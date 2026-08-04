@@ -5,13 +5,25 @@ Pytest configuration and shared fixtures for django-qraft tests.
 import os
 import sys
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+
+@pytest.fixture
+def _disable_hook_validation():
+    """Disable hook path import validation for tests using fake module paths."""
+    with (
+        patch("qraft.base._validate_hook_path"),
+        patch("qraft.batch._validate_hook_path"),
+        patch("qraft.chain._validate_hook_path"),
+        patch("qraft.iter._validate_hook_path"),
+    ):
+        yield
 
 
 @pytest.fixture

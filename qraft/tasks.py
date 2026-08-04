@@ -6,6 +6,7 @@ import logging
 import warnings
 from typing import Any, Callable
 
+from django.db import transaction
 from django_q.tasks import async_task as q2_async_task
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
@@ -123,8 +124,8 @@ def async_task(
         "status": TaskStatus.RUNNING,
     }
 
-    # Create QraftTask first so we can link it to the attempt
-    qraft_task = QraftTask.objects.create(**qraft_metadata)
+    # Extract cluster routing from qraft_options
+    cluster = qraft_options.get("cluster")
 
     # Build Q2 task options, only including non-None values
     # This is important because passing save=None is different from not passing save
@@ -134,6 +135,8 @@ def async_task(
         "q_options": q_options,
         **kwargs,
     }
+    if cluster is not None:
+        q2_kwargs["cluster"] = cluster
     # Preserve user's task_name if provided (no longer overwritten for linkage)
     # Hook handler uses query-based lookup via QraftTaskAttempt.q2_task_id
     if task_name is not None:
@@ -153,15 +156,21 @@ def async_task(
     if broker is not None:
         q2_kwargs["broker"] = broker
 
-    # Queue via Django-Q2 with Qraft's global hook handler
-    q2_task_id = q2_async_task(func, *args, **q2_kwargs)
+    # Create QraftTask, queue to Q2, and create attempt atomically
+    with transaction.atomic():
+        qraft_task = QraftTask.objects.create(**qraft_metadata)
 
-    # Create initial attempt record
-    QraftTaskAttempt.objects.create(
-        qraft_task=qraft_task,
-        attempt_number=1,
-        q2_task_id=q2_task_id,
-    )
+        try:
+            q2_task_id = q2_async_task(func, *args, **q2_kwargs)
+        except Exception:
+            # If Q2 queueing fails, the transaction rolls back QraftTask too
+            raise
+
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task,
+            attempt_number=1,
+            q2_task_id=q2_task_id,
+        )
 
     _logger.debug(
         "Created QraftTask %s with attempt 1 (q2: %s, name: %s) for func %s",
@@ -172,3 +181,103 @@ def async_task(
     )
 
     return q2_task_id
+
+
+def _create_workflow_task(
+    func: str,
+    args: list,
+    kwargs: dict,
+    qraft_options: dict,
+    qraft_iter_id: str | None = None,
+    qraft_batch_id: str | None = None,
+):
+    """
+    Internal helper to create and queue a QraftTask for workflow execution.
+
+    This function is used by workflow primitives (Chain, Iter, Batch) to create
+    tasks with parent linkage. Unlike async_task(), this expects serialized args
+    and handles workflow-specific FK linkage.
+
+    Args:
+        func: Dotted path to the task function
+        args: Positional arguments (already serialized as list)
+        kwargs: Keyword arguments (already serialized as dict)
+        qraft_options: Qraft-specific options (retry policy, etc.)
+        qraft_iter_id: UUID of parent QraftIter (if part of iter)
+        qraft_batch_id: UUID of parent QraftBatch (if part of batch)
+
+    Returns:
+        QraftTask: Created task instance
+
+    Note:
+        - Chain tasks don't use this pattern (OneToOne from ChainStep instead)
+        - Workflow tasks don't have task-level hooks (workflow-level only)
+    """
+    from qraft.models import QraftBatchModel, QraftIterModel
+
+    # Build retry policy
+    retry_policy = RetryPolicy.from_options(qraft_options)
+
+    # Prepare Qraft metadata
+    qraft_metadata = {
+        "func": func,
+        "task_args": args,
+        "task_kwargs": kwargs,
+        "retry_policy": retry_policy.to_dict() if retry_policy else {},
+        "status": TaskStatus.RUNNING,
+        # Workflow tasks don't have task-level hooks (workflow-level only)
+        "success_hook": None,
+        "failure_hook": None,
+    }
+
+    # Add workflow parent linkage
+    if qraft_iter_id:
+        qraft_metadata["qraft_iter"] = QraftIterModel.objects.get(id=qraft_iter_id)
+    elif qraft_batch_id:
+        qraft_metadata["qraft_batch"] = QraftBatchModel.objects.get(id=qraft_batch_id)
+
+    # Queue via Django-Q2 with Qraft's global hook handler
+    # Use workflow ID as group for result aggregation
+    group = None
+    if qraft_iter_id:
+        group = str(qraft_iter_id)
+    elif qraft_batch_id:
+        group = str(qraft_batch_id)
+
+    # Extract cluster routing from qraft_options
+    cluster = qraft_options.get("cluster")
+
+    # Build q2_async_task kwargs
+    q2_kwargs = {
+        "hook": "qraft.hooks.qraft_hook_handler",
+        "group": group,
+        **kwargs,
+    }
+    if cluster is not None:
+        q2_kwargs["cluster"] = cluster
+
+    # Create QraftTask, queue to Q2, and create attempt atomically
+    with transaction.atomic():
+        qraft_task = QraftTask.objects.create(**qraft_metadata)
+
+        try:
+            q2_task_id = q2_async_task(func, *args, **q2_kwargs)
+        except Exception:
+            raise
+
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task,
+            attempt_number=1,
+            q2_task_id=q2_task_id,
+        )
+
+    _logger.debug(
+        "Created workflow QraftTask %s (q2: %s, iter=%s, batch=%s) for func %s",
+        qraft_task.id,
+        q2_task_id,
+        qraft_iter_id or "None",
+        qraft_batch_id or "None",
+        func,
+    )
+
+    return qraft_task

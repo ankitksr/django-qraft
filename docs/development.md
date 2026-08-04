@@ -66,7 +66,7 @@ pip install -e ".[dev]"
 
 ```bash
 # Check imports work
-python -c "import qraft; print(qraft.__version__)"
+python -c "from importlib.metadata import version; print(version('django-qraft'))"
 
 # Run quick test
 pytest tests/ -k test_basic --no-cov

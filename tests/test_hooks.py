@@ -12,6 +12,7 @@ from qraft.hooks import (
     qraft_hook_handler,
 )
 from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt, TaskStatus
+from qraft.retry import handle_task_retry
 
 
 class TestExtractExceptionClass:
@@ -127,8 +128,10 @@ class TestQraftHookHandler:
             mock_dispatcher.assert_not_called()
 
     def test_handler_with_failed_task(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test handler with failed task."""
+        """Test handler with failed task (no retry policy)."""
         mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
+        qraft_task.retry_policy = {}  # No retry policy
+        qraft_task.save()
 
         with patch("qraft.hooks.HookDispatcher") as mock_dispatcher:
             qraft_hook_handler(mock_q2_task_failure)
@@ -138,9 +141,12 @@ class TestQraftHookHandler:
             assert qraft_task_attempt.success is False
             assert qraft_task_attempt.exception_class == "ValueError"
 
-            # Verify task status updated
+            # Verify task status is FAILED (no retry policy means no change to EXHAUSTED)
             qraft_task.refresh_from_db()
             assert qraft_task.status == TaskStatus.FAILED
+
+            # Verify dispatcher was called (for standalone task hook dispatch)
+            mock_dispatcher.assert_called_once()
 
     def test_handler_with_invalid_marker(self, mock_q2_task_success):
         """Test handler with invalid qraft marker."""
@@ -194,18 +200,9 @@ class TestHookDispatcher:
                 hook_type="failure",
             )
 
-    def test_dispatch_failure_with_retry(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test that failure hook is NOT called when retry is scheduled."""
+    def test_dispatch_failure_always_dispatches_hook(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
+        """Test that dispatch() always dispatches failure hook (retry is handled separately)."""
         qraft_task.failure_hook = "test.hooks.on_failure"
-        qraft_task.retry_policy = {
-            "max_attempts": 3,
-            "base_delay": 10.0,
-            "backoff_strategy": "fixed",
-            "jitter": False,
-            "jitter_max": 0.0,
-            "retry_exceptions": [],
-            "skip_exceptions": [],
-        }
         qraft_task.save()
 
         qraft_task_attempt.success = False
@@ -215,14 +212,17 @@ class TestHookDispatcher:
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
 
         with patch.object(dispatcher, "_call_hook") as mock_call:
+            # dispatch() now assumes retry logic was handled by caller
             dispatcher.dispatch(mock_q2_task_failure)
 
-            # Failure hook should NOT be called (retry scheduled instead)
-            mock_call.assert_not_called()
-
-            # Task should be back to PENDING
-            qraft_task.refresh_from_db()
-            assert qraft_task.status == TaskStatus.PENDING
+            # Failure hook SHOULD be called (dispatch no longer handles retry)
+            mock_call.assert_called_once_with(
+                hook_path="test.hooks.on_failure",
+                args=[],
+                kwargs={},
+                task=mock_q2_task_failure,
+                hook_type="failure",
+            )
 
     def test_dispatch_no_hook_configured(self, qraft_task, qraft_task_attempt, mock_q2_task_success):
         """Test dispatch when no hooks are configured."""
@@ -321,67 +321,3 @@ class TestHookDispatcher:
         # Verify hook was called synchronously
         mock_hook.assert_called_once_with(1, 2, key="value")
 
-    def test_handle_retry_schedules_retry(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test retry handling schedules a retry."""
-        qraft_task.retry_policy = {
-            "max_attempts": 3,
-            "base_delay": 10.0,
-            "backoff_strategy": "fixed",
-            "jitter": False,
-            "jitter_max": 0.0,
-            "retry_exceptions": [],
-            "skip_exceptions": [],
-        }
-        qraft_task.save()
-
-        qraft_task_attempt.success = False
-        qraft_task_attempt.exception_class = "ValueError"
-        qraft_task_attempt.save()
-
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-
-        result = dispatcher._handle_retry(mock_q2_task_failure)
-
-        assert result is True
-
-        # Verify task status is PENDING (for retry)
-        qraft_task.refresh_from_db()
-        assert qraft_task.status == TaskStatus.PENDING
-
-    def test_handle_retry_exhausted(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test retry handling when retries are exhausted."""
-        qraft_task.retry_policy = {
-            "max_attempts": 1,
-            "base_delay": 10.0,
-            "backoff_strategy": "fixed",
-            "jitter": False,
-            "jitter_max": 0.0,
-            "retry_exceptions": [],
-            "skip_exceptions": [],
-        }
-        qraft_task.save()
-
-        qraft_task_attempt.success = False
-        qraft_task_attempt.exception_class = "ValueError"
-        qraft_task_attempt.save()
-
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-
-        result = dispatcher._handle_retry(mock_q2_task_failure)
-
-        assert result is False
-
-        # Verify task status is EXHAUSTED
-        qraft_task.refresh_from_db()
-        assert qraft_task.status == TaskStatus.EXHAUSTED
-
-    def test_handle_retry_no_policy(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test retry handling when no retry policy exists."""
-        qraft_task.retry_policy = {}
-        qraft_task.save()
-
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-
-        result = dispatcher._handle_retry(mock_q2_task_failure)
-
-        assert result is False

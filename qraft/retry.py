@@ -10,9 +10,17 @@ from typing import Any
 
 from django.db import transaction
 
-from .conf import RetryBackoff, conf
+from .conf import RetryBackoff, get_conf
 
 logger = logging.getLogger("qraft")
+
+# Minimum delay in seconds when jitter is applied (prevents zero/negative)
+MIN_JITTER_DELAY = 1
+
+# Qraft marker constants for task_name-based linkage
+QRAFT_MARKER_PREFIX = "qraft"
+QRAFT_RETRY_NAME_FMT = "qraft_retry:{task_id}:{attempt}"
+QRAFT_MARKER_FMT = "{prefix}:{task_id}:{attempt}"
 
 
 class RetryPolicy:
@@ -37,7 +45,8 @@ class RetryPolicy:
         Initialize retry policy with defaults from global retry settings.
 
         Args:
-            max_attempts: Maximum retry attempts (default: conf.retry_defaults.max_attempts)
+            max_attempts: Maximum retry attempts
+                (default: conf.retry_defaults.max_attempts)
             base_delay: Base delay in seconds (default: conf.retry_defaults.delay)
             backoff_strategy: Backoff strategy (default: conf.retry_defaults.backoff)
             jitter: Add random jitter (default: conf.retry_defaults.jitter)
@@ -46,22 +55,23 @@ class RetryPolicy:
             skip_exceptions: Exception names to never retry
         """
         # Use global retry default settings
+        defaults = get_conf().retry_defaults
         self.max_attempts = (
             max_attempts
             if max_attempts is not None
-            else conf.retry_defaults.max_attempts
+            else defaults.max_attempts
         )
         self.base_delay = (
-            base_delay if base_delay is not None else conf.retry_defaults.delay
+            base_delay if base_delay is not None else defaults.delay
         )
         self.backoff_strategy = (
             backoff_strategy
             if backoff_strategy is not None
-            else conf.retry_defaults.backoff.value
+            else defaults.backoff.value
         )
-        self.jitter = jitter if jitter is not None else conf.retry_defaults.jitter
+        self.jitter = jitter if jitter is not None else defaults.jitter
         self.jitter_max = (
-            jitter_max if jitter_max is not None else conf.retry_defaults.jitter_max
+            jitter_max if jitter_max is not None else defaults.jitter_max
         )
         self.retry_exceptions = set(retry_exceptions or [])
         self.skip_exceptions = set(skip_exceptions or [])
@@ -196,7 +206,7 @@ class RetryPolicy:
         if self.jitter and delay > 0:
             jitter_amount = delay * self.jitter_max
             jitter = random.uniform(-jitter_amount, jitter_amount)
-            delay = max(1, delay + jitter)  # Minimum 1 second delay
+            delay = max(MIN_JITTER_DELAY, delay + jitter)
 
         return int(delay)
 
@@ -213,7 +223,7 @@ class RetryPolicy:
         delay_seconds = self.calculate_delay(attempt_number)
         return datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
-    def schedule_retry(self, qraft_task) -> int:
+    def schedule_retry(self, qraft_task, current_attempt: int) -> int:
         """
         Schedule a retry for a failed task using Django-Q2's Schedule model.
 
@@ -223,6 +233,8 @@ class RetryPolicy:
 
         Args:
             qraft_task: QraftTask model instance
+            current_attempt: The attempt number that just failed (concrete value,
+                avoids race condition with COUNT queries)
 
         Returns:
             Schedule ID
@@ -231,20 +243,26 @@ class RetryPolicy:
 
         from .models import TaskStatus
 
-        current_attempt = qraft_task.attempt_count
         next_attempt = current_attempt + 1
         eta = self.next_eta(current_attempt)
 
         # Build kwargs with q_options containing task_name for Qraft linkage
         # The scheduler extracts q_options and passes it to async_task
+        marker = QRAFT_MARKER_FMT.format(
+            prefix=QRAFT_MARKER_PREFIX,
+            task_id=qraft_task.id,
+            attempt=next_attempt,
+        )
         retry_kwargs = {
             **qraft_task.task_kwargs,
-            "q_options": {"task_name": f"qraft:{qraft_task.id}:{next_attempt}"},
+            "q_options": {"task_name": marker},
         }
 
         with transaction.atomic():
             schedule = Schedule.objects.create(
-                name=f"qraft_retry:{qraft_task.id}:{next_attempt}",
+                name=QRAFT_RETRY_NAME_FMT.format(
+                    task_id=qraft_task.id, attempt=next_attempt
+                ),
                 func=qraft_task.func,
                 args=repr(tuple(qraft_task.task_args)),
                 kwargs=repr(retry_kwargs),
@@ -267,3 +285,47 @@ class RetryPolicy:
         )
 
         return schedule.id
+
+
+def handle_task_retry(qraft_task, attempt) -> bool:
+    """
+    Handle retry logic for a failed task.
+
+    Checks the task's retry policy and either schedules a retry or marks
+    the task as exhausted.
+
+    Args:
+        qraft_task: QraftTask that failed
+        attempt: QraftTaskAttempt with exception info
+
+    Returns:
+        True if retry was scheduled, False if exhausted or no policy
+    """
+    from .models import TaskStatus
+
+    policy = qraft_task.retry_policy
+    if not policy:
+        return False
+
+    retry_policy = RetryPolicy.from_dict(policy)
+
+    # Use exception class from the attempt (already extracted and stored)
+    exc_class_name = attempt.exception_class
+    current_attempt = attempt.attempt_number
+
+    if retry_policy.should_retry(current_attempt, exc_class_name):
+        # Schedule retry with backoff delay
+        retry_policy.schedule_retry(qraft_task, current_attempt)
+        return True
+
+    # All retries exhausted
+    qraft_task.status = TaskStatus.EXHAUSTED
+    qraft_task.save(update_fields=["status", "date_updated"])
+
+    logger.info(
+        "QraftTask %s exhausted all %d retry attempts",
+        qraft_task.id,
+        current_attempt,
+    )
+
+    return False

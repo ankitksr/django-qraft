@@ -2,6 +2,7 @@
 Demo tasks showcasing Qraft's features.
 
 Each task is designed to demonstrate a specific capability:
+- noop_task: Simple no-op (tests workflows)
 - slow_task: I/O-bound work (benefits from threading)
 - flaky_task: Random failures (tests hooks)
 - countdown_task: Fails N times then succeeds (tests retries)
@@ -12,10 +13,6 @@ import random
 import time
 
 _log = logging.getLogger("showcase")
-
-# Track retry attempts per task (in-memory, resets on worker restart)
-_attempts: dict[str, int] = {}
-
 
 class TransientError(Exception):
     """A recoverable error that should trigger retries."""
@@ -32,6 +29,15 @@ class PermanentError(Exception):
 # =============================================================================
 # Tasks
 # =============================================================================
+
+
+def noop_task(value=None) -> dict:
+    """
+    A simple no-op task that immediately returns.
+
+    Used for testing workflow primitives without I/O overhead.
+    """
+    return {"value": value}
 
 
 def slow_task(duration: float = 1.0) -> dict:
@@ -64,12 +70,23 @@ def countdown_task(task_id: str, fail_times: int = 2) -> dict:
     Perfect for testing retry policies - set max_attempts > fail_times
     to see the task eventually succeed after retries.
 
+    Attempt tracking uses QraftTaskAttempt records in the database so it
+    works correctly across multiple worker processes. When attempt N runs,
+    attempts 1..N-1 already exist (created by the hook handler after each
+    prior attempt completed), so ``count() + 1`` gives the current number.
+
     Args:
         task_id: Unique identifier to track attempts across retries
         fail_times: Number of times to fail before succeeding
     """
-    _attempts[task_id] = _attempts.get(task_id, 0) + 1
-    attempt = _attempts[task_id]
+    from qraft.models import QraftTask
+
+    qraft_task = (
+        QraftTask.objects
+        .filter(func="showcase.tasks.countdown_task", task_args__0=task_id)
+        .latest("date_created")
+    )
+    attempt = qraft_task.attempts.count() + 1
 
     if attempt <= fail_times:
         _log.info(
@@ -78,7 +95,6 @@ def countdown_task(task_id: str, fail_times: int = 2) -> dict:
         raise TransientError(f"Attempt {attempt}/{fail_times}")
 
     _log.info("countdown_task %s: attempt %d SUCCESS", task_id, attempt)
-    del _attempts[task_id]  # Clean up
     return {"task_id": task_id, "attempts": attempt}
 
 
@@ -104,3 +120,25 @@ def on_success(task_id: str) -> None:
 def on_failure(task_id: str) -> None:
     """Failure hook - called when a task fails (after all retries exhausted)."""
     _log.info("FAILURE HOOK: task_id=%s", task_id)
+
+
+def on_cancelled(workflow_id: str) -> None:
+    """Cancellation hook - called when a workflow is cancelled."""
+    _log.info("CANCELLED HOOK: workflow_id=%s", workflow_id)
+
+
+def on_progress(
+    *,
+    workflow_id: str,
+    workflow_type: str,
+    completed_count: int,
+    total_count: int,
+    success_count: int,
+    failure_count: int,
+) -> None:
+    """Progress hook - called after each task in a parallel workflow completes."""
+    _log.info(
+        "PROGRESS: %s %s — %d/%d done (S:%d F:%d)",
+        workflow_type, workflow_id,
+        completed_count, total_count, success_count, failure_count,
+    )

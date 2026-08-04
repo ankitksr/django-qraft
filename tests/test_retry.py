@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
-from qraft.retry import RetryPolicy
+from qraft.retry import RetryPolicy, handle_task_retry
 
 
 class TestRetryPolicy:
@@ -319,7 +319,7 @@ class TestRetryPolicy:
         )
 
         policy = RetryPolicy.from_task(task)
-        schedule_id = policy.schedule_retry(task)
+        schedule_id = policy.schedule_retry(task, current_attempt=1)
 
         # Verify schedule was created
         schedule = Schedule.objects.get(id=schedule_id)
@@ -361,7 +361,7 @@ class TestRetryPolicy:
         policy = RetryPolicy.from_task(task)
 
         before = datetime.now(timezone.utc)
-        schedule_id = policy.schedule_retry(task)
+        schedule_id = policy.schedule_retry(task, current_attempt=1)
         after = datetime.now(timezone.utc)
 
         schedule = Schedule.objects.get(id=schedule_id)
@@ -371,3 +371,91 @@ class TestRetryPolicy:
         expected_max = after + timedelta(seconds=60)
 
         assert expected_min <= schedule.next_run <= expected_max
+
+
+class TestHandleTaskRetry:
+    """Tests for handle_task_retry function."""
+
+    @pytest.mark.django_db
+    def test_schedules_retry_when_policy_allows(self):
+        """Test that handle_task_retry schedules a retry when policy allows."""
+        task = QraftTask.objects.create(
+            func="test.function",
+            retry_policy={
+                "max_attempts": 3,
+                "base_delay": 10.0,
+                "backoff_strategy": "fixed",
+                "jitter": False,
+                "jitter_max": 0.0,
+                "retry_exceptions": [],
+                "skip_exceptions": [],
+            },
+        )
+
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="task-1",
+            success=False,
+            exception_class="ValueError",
+        )
+
+        result = handle_task_retry(task, attempt)
+
+        assert result is True
+
+        # Verify task status is PENDING (for retry)
+        task.refresh_from_db()
+        assert task.status == TaskStatus.PENDING
+
+    @pytest.mark.django_db
+    def test_marks_exhausted_when_retries_done(self):
+        """Test that handle_task_retry marks task as EXHAUSTED when retries are done."""
+        task = QraftTask.objects.create(
+            func="test.function",
+            retry_policy={
+                "max_attempts": 1,
+                "base_delay": 10.0,
+                "backoff_strategy": "fixed",
+                "jitter": False,
+                "jitter_max": 0.0,
+                "retry_exceptions": [],
+                "skip_exceptions": [],
+            },
+        )
+
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="task-1",
+            success=False,
+            exception_class="ValueError",
+        )
+
+        result = handle_task_retry(task, attempt)
+
+        assert result is False
+
+        # Verify task status is EXHAUSTED
+        task.refresh_from_db()
+        assert task.status == TaskStatus.EXHAUSTED
+
+    @pytest.mark.django_db
+    def test_returns_false_when_no_policy(self):
+        """Test that handle_task_retry returns False when no retry policy exists."""
+        task = QraftTask.objects.create(
+            func="test.function",
+            retry_policy={},
+        )
+
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="task-1",
+            success=False,
+            exception_class="ValueError",
+        )
+
+        result = handle_task_retry(task, attempt)
+
+        assert result is False

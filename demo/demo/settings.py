@@ -15,15 +15,40 @@ DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
 INSTALLED_APPS = [
-    "django.contrib.contenttypes",
+    "django.contrib.admin",
     "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
     "django_q",
     "qraft",
     "showcase",
 ]
 
+MIDDLEWARE = [
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+]
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
 ROOT_URLCONF = "demo.urls"
 WSGI_APPLICATION = "demo.wsgi.application"
+STATIC_URL = "/static/"
 
 # Database configuration
 # PostgreSQL recommended for concurrent task processing
@@ -85,7 +110,7 @@ Q_CLUSTER = {
     "timeout": 300,
     "retry": 600,
     "orm": "default",
-    # Alternative clusters for performance comparison
+    # Alternative cluster for performance comparison (multi-worker + threading)
     "ALT_CLUSTERS": {
         "qraft": {
             "name": "qraft",

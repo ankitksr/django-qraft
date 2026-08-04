@@ -15,13 +15,17 @@ from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
 from .conf import get_conf
-from .retry import RetryPolicy
+from .retry import handle_task_retry
 
 _logger = logging.getLogger("django-q")
 
 # Regex to extract exception class from Python traceback
 # Matches lines like "module.path.ExceptionClass: message" or "ExceptionClass: message"
 _EXC_PATTERN = re.compile(r"^([\w.]+):\s", re.MULTILINE)
+
+# Max chars for placeholder UUID hex in HookDispatch.q2_task_id
+# Format: "p-{hex}" must fit in CharField(max_length=32)
+_PLACEHOLDER_HEX_LEN = 30
 
 
 def _extract_exception_class(result: str | None) -> str | None:
@@ -58,13 +62,18 @@ def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
 
     Marker format: "qraft:{task_id}:{attempt_number}"
 
-    Returns None if the marker is invalid.
+    Returns None if the marker is invalid or the UUID is malformed.
     """
+    from .retry import QRAFT_MARKER_PREFIX
+
     parts = marker.split(":")
-    if len(parts) != 3 or parts[0] != "qraft":
+    if len(parts) != 3 or parts[0] != QRAFT_MARKER_PREFIX:
         return None
     try:
-        return parts[1], int(parts[2])
+        task_id = parts[1]
+        # Validate UUID format
+        uuid.UUID(task_id)
+        return task_id, int(parts[2])
     except (ValueError, IndexError):
         return None
 
@@ -100,8 +109,11 @@ def qraft_hook_handler(q2_task):
         )
 
     except QraftTaskAttempt.DoesNotExist:
-        # Fallback: Parse task_name for retry tasks (scheduled via Schedule, not async_task)
-        if not q2_task.name or not q2_task.name.startswith("qraft:"):
+        # Fallback: Parse task_name for retry tasks
+        # (scheduled via Schedule, not async_task)
+        from .retry import QRAFT_MARKER_PREFIX
+
+        if not q2_task.name or not q2_task.name.startswith(f"{QRAFT_MARKER_PREFIX}:"):
             _logger.debug(
                 "No Qraft marker or attempt found for task %s, skipping", q2_task.id
             )
@@ -145,6 +157,9 @@ def qraft_hook_handler(q2_task):
 
     # Update attempt outcome and task status atomically
     with transaction.atomic():
+        # Re-fetch with lock to prevent concurrent status updates
+        qraft_task = QraftTask.objects.select_for_update().get(id=qraft_task.id)
+
         attempt.success = q2_task.success
         attempt.date_completed = q2_task.stopped
         if not q2_task.success:
@@ -157,9 +172,20 @@ def qraft_hook_handler(q2_task):
         )
         qraft_task.save(update_fields=["status", "date_updated"])
 
-    # Dispatch hooks via dispatcher
-    dispatcher = HookDispatcher(qraft_task, attempt)
-    dispatcher.dispatch(q2_task)
+    # Handle retry logic for failed tasks BEFORE workflow/hook processing
+    if not q2_task.success:
+        if handle_task_retry(qraft_task, attempt):
+            # Retry scheduled - task is not terminal yet, skip all further processing
+            return
+
+    # Task is terminal (succeeded or exhausted) - proceed with completion handling
+    if _is_workflow_task(qraft_task):
+        # Workflow tasks: route to workflow dispatcher, skip task-level hooks
+        _handle_workflow_completion(qraft_task, attempt)
+    else:
+        # Standalone tasks: dispatch task-level hooks
+        dispatcher = HookDispatcher(qraft_task, attempt)
+        dispatcher.dispatch(q2_task)
 
 
 class HookDispatcher:
@@ -173,24 +199,20 @@ class HookDispatcher:
 
     def dispatch(self, q2_task):
         """
-        Main dispatch method called after task completion.
+        Dispatch appropriate hook based on task outcome.
 
-        Handles retry logic for failed tasks before dispatching hooks.
-        If a retry is scheduled, the failure hook is NOT called.
+        This method assumes retry logic has already been handled by the caller.
+        It only dispatches success or failure hooks.
 
         Args:
             q2_task: Django-Q2 Task model instance
         """
         if q2_task.success:
-            self._dispatch_success_hook(q2_task)
+            self.dispatch_success_hook(q2_task)
         else:
-            # Try to retry before dispatching failure hook
-            if self._handle_retry(q2_task):
-                # Retry was scheduled, don't call failure hook yet
-                return
-            self._dispatch_failure_hook(q2_task)
+            self.dispatch_failure_hook(q2_task)
 
-    def _dispatch_success_hook(self, q2_task):
+    def dispatch_success_hook(self, q2_task):
         """Dispatch success hook if configured."""
         if not self.qraft_task.success_hook:
             return
@@ -203,7 +225,7 @@ class HookDispatcher:
             hook_type="success",
         )
 
-    def _dispatch_failure_hook(self, q2_task):
+    def dispatch_failure_hook(self, q2_task):
         """Dispatch failure hook if configured."""
         if not self.qraft_task.failure_hook:
             return
@@ -250,7 +272,7 @@ class HookDispatcher:
             # Check if hook already dispatched (idempotency guard)
             # Use a placeholder for q2_task_id to avoid unique constraint issues
             # Format: p-{short_uuid} to fit in 32 chars (2 + 30 = 32)
-            placeholder_id = f"p-{uuid.uuid4().hex[:30]}"
+            placeholder_id = f"p-{uuid.uuid4().hex[:_PLACEHOLDER_HEX_LEN]}"
             with transaction.atomic():
                 hook_dispatch, created = HookDispatch.objects.get_or_create(
                     qraft_task=self.qraft_task,
@@ -291,6 +313,12 @@ class HookDispatcher:
             )
 
         except Exception as e:
+            # Clean up placeholder dispatch record on failure
+            HookDispatch.objects.filter(
+                qraft_task=self.qraft_task,
+                hook_type=hook_type,
+                q2_task_id=placeholder_id,
+            ).delete()
             _logger.error(
                 "Failed to dispatch %s hook for QraftTask %s: %s",
                 hook_type,
@@ -334,42 +362,53 @@ class HookDispatcher:
                 exc_info=True,
             )
 
-    def _handle_retry(self, q2_task) -> bool:
-        """
-        Handle retry logic based on policy.
+def _is_workflow_task(qraft_task) -> bool:
+    """
+    Check if task belongs to any workflow.
 
-        Args:
-            q2_task: Django-Q2 Task instance that failed
-
-        Returns:
-            True if retry was scheduled, False otherwise
-        """
-        from .models import TaskStatus
-
-        policy = self.qraft_task.retry_policy
-        if not policy:
-            return False
-
-        retry_policy = RetryPolicy.from_dict(policy)
-
-        # Use exception class from the attempt (already extracted and stored)
-        exc_class_name = self.attempt.exception_class
-
-        current_attempt = self.qraft_task.attempt_count
-
-        if retry_policy.should_retry(current_attempt, exc_class_name):
-            # Schedule retry with backoff delay
-            retry_policy.schedule_retry(self.qraft_task)
+    Returns:
+        bool: True if task is part of chain/iter/batch
+    """
+    # Check chain membership via reverse OneToOne
+    try:
+        if hasattr(qraft_task, "chain_step") and qraft_task.chain_step is not None:
             return True
+    except Exception:
+        pass
 
-        # All retries exhausted
-        self.qraft_task.status = TaskStatus.EXHAUSTED
-        self.qraft_task.save(update_fields=["status", "date_updated"])
+    # Check iter/batch membership via FK
+    return qraft_task.qraft_iter is not None or qraft_task.qraft_batch is not None
 
-        _logger.info(
-            "QraftTask %s exhausted all %d retry attempts",
-            self.qraft_task.id,
-            current_attempt,
-        )
 
-        return False
+def _handle_workflow_completion(qraft_task, attempt):
+    """
+    Route to appropriate workflow dispatcher if task is part of a workflow.
+
+    Args:
+        qraft_task: QraftTask instance
+        attempt: QraftTaskAttempt instance
+    """
+    from .dispatchers import ChainDispatcher, ParallelDispatcher
+    from .models import QraftChainStep
+
+    # Check chain membership via reverse OneToOne
+    try:
+        chain_step = qraft_task.chain_step
+        if chain_step:
+            dispatcher = ChainDispatcher(chain_step.chain, chain_step, attempt)
+            dispatcher.handle()
+            return
+    except QraftChainStep.DoesNotExist:
+        pass
+
+    # Check iter membership
+    if qraft_task.qraft_iter:
+        dispatcher = ParallelDispatcher(qraft_task.qraft_iter, attempt)
+        dispatcher.handle()
+        return
+
+    # Check batch membership
+    if qraft_task.qraft_batch:
+        dispatcher = ParallelDispatcher(qraft_task.qraft_batch, attempt)
+        dispatcher.handle()
+        return

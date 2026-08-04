@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
     - uses: actions/checkout@v4
@@ -28,8 +28,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv pip install -e .
-        uv pip install --group test
+        uv sync --group test
 
     - name: Run linter
       run: |
@@ -37,10 +36,11 @@ jobs:
 
     - name: Run tests with coverage
       run: |
-        uv run pytest --cov=qraft --cov-report=xml --cov-report=term -n auto
+        uv run pytest --cov=qraft --cov-report=xml --cov-report=term --cov-fail-under=72 -n auto
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
         file: ./coverage.xml
+        token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: false

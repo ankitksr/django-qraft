@@ -28,14 +28,19 @@ pytest
 
 ```
 tests/
-├── __init__.py           # Package marker
-├── conftest.py          # Shared fixtures and pytest configuration
-├── test_settings.py     # Django settings for tests
-├── test_models.py       # Tests for QraftTask, QraftTaskAttempt, HookDispatch
-├── test_retry.py        # Tests for RetryPolicy and retry logic
-├── test_tasks.py        # Tests for async_task function
-├── test_hooks.py        # Tests for hook dispatching
-└── test_conf.py         # Tests for configuration system
+├── __init__.py                   # Package marker
+├── conftest.py                   # Shared fixtures and pytest configuration
+├── settings.py                   # Django settings for tests
+├── test_models.py                # Tests for QraftTask, QraftTaskAttempt, HookDispatch
+├── test_retry.py                 # Tests for RetryPolicy and retry logic
+├── test_tasks.py                 # Tests for async_task function
+├── test_hooks.py                 # Tests for hook dispatching
+├── test_conf.py                  # Tests for configuration system
+├── test_chain.py                 # Tests for QraftChain workflow primitive
+├── test_iter.py                  # Tests for QraftIter workflow primitive
+├── test_batch.py                 # Tests for QraftBatch workflow primitive
+├── test_integration.py           # Cross-cutting integration tests
+└── test_workflow_integration.py  # End-to-end workflow tests (integration marker)
 ```
 
 ## Running Tests
@@ -138,6 +143,14 @@ Tests for hook dispatching:
 - **TestQraftHookHandler**: Hook handler logic, dual lookup
 - **TestHookDispatcher**: Hook dispatching, retry handling, idempotency
 
+### Workflow Tests (`test_chain.py`, `test_iter.py`, `test_batch.py`)
+
+Tests for workflow primitives:
+- **QraftChain**: sequential execution, resume from failed step, chain-level hooks
+- **QraftIter**: parallel fan-out, atomic counters, completion detection
+- **QraftBatch**: fork-join, per-task retry policies, `add()` deprecation shim
+- `test_workflow_integration.py` covers end-to-end flows (marked `integration`)
+
 ### Configuration Tests (`test_conf.py`)
 
 Tests for settings management:
@@ -196,7 +209,7 @@ def test_async_task(mock_q2_async):
 ## Coverage Goals
 
 We aim for:
-- **>90% code coverage** overall
+- **75%+ code coverage** overall (CI enforces 72%; `qraft/admin.py` is verified manually via the demo app)
 - **100% coverage** for critical paths (retry logic, hook dispatching)
 - **Clear test names** that document behavior
 - **Minimal but effective** test cases

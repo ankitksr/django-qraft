@@ -7,6 +7,7 @@ Supports ALT_CLUSTERS for running mixed worker pools (process + threaded).
 
 import os
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 from django.conf import settings as django_settings
@@ -128,14 +129,20 @@ class QraftSettings(BaseSettings):
         return (DjangoSettingsSource(settings_cls),)
 
 
-def get_conf() -> "QraftSettings":
+@lru_cache(maxsize=8)
+def _cached_conf(cluster_name: str | None) -> QraftSettings:
+    """Cache settings instances per cluster name."""
+    return QraftSettings()
+
+
+def get_conf() -> QraftSettings:
     """
     Get Qraft settings, respecting current Q_CLUSTER_NAME environment variable.
 
-    Use this instead of the global `conf` when you need settings that reflect
-    the current cluster name (e.g., after setting Q_CLUSTER_NAME at runtime).
+    Uses LRU cache keyed on cluster name to avoid re-creating settings objects
+    on every call while still supporting ALT_CLUSTERS.
     """
-    return QraftSettings()
+    return _cached_conf(os.getenv("Q_CLUSTER_NAME"))
 
 
 # Global settings instance (loaded at import time)

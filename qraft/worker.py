@@ -38,6 +38,16 @@ from django_q.utils import close_old_django_connections, get_func_repr
 
 _logger = logging.getLogger("django-q")
 
+# Timer sentinel values for inter-process communication
+TIMER_IDLE = -1       # Worker is idle, no task executing
+TIMER_RECYCLE = -2    # Signal sentinel to recycle this worker
+
+# Extra seconds added to task timeout for processing overhead
+TIMER_BUFFER = 3
+
+# How long (seconds) to block on task_queue.get() before re-checking
+QUEUE_POLL_INTERVAL = 1.0
+
 
 def _execute_task_in_thread(
     task: dict,
@@ -89,10 +99,10 @@ def _execute_task_in_thread(
         # Update timer to indicate busy state
         # In threaded mode, timer tracks "any thread busy" state
         with timer.get_lock():
-            if timer.value == -1:  # Only set if currently idle
+            if timer.value == TIMER_IDLE:
                 timer_value = task.pop("timeout", timeout) or timeout
                 if timer_value and timer_value > 0:
-                    timer.value = timer_value + 3  # Buffer for processing
+                    timer.value = timer_value + TIMER_BUFFER
 
         # Execute the task (mirrors Django-Q2 worker execution)
         try:
@@ -132,7 +142,7 @@ def _execute_task_in_thread(
         # Reset timer to idle after task completion
         with timer.get_lock():
             if timer.value > 0:
-                timer.value = -1
+                timer.value = TIMER_IDLE
         # Release semaphore to allow next task
         inflight_semaphore.release()
 
@@ -197,7 +207,7 @@ def threaded_worker(
 
     task_count = 0
     if timeout is None:
-        timeout = -1
+        timeout = TIMER_IDLE
 
     # Main loop: pull tasks and submit to thread pool
     # Use timeout-based get to allow periodic checks and clean shutdown.
@@ -206,7 +216,7 @@ def threaded_worker(
     while not should_stop:
         try:
             # Use timeout to allow periodic wake-up for shutdown checks
-            task = task_queue.get(timeout=1.0)
+            task = task_queue.get(timeout=QUEUE_POLL_INTERVAL)
         except Empty:
             # No task available, continue loop to check again
             continue
@@ -249,7 +259,7 @@ def threaded_worker(
                 proc_name,
                 task_count,
             )
-            timer.value = -2  # Signal recycle to sentinel
+            timer.value = TIMER_RECYCLE
             should_stop = True
 
     # Graceful shutdown: wait for in-flight tasks to complete

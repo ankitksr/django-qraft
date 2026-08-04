@@ -118,9 +118,7 @@ class TestEndToEndWorkflows:
 
     def test_retry_workflow(self, qraft_task, qraft_task_attempt):
         """Test complete retry workflow."""
-        from unittest.mock import Mock
-
-        from qraft.hooks import HookDispatcher
+        from qraft.retry import handle_task_retry
 
         # Configure task with retry policy
         qraft_task.retry_policy = {
@@ -139,14 +137,8 @@ class TestEndToEndWorkflows:
         qraft_task_attempt.exception_class = "ValueError"
         qraft_task_attempt.save()
 
-        # Mock failed Q2 task
-        q2_task = Mock()
-        q2_task.success = False
-        q2_task.id = qraft_task_attempt.q2_task_id
-
-        # Dispatch (should schedule retry)
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-        result = dispatcher._handle_retry(q2_task)
+        # Handle retry (should schedule retry)
+        result = handle_task_retry(qraft_task, qraft_task_attempt)
 
         assert result is True
 
@@ -163,9 +155,7 @@ class TestEndToEndWorkflows:
 
     def test_retry_exhaustion_workflow(self, qraft_task, qraft_task_attempt):
         """Test workflow when retries are exhausted."""
-        from unittest.mock import Mock
-
-        from qraft.hooks import HookDispatcher
+        from qraft.retry import handle_task_retry
 
         # Configure task with max_attempts=1 (already on first attempt)
         qraft_task.retry_policy = {
@@ -184,14 +174,8 @@ class TestEndToEndWorkflows:
         qraft_task_attempt.exception_class = "ValueError"
         qraft_task_attempt.save()
 
-        # Mock failed Q2 task
-        q2_task = Mock()
-        q2_task.success = False
-        q2_task.id = qraft_task_attempt.q2_task_id
-
-        # Dispatch (should exhaust retries)
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-        result = dispatcher._handle_retry(q2_task)
+        # Handle retry (should exhaust retries)
+        result = handle_task_retry(qraft_task, qraft_task_attempt)
 
         assert result is False
 

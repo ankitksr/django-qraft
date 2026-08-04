@@ -1,0 +1,184 @@
+"""QraftIter: Parallel execution of the same function with different inputs."""
+
+import logging
+from uuid import UUID
+
+from django.db import transaction
+
+from qraft.base import BaseWorkflow, _validate_hook_path
+from qraft.models import QraftIterModel, WorkflowStatus
+from qraft.results import WorkflowResult
+
+_logger = logging.getLogger("qraft.iter")
+
+
+class QraftIter(BaseWorkflow):
+    """
+    Parallel workflow primitive for same function with many inputs.
+
+    Features:
+    - All tasks execute in parallel
+    - Single function applied to different inputs
+    - Atomic counter tracking for completion
+    - Workflow-level success/failure hooks
+    - Cancellation support
+    - Progress hook called on each task completion
+
+    Example:
+        iter_task = QraftIter(
+            'myapp.tasks.download_report',
+            qraft_options={'max_attempts': 3},
+            cluster='io-workers',
+            on_success='myapp.hooks.all_reports_ready',
+        )
+        for report_id in [1, 2, 3, 4, 5]:
+            iter_task.append(report_id)
+        iter_id = iter_task.run()
+    """
+
+    _workflow_type = "iter"
+
+    def __init__(
+        self,
+        func: str,
+        qraft_options: dict | None = None,
+        cluster: str | None = None,
+        on_success: str | None = None,
+        on_failure: str | None = None,
+        on_cancelled: str | None = None,
+        progress_hook: str | None = None,
+        success_args: tuple = (),
+        success_kwargs: dict | None = None,
+        failure_args: tuple = (),
+        failure_kwargs: dict | None = None,
+        iter_id: UUID | str | None = None,
+    ):
+        self._items = []
+
+        # Validate hooks at creation time
+        for hook in (on_success, on_failure, on_cancelled, progress_hook):
+            _validate_hook_path(hook)
+
+        if iter_id:
+            self._model = QraftIterModel.objects.get(id=iter_id)
+        else:
+            merged_options = qraft_options or {}
+            if cluster is not None:
+                merged_options = {**merged_options, "cluster": cluster}
+
+            self._model = QraftIterModel.objects.create(
+                func=func,
+                default_qraft_options=merged_options,
+                success_hook=on_success,
+                success_args=list(success_args),
+                success_kwargs=success_kwargs or {},
+                failure_hook=on_failure,
+                failure_args=list(failure_args),
+                failure_kwargs=failure_kwargs or {},
+                on_cancelled=on_cancelled,
+                progress_hook=progress_hook,
+            )
+
+        _logger.debug("Initialized QraftIter %s for func %s", self._model.id, func)
+
+    @property
+    def total_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.total_count
+
+    @property
+    def completed_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.completed_count
+
+    @property
+    def success_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.success_count
+
+    @property
+    def failure_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.failure_count
+
+    def append(self, *args, **kwargs):
+        """
+        Add an item to the iter with the given arguments.
+
+        Raises:
+            ValueError: If iter has already been run
+        """
+        if self._model.status != WorkflowStatus.PENDING:
+            raise ValueError("Cannot append to an iter that has already been run")
+
+        self._items.append({"args": args, "kwargs": kwargs})
+        _logger.debug("Appended item %d to iter %s", len(self._items), self._model.id)
+
+    def run(self) -> UUID:
+        """
+        Start executing all items in parallel.
+
+        Returns:
+            UUID: Iter ID
+
+        Raises:
+            ValueError: If iter is empty or has already been run
+        """
+        if not self._items:
+            raise ValueError("Cannot run empty iter")
+
+        if self._model.status != WorkflowStatus.PENDING:
+            raise ValueError(f"Iter already run (status: {self._model.status})")
+
+        with transaction.atomic():
+            self._model.total_count = len(self._items)
+            self._model.status = WorkflowStatus.RUNNING
+            self._model.save(update_fields=["total_count", "status", "date_updated"])
+
+        from qraft.tasks import _create_workflow_task
+
+        for idx, item in enumerate(self._items):
+            _create_workflow_task(
+                func=self._model.func,
+                args=item["args"],
+                kwargs=item["kwargs"],
+                qraft_options=self._model.default_qraft_options,
+                qraft_iter_id=self._model.id,
+            )
+            _logger.debug(
+                "Queued iter task %d/%d (iter=%s)",
+                idx + 1, len(self._items), self._model.id,
+            )
+
+        _logger.info(
+            "Started QraftIter %s with %d items",
+            self._model.id, len(self._items),
+        )
+        return self._model.id
+
+    def length(self) -> int:
+        """Get the total number of items."""
+        return self._model.total_count
+
+    def result(self, wait: int | None = None) -> WorkflowResult:
+        """
+        Get results from all tasks.
+
+        Args:
+            wait: Timeout in milliseconds to wait for completion
+
+        Returns:
+            WorkflowResult with task results (unordered)
+
+        Raises:
+            TimeoutError: If wait is provided and iter doesn't complete in time
+        """
+        self._poll_until_terminal(wait)
+        return self._build_workflow_result(self._model.tasks.all())
+
+    def __repr__(self):
+        return (
+            f"<QraftIter id={self._model.id}"
+            f" status={self._model.status}"
+            f" completed={self.completed_count}/{self.total_count}>"
+        )

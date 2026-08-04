@@ -7,11 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- Async/await worker support for native asyncio tasks
+- Enhanced monitoring and metrics
+- Task prioritization
+- Dead letter queue for failed tasks
+- Nested workflow support
+
+## [1.1.1] - 2026-02-17
+
+### Fixed
+
+#### Concurrency Bugs
+- **Fix `attempt_count` race in retry logic**: Use concrete `attempt.attempt_number` instead of COUNT query to prevent race conditions in concurrent retry scheduling
+- **Add `select_for_update()` in hook handler**: Prevent concurrent status updates on the same QraftTask
+- **Fix TOCTOU race in `_dispatch_workflow_hook()`**: Replace filter-then-create pattern with atomic `get_or_create()` for workflow hook dispatch
+- **Fix HookDispatch placeholder cleanup**: Delete placeholder dispatch record on `q2_async_task()` failure instead of silently swallowing the error
+- **Wrap `async_task()` in transaction**: QraftTask creation + Q2 queueing + QraftTaskAttempt creation are now atomic
+- **Add ParallelDispatcher idempotency**: New `counted` field on QraftTaskAttempt prevents double-counting in parallel workflows
+
+#### Configuration & Error Handling
+- **LRU-cached `get_conf()`**: Settings instances are now cached per cluster name, avoiding re-creation on every call
+- **Use `get_conf()` in RetryPolicy**: Retry defaults now respect ALT_CLUSTERS at runtime instead of using module-level singleton
+- **Unified retry marker constants**: Centralized marker format strings in `qraft/retry.py` for consistency
+- **UUID validation in marker parsing**: `_parse_qraft_marker()` now validates UUID format before returning
+
 ### Added
-- Comprehensive documentation structure in `docs/`
-- LICENSE file (MIT)
-- CONTRIBUTING.md with development guidelines
-- CHANGELOG.md for version tracking
+
+#### Workflow Improvements
+- **Cancellation support**: All workflow types (Chain, Iter, Batch) now support `cancel()` method with `CANCELLED` status
+- **Progress hooks**: Parallel workflows (Iter, Batch) support `progress_hook` called on each task completion
+- **Rich result objects**: `WorkflowResult` and `TaskResult` dataclasses with `succeeded`, `failed_results`, `errors()`, and backward-compatible iteration
+- **BaseWorkflow class**: Shared base class for Chain/Iter/Batch with common patterns (polling, cancellation, result building)
+- **Hook path validation**: Hook dotted paths are validated at workflow creation time using `import_string()`
+- **Exponential backoff polling**: `result(wait=...)` now uses exponential backoff (50ms → 2s) instead of fixed 100ms sleep
+- **`on_cancelled` hook field**: Workflows can specify a hook to call on cancellation
+- **`QraftBatch.append()`**: Consistent API across all workflow types; `add()` is deprecated
+
+#### Admin & Models
+- **Workflow admin registration**: `QraftChainModel`, `QraftIterModel`, `QraftBatchModel`, and `WorkflowHookDispatch` are now registered in Django admin with colored status, counters, and hook indicators
+- **Fix N+1 in QraftTaskAdmin**: `get_queryset()` now annotates `attempt_count` to avoid per-row queries
+- **State machine validation**: `WorkflowStatusMixin.transition_to()` validates status transitions with clear error messages
+- **`counted` field on QraftTaskAttempt**: Supports dispatcher idempotency
+
+#### Packaging & CI
+- **Fixed `requires-python`**: Changed from `>=3.9` to `>=3.10` (match syntax used in codebase)
+- **Fixed CI workflow**: Updated Python matrix, fixed `uv sync --group test`, added Codecov token, added `--cov-fail-under=80`
+- **Added packaging metadata**: classifiers, project URLs, keywords
+- **Version metadata**: package version is exposed via `pyproject.toml` / `importlib.metadata.version("django-qraft")`
+- **Fixed README/CHANGELOG placeholders**: Replaced `yourusername` with actual GitHub username
+
+### Changed
+- `QraftTask.qraft_iter` and `qraft_batch` FK cascade changed from `SET_NULL` to `CASCADE`
+- `QraftBatch.add()` deprecated in favor of `append()` for API consistency
+- `RetryPolicy.__init__()` now uses `get_conf()` instead of module-level `conf`
+- `schedule_retry()` now takes explicit `current_attempt` parameter
+- Ruff target version changed from `py312` to `py310`
+
+### Database
+- `QraftTaskAttempt.counted`, `WorkflowHookMixin.on_cancelled`, `WorkflowHookMixin.progress_hook`, `CANCELLED` status choice, and FK cascade changes folded into migration `0003_workflow_primitives` (squashed pre-release)
+
+## [1.1.0] - 2026-01-24
+
+### Added
+
+#### Workflow Primitives
+- **QraftChain**: Sequential task execution with resume capability
+  - Each step can have its own retry policy
+  - Chain-level success/failure hooks
+  - Resume from failed step after fixing issues
+  - Automatic continuation after each step succeeds
+  - API: `QraftChain.append()`, `run()`, `resume()`, `result()`, `current()`
+
+- **QraftIter**: Parallel execution of same function with different inputs
+  - Atomic counter tracking for completion
+  - Default retry policy applies to all items
+  - Workflow-level hooks fire when all tasks complete
+  - API: `QraftIter.append()`, `run()`, `result()`, `length()`
+
+- **QraftBatch**: Parallel execution of different functions (fork-join)
+  - Each task can have individual retry policy
+  - Heterogeneous task support
+  - Workflow-level hooks fire when all tasks complete
+  - API: `QraftBatch.add()`, `run()`, `result()`
+
+#### New Models
+- `QraftChainModel`: Chain workflow state tracking
+- `QraftChainStep`: Individual chain step with OneToOne link to QraftTask
+- `QraftIterModel`: Iter workflow with atomic counters
+- `QraftBatchModel`: Batch workflow with atomic counters
+- `WorkflowHookDispatch`: Idempotent workflow hook tracking
+
+#### Module Reorganization
+- Refactored `qraft/models.py` into modular structure:
+  - `qraft/models/tasks.py`: QraftTask and QraftTaskAttempt
+  - `qraft/models/workflows.py`: Workflow models
+  - `qraft/models/hooks.py`: Hook dispatch models
+  - `qraft/models/mixins.py`: Shared enums and mixins (WorkflowStatus, WorkflowHookMixin)
+
+#### Workflow Infrastructure
+- Workflow detection in hook handler with automatic routing
+- `ChainDispatcher` for sequential workflow continuation
+- `ParallelDispatcher` for atomic completion tracking with F() expressions
+- `_create_workflow_task()` internal helper for workflow task creation
+- Workflow-level dual-phase hooks (separate from task-level hooks)
+
+### Changed
+- Hook handler now detects workflow membership and routes to appropriate dispatcher
+- Workflow tasks skip task-level hooks (workflow-level hooks only)
+- Models module is now a package with organized submodules
+
+### Database
+- Migration `0003_workflow_primitives`: Adds all workflow models and QraftTask FKs
+  - New tables: `qraft_qraftchainmodel`, `qraft_qraftchainstep`, `qraft_qraftitermodel`, `qraft_qraftbatchmodel`, `qraft_workflowhookdispatch`
+  - Added fields: `qraft_task.qraft_iter`, `qraft_task.qraft_batch`
+
+### Demo Updates
+- Added `demo chain` command for sequential workflow demonstration
+- Added `demo iter` command for parallel same-function demonstration
+- Added `demo batch` command for parallel multi-function demonstration
+
+### Testing
+- Added comprehensive unit tests for Chain, Iter, and Batch primitives
+- Added integration tests marked with `@pytest.mark.integration`
+- Test files: `test_chain.py`, `test_iter.py`, `test_batch.py`, `test_workflow_integration.py`
+
+### Documentation
+- Updated README.md with workflow primitives documentation and examples
+- Updated CLAUDE.md with workflow architecture details
+- Added workflow primitives to feature list and use cases
 
 ## [1.0.0] - 2025-01-24
 
@@ -60,12 +184,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Backward compatibility with Django-Q2
 
 ### Compatibility
-- Python 3.9+
+- Python 3.10+
 - Django 4.2+
 - Django-Q2 1.8+
 - Drop-in enhancement of Django-Q2
 
-## [0.1.0] - 2024-XX-XX (Initial Development)
+## [0.1.0] - 2025-01-10 (Initial Development)
 
 ### Added
 - Initial project structure
@@ -89,6 +213,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
-[Unreleased]: https://github.com/yourusername/django-qraft/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/yourusername/django-qraft/releases/tag/v1.0.0
-[0.1.0]: https://github.com/yourusername/django-qraft/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/ankitksr/django-qraft/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/ankitksr/django-qraft/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/ankitksr/django-qraft/releases/tag/v1.0.0
+[0.1.0]: https://github.com/ankitksr/django-qraft/releases/tag/v0.1.0

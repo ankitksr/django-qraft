@@ -1,6 +1,7 @@
 # Django-Qraft
 
-[![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/ankitksr/django-qraft/actions/workflows/test.yml/badge.svg)](https://github.com/ankitksr/django-qraft/actions/workflows/test.yml)
 [![Django Version](https://img.shields.io/badge/django-4.2+-green.svg)](https://www.djangoproject.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -53,6 +54,46 @@ QRAFT_CLUSTER = {
 ```
 
 [Learn more →](docs/threading.md)
+
+### 🔗 Workflow Primitives
+Orchestrate complex task workflows with chain (sequential), iter (parallel homogeneous), and batch (parallel heterogeneous) patterns.
+
+```python
+from qraft.chain import QraftChain
+
+# Sequential pipeline
+chain = QraftChain(on_success='myapp.hooks.pipeline_complete')
+chain.append('myapp.tasks.extract', source_id)
+chain.append('myapp.tasks.transform', format='json')
+chain.append('myapp.tasks.load', dest_id)
+chain.run()
+```
+
+```python
+from qraft.iter import QraftIter
+
+# Parallel processing of multiple items
+iter_task = QraftIter('myapp.tasks.process_report',
+    qraft_options={'max_attempts': 3},
+    on_success='myapp.hooks.all_reports_ready'
+)
+for report_id in report_ids:
+    iter_task.append(report_id)
+iter_task.run()
+```
+
+```python
+from qraft.batch import QraftBatch
+
+# Fork-join pattern for heterogeneous tasks
+batch = QraftBatch(on_success='myapp.hooks.generate_report')
+batch.append('myapp.tasks.fetch_sales', region='NA')
+batch.append('myapp.tasks.fetch_inventory', warehouse='main')
+batch.append('myapp.tasks.fetch_shipping', carrier='fedex')
+batch.run()
+```
+
+[Learn more →](docs/workflows.md)
 
 ### 🔌 Drop-in Compatible
 Fully compatible with Django-Q2 configuration and behavior. Use existing `Q_CLUSTER` settings or migrate to `QRAFT_CLUSTER`.
@@ -126,6 +167,7 @@ task_id = async_task(
 - [Dual-Phase Hooks](docs/hooks.md) - Success and failure hook system
 - [Retry Policies](docs/retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](docs/threading.md) - Concurrency for I/O-bound tasks
+- [Workflow Primitives](docs/workflows.md) - Chain, Iter, and Batch orchestration
 
 ### Advanced Topics
 - [Architecture](docs/architecture.md) - System design and extension patterns
@@ -234,7 +276,7 @@ QraftCluster (extends Cluster)
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - Django 4.2+
 - Django-Q2 1.8+
 
@@ -255,6 +297,11 @@ python manage.py demo retry --fail-times 2 --max-attempts 4
 # Terminal 1: python manage.py qraftcluster
 # Terminal 2: Q_CLUSTER_NAME=qraft python manage.py qraftcluster
 # Terminal 3: python manage.py demo perf -n 20
+
+# Workflow primitives demos
+python manage.py demo chain -n 3
+python manage.py demo iter -n 5
+python manage.py demo batch -n 3
 ```
 
 [Demo Guide →](demo/README.md)
@@ -275,7 +322,7 @@ python manage.py demo retry --fail-times 2 --max-attempts 4
 
 ## Testing
 
-Django-Qraft has a comprehensive test suite with >90% coverage:
+Django-Qraft has a comprehensive test suite (75% coverage; the admin UI is excluded and verified manually via the demo app):
 
 ```bash
 # Run all tests
@@ -298,7 +345,7 @@ Contributions are welcome! Please see our [Contributing Guide](CONTRIBUTING.md) 
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/django-qraft.git
+git clone https://github.com/ankitksr/django-qraft.git
 cd django-qraft
 
 # Install dependencies
@@ -325,10 +372,12 @@ Django-Qraft maintains full backward compatibility with Django-Q2:
 
 ## Roadmap
 
+- [x] **v1.1.0**: Workflow primitives (Chain, Iter, Batch)
 - [ ] Async/await worker support for native asyncio tasks
 - [ ] Enhanced monitoring and metrics
 - [ ] Task prioritization
 - [ ] Dead letter queue for failed tasks
+- [ ] Nested workflow support
 
 [Future Plans →](docs/future/)
 
@@ -343,7 +392,7 @@ Built on top of the excellent [Django-Q2](https://django-q2.readthedocs.io/) pro
 ## Links
 
 - **Documentation**: [docs/](docs/)
-- **Source Code**: [GitHub Repository](https://github.com/yourusername/django-qraft)
-- **Issue Tracker**: [GitHub Issues](https://github.com/yourusername/django-qraft/issues)
+- **Source Code**: [GitHub Repository](https://github.com/ankitksr/django-qraft)
+- **Issue Tracker**: [GitHub Issues](https://github.com/ankitksr/django-qraft/issues)
 - **Changelog**: [CHANGELOG.md](CHANGELOG.md)
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)

@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from qraft.conf import QraftSettings, RetryBackoff, RetryDefaultsSettings, get_conf
+from qraft.conf import QraftSettings, RetryBackoff, RetryDefaultsSettings, _cached_conf, get_conf
 
 
 class TestRetryDefaultsSettings:
@@ -265,17 +265,17 @@ class TestGetConf:
             assert conf.threads == 1
 
     @patch("qraft.conf.django_settings")
-    def test_get_conf_returns_new_instance(self, mock_django_settings):
-        """Test that get_conf returns a new instance each time."""
+    def test_get_conf_returns_cached_instance(self, mock_django_settings):
+        """Test that get_conf returns the same cached instance for same cluster."""
         mock_django_settings.QRAFT_CLUSTER = {"threads": 2}
+        _cached_conf.cache_clear()
 
         conf1 = get_conf()
         conf2 = get_conf()
 
-        # Should be different instances
-        assert conf1 is not conf2
-        # But with same values
-        assert conf1.threads == conf2.threads
+        # LRU cache returns same instance for same cluster name
+        assert conf1 is conf2
+        assert conf1.threads == 2
 
 
 class TestRetryBackoff:

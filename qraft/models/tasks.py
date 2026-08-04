@@ -1,3 +1,5 @@
+"""Core task models for Django-Qraft."""
+
 from uuid import uuid4
 
 from django.core.serializers.json import DjangoJSONEncoder
@@ -101,6 +103,26 @@ class QraftTask(models.Model):
         help_text="Retry policy configuration",
     )
 
+    # Workflow linkage (only one will be set, if any)
+    qraft_iter = models.ForeignKey(
+        "QraftIterModel",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+        help_text="Parent QraftIter workflow (if part of iter)",
+    )
+    qraft_batch = models.ForeignKey(
+        "QraftBatchModel",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+        help_text="Parent QraftBatch workflow (if part of batch)",
+    )
+    # Chain linkage is via QraftChainStep.qraft_task OneToOne
+    # (reverse: task.chain_step)
+
     @property
     def attempt_count(self) -> int:
         """Return the number of attempts for this task."""
@@ -162,6 +184,12 @@ class QraftTaskAttempt(models.Model):
         help_text="Exception class name if failed",
     )
 
+    # Dispatcher idempotency flag (prevents double-counting in parallel workflows)
+    counted = models.BooleanField(
+        default=False,
+        help_text="Whether this attempt has been counted by a parallel dispatcher",
+    )
+
     # Timing
     date_created = models.DateTimeField(auto_now_add=True)
     date_completed = models.DateTimeField(
@@ -194,70 +222,6 @@ class QraftTaskAttempt(models.Model):
             models.UniqueConstraint(
                 fields=["qraft_task", "attempt_number"],
                 name="unique_attempt_per_task",
-            )
-        ]
-
-
-class HookDispatch(models.Model):
-    """
-    Tracks hooks dispatched as async tasks.
-
-    Links a QraftTask to the hook task that was queued for execution.
-    The unique constraint on (qraft_task, hook_type) ensures hooks
-    are only dispatched once per task, providing idempotency.
-    """
-
-    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
-
-    qraft_task = models.ForeignKey(
-        QraftTask,
-        related_name="hook_dispatches",
-        on_delete=models.CASCADE,
-        help_text="QraftTask that triggered this hook",
-    )
-
-    hook_type = models.CharField(
-        max_length=10,
-        help_text="Type of hook: 'success' or 'failure'",
-    )
-
-    hook_path = models.CharField(
-        max_length=256,
-        help_text="Dotted path to hook function",
-    )
-
-    q2_task_id = models.CharField(
-        max_length=32,
-        unique=True,
-        help_text="Django-Q2 task ID of the queued hook",
-    )
-
-    date_created = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"HookDispatch {self.hook_type} for {self.qraft_task_id}"
-
-    def get_q2_task(self):
-        """Retrieve the associated Django-Q2 Task if it exists."""
-        from django_q.models import Task as Q2Task
-
-        if not self.q2_task_id:
-            return None
-
-        try:
-            return Q2Task.objects.get(id=self.q2_task_id)
-        except Q2Task.DoesNotExist:
-            return None
-
-    class Meta:
-        app_label = "qraft"
-        verbose_name = "Hook Dispatch"
-        verbose_name_plural = "Hook Dispatches"
-        ordering = ["-date_created"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["qraft_task", "hook_type"],
-                name="unique_hook_dispatch_per_task_type",
             )
         ]
 
