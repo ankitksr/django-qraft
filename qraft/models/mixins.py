@@ -9,6 +9,7 @@ class WorkflowStatus(models.TextChoices):
 
     PENDING = "pending", "Pending"
     RUNNING = "running", "Running"
+    WAITING_APPROVAL = "waiting_approval", "Waiting for approval"
     SUCCEEDED = "succeeded", "Succeeded"
     FAILED = "failed", "Failed"
     CANCELLED = "cancelled", "Cancelled"
@@ -18,9 +19,14 @@ class WorkflowStatus(models.TextChoices):
 VALID_TRANSITIONS = {
     WorkflowStatus.PENDING: {WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED},
     WorkflowStatus.RUNNING: {
+        WorkflowStatus.WAITING_APPROVAL,
         WorkflowStatus.SUCCEEDED,
         WorkflowStatus.FAILED,
         WorkflowStatus.CANCELLED,
+    },
+    WorkflowStatus.WAITING_APPROVAL: {
+        WorkflowStatus.RUNNING,  # approve
+        WorkflowStatus.CANCELLED,  # reject
     },
     WorkflowStatus.FAILED: {WorkflowStatus.RUNNING},  # resume
     WorkflowStatus.SUCCEEDED: set(),  # terminal

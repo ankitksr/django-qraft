@@ -79,6 +79,11 @@ class QraftChainStep(models.Model):
         help_text="Qraft-specific options (retry policy, etc.)",
     )
 
+    requires_approval = models.BooleanField(
+        default=False,
+        help_text="Chain parks in WAITING_APPROVAL before running this step",
+    )
+
     # Link to QraftTask once step is queued (null until run)
     qraft_task = models.OneToOneField(
         "QraftTask",

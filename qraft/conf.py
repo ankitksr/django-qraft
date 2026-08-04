@@ -110,6 +110,17 @@ class QraftSettings(BaseSettings):
         False, description="Run hooks synchronously in monitor (legacy behavior)"
     )
 
+    # Orphan reaper settings
+    reap_interval: float = Field(
+        60.0, gt=0, description="Seconds between orphan reaper sweeps in the sentinel"
+    )
+    reap_stale_after: float = Field(
+        3600.0,
+        gt=0,
+        description="Seconds a RUNNING attempt may go without a Q2 result "
+        "before it is treated as orphaned",
+    )
+
     def get_max_inflight(self) -> int:
         """Return max_inflight, defaulting to threads * 2 if not set."""
         if self.max_inflight is not None:

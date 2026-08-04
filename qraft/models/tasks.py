@@ -103,6 +103,34 @@ class QraftTask(models.Model):
         help_text="Retry policy configuration",
     )
 
+    idempotency_key = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="Caller-supplied key; re-enqueueing the same key is a no-op",
+    )
+
+    class TaskPriority(models.TextChoices):
+        HIGH = "high", "High"
+        DEFAULT = "default", "Default"
+        LOW = "low", "Low"
+
+    priority = models.CharField(
+        max_length=10,
+        choices=TaskPriority.choices,
+        default=TaskPriority.DEFAULT,
+        db_index=True,
+        help_text="Priority lane within the consuming cluster",
+    )
+
+    progress = models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Task-reported progress payload (current/total/message)",
+    )
+
     # Workflow linkage (only one will be set, if any)
     qraft_iter = models.ForeignKey(
         "QraftIterModel",
@@ -190,6 +218,13 @@ class QraftTaskAttempt(models.Model):
         help_text="Whether this attempt has been counted by a parallel dispatcher",
     )
 
+    usage = models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Task-reported usage (model, input_tokens, output_tokens, cost)",
+    )
+
     # Timing
     date_created = models.DateTimeField(auto_now_add=True)
     date_completed = models.DateTimeField(
@@ -226,5 +261,28 @@ class QraftTaskAttempt(models.Model):
         ]
 
 
+class RateBucket(models.Model):
+    """
+    DB-coordinated token bucket for cross-worker backpressure.
+
+    One row per throttle key (provider, tenant, ...). Workers refill and drain
+    the bucket under a row lock, so N workers share one rate limit instead of
+    each enforcing its own.
+    """
+
+    key = models.CharField(max_length=255, unique=True)
+    tokens = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"RateBucket {self.key} ({self.tokens:.1f})"
+
+    class Meta:
+        app_label = "qraft"
+        verbose_name = "Rate Bucket"
+        verbose_name_plural = "Rate Buckets"
+
+
 # Module-level export for convenience
 TaskStatus = QraftTask.TaskStatus
+TaskPriority = QraftTask.TaskPriority
