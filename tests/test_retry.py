@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
-from qraft.retry import RetryPolicy, handle_task_retry
+from qraft.retry import RetryPolicy, handle_task_retry, parse_retry_after
 
 
 class TestRetryPolicy:
@@ -246,10 +246,10 @@ class TestRetryPolicy:
             jitter=False,
         )
 
-        assert policy.calculate_delay(1) == 10   # 10 * 2^0
-        assert policy.calculate_delay(2) == 20   # 10 * 2^1
-        assert policy.calculate_delay(3) == 40   # 10 * 2^2
-        assert policy.calculate_delay(4) == 80   # 10 * 2^3
+        assert policy.calculate_delay(1) == 10  # 10 * 2^0
+        assert policy.calculate_delay(2) == 20  # 10 * 2^1
+        assert policy.calculate_delay(3) == 40  # 10 * 2^2
+        assert policy.calculate_delay(4) == 80  # 10 * 2^3
 
     def test_calculate_delay_with_jitter(self):
         """Test delay calculation with jitter."""
@@ -459,3 +459,89 @@ class TestHandleTaskRetry:
         result = handle_task_retry(task, attempt)
 
         assert result is False
+
+
+class TestRateLimitRetries:
+    """Tests for rate-limit-aware retry behavior."""
+
+    def test_rate_limit_exception_retryable_despite_allowlist(self):
+        """Rate-limit exceptions bypass a restrictive retry_exceptions allowlist."""
+        policy = RetryPolicy(
+            max_attempts=3,
+            retry_exceptions=["ValueError"],
+        )
+
+        assert policy.should_retry(1, "RateLimitError") is True
+        assert policy.should_retry(1, "TooManyRequests") is True
+
+    def test_skip_exceptions_still_wins_over_rate_limit(self):
+        """skip_exceptions takes precedence even over the rate-limit set."""
+        policy = RetryPolicy(skip_exceptions=["RateLimitError"])
+
+        assert policy.should_retry(1, "RateLimitError") is False
+
+    def test_custom_rate_limit_exceptions_override_default_set(self):
+        policy = RetryPolicy(
+            retry_exceptions=["ValueError"],
+            rate_limit_exceptions=["MyThrottleError"],
+        )
+
+        # No longer in the (overridden) rate-limit set, so the allowlist applies.
+        assert policy.should_retry(1, "RateLimitError") is False
+        assert policy.should_retry(1, "MyThrottleError") is True
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Retry-After: 12", 12.0),
+            ("retry_after=12", 12.0),
+            ("please retry after 5", 5.0),
+            ("try again in 12 seconds", 12.0),
+            ("try again in 7s", 7.0),
+            ("something went wrong, no hint here", None),
+        ],
+    )
+    def test_parse_retry_after(self, text, expected):
+        assert parse_retry_after(text) == expected
+
+    def test_parse_retry_after_handles_empty_input(self):
+        assert parse_retry_after(None) is None
+        assert parse_retry_after("") is None
+
+    def test_calculate_delay_honors_retry_after(self):
+        policy = RetryPolicy(base_delay=10.0, jitter=False)
+
+        delay = policy.calculate_delay(1, retry_after=20.0)
+
+        # Small positive jitter only - never below the provider's hint.
+        assert 20 <= delay <= 22
+
+    def test_calculate_delay_caps_retry_after_at_max(self):
+        policy = RetryPolicy(base_delay=10.0, jitter=False, rate_limit_max_delay=30.0)
+
+        delay = policy.calculate_delay(1, retry_after=1000.0)
+
+        assert delay <= 33  # capped at 30 + 10% jitter headroom
+
+    def test_calculate_delay_is_rate_limit_uses_exponential_regardless_of_strategy(
+        self,
+    ):
+        policy = RetryPolicy(
+            base_delay=10.0,
+            backoff_strategy="fixed",
+            jitter=False,
+            rate_limit_max_delay=1000.0,
+        )
+
+        assert policy.calculate_delay(1, is_rate_limit=True) == 10
+        assert policy.calculate_delay(3, is_rate_limit=True) == 40
+
+    def test_calculate_delay_is_rate_limit_capped_at_max_delay(self):
+        policy = RetryPolicy(
+            base_delay=100.0,
+            backoff_strategy="exponential",
+            jitter=False,
+            rate_limit_max_delay=50.0,
+        )
+
+        assert policy.calculate_delay(3, is_rate_limit=True) == 50

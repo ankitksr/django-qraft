@@ -6,13 +6,37 @@ import logging
 import warnings
 from typing import Any, Callable
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django_q.tasks import async_task as q2_async_task
 
+from qraft.brokers import QraftOrmBroker, priority_list_key
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+from qraft.models.tasks import TaskPriority
 from qraft.retry import RetryPolicy
 
 _logger = logging.getLogger("qraft")
+
+
+def _existing_task_for_key(idempotency_key: str) -> str | None:
+    """
+    Return the q2_task_id of the task already enqueued under this key.
+
+    Returns None if no QraftTask holds this key yet.
+    """
+    existing = QraftTask.objects.filter(idempotency_key=idempotency_key).first()
+    if existing is None:
+        return None
+
+    attempt = existing.latest_attempt
+    if attempt is None:
+        return None
+
+    _logger.info(
+        "Idempotency key %s already used by QraftTask %s; skipping re-enqueue",
+        idempotency_key,
+        existing.id,
+    )
+    return attempt.q2_task_id
 
 
 def async_task(
@@ -72,6 +96,16 @@ def async_task(
                 jitter_max (float): maximum jitter as fraction of delay.
                 retry_exceptions (list[str]): exception class names to retry on.
                 skip_exceptions (list[str]): exception class names to skip.
+                idempotency_key (str): caller-supplied dedupe key. A second
+                    call with the same key is a no-op: it returns the
+                    original call's q2_task_id instead of enqueueing again.
+                    The key is a permanent dedupe, not a "retry if failed"
+                    signal - even a FAILED/EXHAUSTED task blocks re-enqueue.
+                    Callers that want to run again must use a new key.
+                priority ("high" | "default" | "low"): priority lane to
+                    enqueue into. Only takes effect if the cluster's broker
+                    is `qraft.brokers.QraftOrmBroker` (see that module's
+                    docstring); otherwise the task is queued normally.
         **kwargs:
             Extra keyword arguments passed to the task function.
 
@@ -83,6 +117,21 @@ def async_task(
 
     if qraft_options is None:
         qraft_options = {}
+
+    # Idempotency: a task already enqueued under this key is never
+    # re-enqueued, regardless of its current status. Callers that want to
+    # run again must use a new key.
+    idempotency_key = qraft_options.get("idempotency_key")
+    if idempotency_key:
+        existing_q2_task_id = _existing_task_for_key(idempotency_key)
+        if existing_q2_task_id is not None:
+            return existing_q2_task_id
+
+    priority = qraft_options.get("priority", TaskPriority.DEFAULT)
+    if priority not in TaskPriority.values:
+        raise ValueError(
+            f"Invalid priority {priority!r}; must be one of {TaskPriority.values}"
+        )
 
     # Extract Qraft hook configuration
     success_hook = qraft_options.get("success_hook")
@@ -122,10 +171,20 @@ def async_task(
         "failure_kwargs": qraft_options.get("failure_kwargs", {}),
         "retry_policy": retry_policy.to_dict() if retry_policy else {},
         "status": TaskStatus.RUNNING,
+        "idempotency_key": idempotency_key,
+        "priority": priority,
     }
 
     # Extract cluster routing from qraft_options
     cluster = qraft_options.get("cluster")
+
+    # Priority lanes: only takes effect against a cluster running
+    # qraft.brokers.QraftOrmBroker (see that module's docstring). Explicit
+    # `broker=` from the caller wins over priority routing.
+    if broker is None:
+        list_key = priority_list_key(priority)
+        if list_key is not None:
+            broker = QraftOrmBroker(list_key=list_key)
 
     # Build Q2 task options, only including non-None values
     # This is important because passing save=None is different from not passing save
@@ -156,21 +215,26 @@ def async_task(
     if broker is not None:
         q2_kwargs["broker"] = broker
 
-    # Create QraftTask, queue to Q2, and create attempt atomically
-    with transaction.atomic():
-        qraft_task = QraftTask.objects.create(**qraft_metadata)
-
-        try:
+    # Create QraftTask, queue to Q2, and create attempt atomically.
+    # A concurrent call with the same idempotency_key can lose the race here:
+    # IntegrityError aborts this transaction, so the fallback lookup below
+    # runs outside it, against the winner's already-committed row.
+    try:
+        with transaction.atomic():
+            qraft_task = QraftTask.objects.create(**qraft_metadata)
             q2_task_id = q2_async_task(func, *args, **q2_kwargs)
-        except Exception:
-            # If Q2 queueing fails, the transaction rolls back QraftTask too
-            raise
-
-        QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=1,
-            q2_task_id=q2_task_id,
+            QraftTaskAttempt.objects.create(
+                qraft_task=qraft_task,
+                attempt_number=1,
+                q2_task_id=q2_task_id,
+            )
+    except IntegrityError:
+        existing_q2_task_id = (
+            _existing_task_for_key(idempotency_key) if idempotency_key else None
         )
+        if existing_q2_task_id is None:
+            raise
+        return existing_q2_task_id
 
     _logger.debug(
         "Created QraftTask %s with attempt 1 (q2: %s, name: %s) for func %s",

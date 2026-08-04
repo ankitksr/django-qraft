@@ -174,7 +174,7 @@ def qraft_hook_handler(q2_task):
 
     # Handle retry logic for failed tasks BEFORE workflow/hook processing
     if not q2_task.success:
-        if handle_task_retry(qraft_task, attempt):
+        if handle_task_retry(qraft_task, attempt, result_text=q2_task.result):
             # Retry scheduled - task is not terminal yet, skip all further processing
             return
 
@@ -361,6 +361,7 @@ class HookDispatcher:
                 e,
                 exc_info=True,
             )
+
 
 def _is_workflow_task(qraft_task) -> bool:
     """

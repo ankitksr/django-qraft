@@ -25,6 +25,12 @@ Q_CLUSTER = {
     "orm": "default",
 }
 
+# Only interpreted by Django >= 6.0 (django.tasks / DEP 14); ignored
+# otherwise, so this is safe to declare unconditionally.
+TASKS = {
+    "default": {"BACKEND": "qraft.backend.QraftTaskBackend"},
+}
+
 QRAFT_CLUSTER = {
     "threads": 1,
     "max_inflight": 2,

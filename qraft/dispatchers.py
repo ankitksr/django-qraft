@@ -67,20 +67,7 @@ class ChainDispatcher:
         # Check if there's a next step
         next_step = self.chain.steps.filter(step_index=self.step.step_index + 1).first()
 
-        if next_step:
-            # Queue next step
-            with transaction.atomic():
-                self.chain.current_step_index = next_step.step_index
-                self.chain.save(update_fields=["current_step_index", "date_updated"])
-
-            _queue_chain_step(self.chain, next_step)
-            _logger.info(
-                "Chain %s: step %d succeeded, queued step %d",
-                self.chain.id,
-                self.step.step_index,
-                next_step.step_index,
-            )
-        else:
+        if not next_step:
             # Chain complete
             self._complete_chain(success=True)
             _logger.info(
@@ -88,6 +75,39 @@ class ChainDispatcher:
                 self.chain.id,
                 self.step.step_index,
             )
+            return
+
+        if next_step.requires_approval:
+            with transaction.atomic():
+                chain = QraftChainModel.objects.select_for_update().get(
+                    id=self.chain.id
+                )
+                chain.current_step_index = next_step.step_index
+                chain.transition_to(WorkflowStatus.WAITING_APPROVAL)
+                chain.save(
+                    update_fields=["current_step_index", "status", "date_updated"]
+                )
+            self.chain = chain
+            _logger.info(
+                "Chain %s: step %d succeeded, step %d requires approval, parked",
+                self.chain.id,
+                self.step.step_index,
+                next_step.step_index,
+            )
+            return
+
+        # Queue next step
+        with transaction.atomic():
+            self.chain.current_step_index = next_step.step_index
+            self.chain.save(update_fields=["current_step_index", "date_updated"])
+
+        _queue_chain_step(self.chain, next_step)
+        _logger.info(
+            "Chain %s: step %d succeeded, queued step %d",
+            self.chain.id,
+            self.step.step_index,
+            next_step.step_index,
+        )
 
     def _handle_step_failure(self):
         """Handle step failure after retries exhausted."""
@@ -107,8 +127,7 @@ class ChainDispatcher:
         """
         with transaction.atomic():
             self.chain.status = (
-                WorkflowStatus.SUCCEEDED if success
-                else WorkflowStatus.FAILED
+                WorkflowStatus.SUCCEEDED if success else WorkflowStatus.FAILED
             )
             self.chain.save(update_fields=["status", "date_updated"])
 
@@ -121,12 +140,10 @@ class ChainDispatcher:
                 hook_type="success" if success else "failure",
                 hook_path=hook,
                 hook_args=(
-                    self.chain.success_args if success
-                    else self.chain.failure_args
+                    self.chain.success_args if success else self.chain.failure_args
                 ),
                 hook_kwargs=(
-                    self.chain.success_kwargs if success
-                    else self.chain.failure_kwargs
+                    self.chain.success_kwargs if success else self.chain.failure_kwargs
                 ),
             )
 
@@ -166,7 +183,8 @@ class ParallelDispatcher:
         if self.workflow.status == WorkflowStatus.CANCELLED:
             _logger.debug(
                 "%s %s cancelled, skipping task processing",
-                self.workflow_type, self.workflow.id,
+                self.workflow_type,
+                self.workflow.id,
             )
             return
 
@@ -208,9 +226,8 @@ class ParallelDispatcher:
 
         with transaction.atomic():
             # Lock the attempt to check/set counted flag atomically
-            attempt = (
-                QraftTaskAttempt.objects.select_for_update()
-                .get(id=self.attempt.id)
+            attempt = QraftTaskAttempt.objects.select_for_update().get(
+                id=self.attempt.id
             )
             if attempt.counted:
                 _logger.debug(
@@ -225,9 +242,7 @@ class ParallelDispatcher:
             attempt.save(update_fields=["counted"])
 
             workflow = (
-                type(self.workflow)
-                .objects.select_for_update()
-                .get(id=self.workflow.id)
+                type(self.workflow).objects.select_for_update().get(id=self.workflow.id)
             )
 
             workflow.completed_count += 1
@@ -238,8 +253,10 @@ class ParallelDispatcher:
 
             is_complete = workflow.completed_count == workflow.total_count
             update_fields = [
-                "completed_count", "success_count",
-                "failure_count", "date_updated",
+                "completed_count",
+                "success_count",
+                "failure_count",
+                "date_updated",
             ]
 
             if is_complete:
@@ -291,7 +308,9 @@ class ParallelDispatcher:
         except Exception as e:
             _logger.warning(
                 "Failed to dispatch progress hook for %s %s: %s",
-                self.workflow_type, self.workflow.id, e,
+                self.workflow_type,
+                self.workflow.id,
+                e,
             )
 
     def _dispatch_workflow_hook(self):
@@ -306,11 +325,13 @@ class ParallelDispatcher:
                 hook_type="success" if success else "failure",
                 hook_path=hook,
                 hook_args=(
-                    self.workflow.success_args if success
+                    self.workflow.success_args
+                    if success
                     else self.workflow.failure_args
                 ),
                 hook_kwargs=(
-                    self.workflow.success_kwargs if success
+                    self.workflow.success_kwargs
+                    if success
                     else self.workflow.failure_kwargs
                 ),
             )

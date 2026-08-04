@@ -227,3 +227,58 @@ class TestAsyncTask:
         # Verify task args
         assert qraft_task.task_args == [1, 2]
         assert qraft_task.task_kwargs == {"key": "value"}
+
+
+@pytest.mark.django_db
+class TestAsyncTaskIdempotency:
+    """Tests for idempotency_key handling in async_task."""
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_second_call_same_key_returns_first_q2_task_id(self, mock_q2_async):
+        """A repeated key is a no-op: it returns the original q2_task_id."""
+        mock_q2_async.return_value = "q2-task-idem-1"
+        first = async_task(
+            "test.function", qraft_options={"idempotency_key": "same-key"}
+        )
+
+        mock_q2_async.return_value = "q2-task-idem-2"
+        second = async_task(
+            "test.function", qraft_options={"idempotency_key": "same-key"}
+        )
+
+        assert first == "q2-task-idem-1"
+        assert second == "q2-task-idem-1"
+        assert mock_q2_async.call_count == 1
+        assert QraftTask.objects.count() == 1
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_different_keys_create_separate_tasks(self, mock_q2_async):
+        """Distinct idempotency keys are independent tasks."""
+        mock_q2_async.side_effect = ["q2-task-a", "q2-task-b"]
+
+        async_task("test.function", qraft_options={"idempotency_key": "key-a"})
+        async_task("test.function", qraft_options={"idempotency_key": "key-b"})
+
+        assert QraftTask.objects.count() == 2
+        keys = set(QraftTask.objects.values_list("idempotency_key", flat=True))
+        assert keys == {"key-a", "key-b"}
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_key_stored_on_task(self, mock_q2_async):
+        """The idempotency key is persisted on QraftTask."""
+        mock_q2_async.return_value = "q2-task-store"
+
+        async_task("test.function", qraft_options={"idempotency_key": "my-key"})
+
+        qraft_task = QraftTask.objects.get()
+        assert qraft_task.idempotency_key == "my-key"
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_no_key_does_not_dedupe(self, mock_q2_async):
+        """Calls without an idempotency_key are never deduped against each other."""
+        mock_q2_async.side_effect = ["q2-task-x", "q2-task-y"]
+
+        async_task("test.function")
+        async_task("test.function")
+
+        assert QraftTask.objects.count() == 2

@@ -82,6 +82,7 @@ class QraftChain(BaseWorkflow):
         self,
         func: str,
         *args,
+        requires_approval: bool = False,
         qraft_options: dict | None = None,
         **kwargs,
     ):
@@ -91,6 +92,8 @@ class QraftChain(BaseWorkflow):
         Args:
             func: Dotted path to the task function
             *args: Positional arguments for the task
+            requires_approval: If True, the chain parks in WAITING_APPROVAL
+                immediately before this step runs, until approve()/reject()
             qraft_options: Qraft-specific options (retry policy, cluster routing, etc.)
             **kwargs: Keyword arguments for the task
 
@@ -105,12 +108,15 @@ class QraftChain(BaseWorkflow):
             "task_args": list(args),
             "task_kwargs": kwargs,
             "qraft_options": qraft_options or {},
+            "requires_approval": requires_approval,
         }
         self._steps.append(step_data)
 
         _logger.debug(
             "Appended step %d to chain %s: %s",
-            len(self._steps) - 1, self._model.id, func,
+            len(self._steps) - 1,
+            self._model.id,
+            func,
         )
 
     def run(self) -> UUID:
@@ -140,12 +146,24 @@ class QraftChain(BaseWorkflow):
             self._model.status = WorkflowStatus.RUNNING
             self._model.save(update_fields=["status", "date_updated"])
 
-        first_step = self._model.steps.get(step_index=0)
+            first_step = self._model.steps.get(step_index=0)
+            if first_step.requires_approval:
+                self._model.transition_to(WorkflowStatus.WAITING_APPROVAL)
+                self._model.save(update_fields=["status", "date_updated"])
+
+        if first_step.requires_approval:
+            _logger.info(
+                "QraftChain %s parked at WAITING_APPROVAL before step 0",
+                self._model.id,
+            )
+            return self._model.id
+
         _queue_chain_step(self._model, first_step)
 
         _logger.info(
             "Started QraftChain %s with %d steps",
-            self._model.id, len(self._steps),
+            self._model.id,
+            len(self._steps),
         )
         return self._model.id
 
@@ -176,9 +194,62 @@ class QraftChain(BaseWorkflow):
 
         _logger.info(
             "Resumed QraftChain %s from step %d",
-            self._model.id, current_step.step_index,
+            self._model.id,
+            current_step.step_index,
         )
         return self._model.id
+
+    def approve(self) -> UUID:
+        """
+        Approve the step the chain is parked on and resume execution.
+
+        Raises:
+            InvalidStatusTransition: If chain is not WAITING_APPROVAL
+        """
+        with transaction.atomic():
+            chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
+            chain.transition_to(WorkflowStatus.RUNNING)
+            chain.save(update_fields=["status", "date_updated"])
+            step = chain.steps.get(step_index=chain.current_step_index)
+
+        self._model = chain
+        _queue_chain_step(chain, step)
+
+        _logger.info(
+            "QraftChain %s approved, queued step %d", chain.id, step.step_index
+        )
+        return chain.id
+
+    def reject(self, reason: str | None = None) -> UUID:
+        """
+        Reject the step the chain is parked on, cancelling the chain.
+
+        Args:
+            reason: Optional human-readable reason (logged only, not stored)
+
+        Raises:
+            InvalidStatusTransition: If chain is not WAITING_APPROVAL
+        """
+        with transaction.atomic():
+            chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
+            chain.transition_to(WorkflowStatus.CANCELLED)
+            chain.save(update_fields=["status", "date_updated"])
+
+        self._model = chain
+        _logger.info("QraftChain %s rejected: %s", chain.id, reason)
+
+        if chain.on_cancelled:
+            from qraft.dispatchers import _dispatch_workflow_hook
+
+            _dispatch_workflow_hook(
+                workflow_type="chain",
+                workflow_id=chain.id,
+                hook_type="cancelled",
+                hook_path=chain.on_cancelled,
+                hook_args=[],
+                hook_kwargs={},
+            )
+        return chain.id
 
     def current(self) -> int:
         """Get the current step index."""

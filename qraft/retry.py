@@ -5,6 +5,7 @@ Supports multiple backoff strategies, jitter, and exception-specific retry logic
 
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -21,6 +22,55 @@ MIN_JITTER_DELAY = 1
 QRAFT_MARKER_PREFIX = "qraft"
 QRAFT_RETRY_NAME_FMT = "qraft_retry:{task_id}:{attempt}"
 QRAFT_MARKER_FMT = "{prefix}:{task_id}:{attempt}"
+
+# Exception class names commonly raised by provider SDKs for rate limiting /
+# transient overload. These are retryable even under a restrictive
+# retry_exceptions allowlist, since backing off on them is almost always
+# the right default.
+RATE_LIMIT_EXCEPTIONS = frozenset(
+    {
+        "RateLimited",
+        "RateLimitError",
+        "TooManyRequests",
+        "TooManyRequestsError",
+        "ThrottlingException",
+        "ResourceExhausted",
+        "ServiceUnavailableError",
+        "OverloadedError",
+        "APIStatusError429",
+    }
+)
+
+# Patterns for "retry after N seconds" hints in provider error strings, e.g.
+# "Retry-After: 12", "retry_after=12", "try again in 12 seconds".
+_RETRY_AFTER_PATTERNS = (
+    re.compile(r"retry[-_ ]after[:=\s]+(\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r"try again in (\d+(?:\.\d+)?)\s*s(?:econds?)?", re.IGNORECASE),
+)
+
+
+def parse_retry_after(text: str) -> float | None:
+    """
+    Extract a "retry after N seconds" hint from a provider error string.
+
+    Returns the raw parsed value in seconds, uncapped - callers are
+    responsible for applying any maximum delay.
+
+    Args:
+        text: Error message or traceback text to search.
+
+    Returns:
+        Parsed delay in seconds, or None if no pattern matched.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    for pattern in _RETRY_AFTER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return float(match.group(1))
+
+    return None
 
 
 class RetryPolicy:
@@ -40,6 +90,8 @@ class RetryPolicy:
         jitter_max: float | None = None,
         retry_exceptions: list[str] | None = None,
         skip_exceptions: list[str] | None = None,
+        rate_limit_exceptions: list[str] | None = None,
+        rate_limit_max_delay: float = 300.0,
     ):
         """
         Initialize retry policy with defaults from global retry settings.
@@ -53,28 +105,29 @@ class RetryPolicy:
             jitter_max: Max jitter fraction (default: conf.retry_defaults.jitter_max)
             retry_exceptions: Exception names to retry on (None = retry all)
             skip_exceptions: Exception names to never retry
+            rate_limit_exceptions: Exception names treated as rate-limit errors
+                (None = use RATE_LIMIT_EXCEPTIONS default set)
+            rate_limit_max_delay: Cap in seconds for rate-limit-driven delays
         """
         # Use global retry default settings
         defaults = get_conf().retry_defaults
         self.max_attempts = (
-            max_attempts
-            if max_attempts is not None
-            else defaults.max_attempts
+            max_attempts if max_attempts is not None else defaults.max_attempts
         )
-        self.base_delay = (
-            base_delay if base_delay is not None else defaults.delay
-        )
+        self.base_delay = base_delay if base_delay is not None else defaults.delay
         self.backoff_strategy = (
-            backoff_strategy
-            if backoff_strategy is not None
-            else defaults.backoff.value
+            backoff_strategy if backoff_strategy is not None else defaults.backoff.value
         )
         self.jitter = jitter if jitter is not None else defaults.jitter
-        self.jitter_max = (
-            jitter_max if jitter_max is not None else defaults.jitter_max
-        )
+        self.jitter_max = jitter_max if jitter_max is not None else defaults.jitter_max
         self.retry_exceptions = set(retry_exceptions or [])
         self.skip_exceptions = set(skip_exceptions or [])
+        self.rate_limit_exceptions = (
+            set(rate_limit_exceptions)
+            if rate_limit_exceptions is not None
+            else set(RATE_LIMIT_EXCEPTIONS)
+        )
+        self.rate_limit_max_delay = rate_limit_max_delay
 
         # Validation
         if not 1 <= self.max_attempts <= 10:
@@ -117,6 +170,8 @@ class RetryPolicy:
             "jitter_max",
             "retry_exceptions",
             "skip_exceptions",
+            "rate_limit_exceptions",
+            "rate_limit_max_delay",
         }
 
         # Extract only retry-related options
@@ -138,6 +193,8 @@ class RetryPolicy:
             "jitter_max": self.jitter_max,
             "retry_exceptions": list(self.retry_exceptions),
             "skip_exceptions": list(self.skip_exceptions),
+            "rate_limit_exceptions": list(self.rate_limit_exceptions),
+            "rate_limit_max_delay": self.rate_limit_max_delay,
         }
 
     def should_retry(
@@ -171,6 +228,11 @@ class RetryPolicy:
             logger.debug("Exception %s in skip list", exc_name)
             return False
 
+        # Rate-limit errors are retryable even under a restrictive allowlist
+        if exc_name in self.rate_limit_exceptions:
+            logger.debug("Exception %s is a rate-limit error, retrying", exc_name)
+            return True
+
         # If retry_exceptions are specified, only retry those exceptions
         if self.retry_exceptions:
             should_retry = exc_name in self.retry_exceptions
@@ -184,23 +246,56 @@ class RetryPolicy:
         # Default: retry all exceptions not in skip list
         return True
 
-    def calculate_delay(self, attempt_number: int) -> float:
+    def is_rate_limit(self, exception: Exception | str | None) -> bool:
+        """Whether an exception (instance or class name) is a rate-limit error."""
+        if exception is None:
+            return False
+        exc_name = (
+            exception if isinstance(exception, str) else exception.__class__.__name__
+        )
+        return exc_name in self.rate_limit_exceptions
+
+    def calculate_delay(
+        self,
+        attempt_number: int,
+        retry_after: float | None = None,
+        is_rate_limit: bool = False,
+    ) -> float:
         """
         Calculate delay for the next retry attempt.
 
         Args:
             attempt_number: Current attempt number (1-based)
+            retry_after: Provider-supplied delay hint (e.g. from a
+                Retry-After header). Takes precedence over everything else.
+            is_rate_limit: Whether this retry follows a rate-limit error.
+                Ignored if retry_after is given.
 
         Returns:
             Delay in seconds
         """
-        match self.backoff_strategy:
-            case "linear":
-                delay = self.base_delay * attempt_number
-            case "exponential":
-                delay = self.base_delay * (2 ** (attempt_number - 1))
-            case _:
-                delay = self.base_delay
+        if retry_after is not None:
+            # Honor the provider's hint as a floor - only add a small positive
+            # jitter, never reduce below what it asked for.
+            delay = min(retry_after, self.rate_limit_max_delay)
+            delay += random.uniform(0, delay * 0.1)
+            return int(delay)
+
+        if is_rate_limit:
+            # Rate limits back off exponentially regardless of the configured
+            # strategy - a fixed/linear policy shouldn't hammer a 429.
+            delay = min(
+                self.base_delay * (2 ** (attempt_number - 1)),
+                self.rate_limit_max_delay,
+            )
+        else:
+            match self.backoff_strategy:
+                case "linear":
+                    delay = self.base_delay * attempt_number
+                case "exponential":
+                    delay = self.base_delay * (2 ** (attempt_number - 1))
+                case _:
+                    delay = self.base_delay
 
         # Add jitter if enabled
         if self.jitter and delay > 0:
@@ -208,22 +303,38 @@ class RetryPolicy:
             jitter = random.uniform(-jitter_amount, jitter_amount)
             delay = max(MIN_JITTER_DELAY, delay + jitter)
 
+        if is_rate_limit:
+            delay = min(delay, self.rate_limit_max_delay)
+
         return int(delay)
 
-    def next_eta(self, attempt_number: int) -> datetime:
+    def next_eta(
+        self,
+        attempt_number: int,
+        retry_after: float | None = None,
+        is_rate_limit: bool = False,
+    ) -> datetime:
         """
         Calculate ETA for the next retry attempt.
 
         Args:
             attempt_number: Current attempt number (1-based)
+            retry_after: Provider-supplied delay hint, see calculate_delay
+            is_rate_limit: Whether this retry follows a rate-limit error
 
         Returns:
             UTC datetime when task should be retried
         """
-        delay_seconds = self.calculate_delay(attempt_number)
+        delay_seconds = self.calculate_delay(attempt_number, retry_after, is_rate_limit)
         return datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
-    def schedule_retry(self, qraft_task, current_attempt: int) -> int:
+    def schedule_retry(
+        self,
+        qraft_task,
+        current_attempt: int,
+        retry_after: float | None = None,
+        is_rate_limit: bool = False,
+    ) -> int:
         """
         Schedule a retry for a failed task using Django-Q2's Schedule model.
 
@@ -235,6 +346,8 @@ class RetryPolicy:
             qraft_task: QraftTask model instance
             current_attempt: The attempt number that just failed (concrete value,
                 avoids race condition with COUNT queries)
+            retry_after: Provider-supplied delay hint, see calculate_delay
+            is_rate_limit: Whether this retry follows a rate-limit error
 
         Returns:
             Schedule ID
@@ -244,7 +357,10 @@ class RetryPolicy:
         from .models import TaskStatus
 
         next_attempt = current_attempt + 1
-        eta = self.next_eta(current_attempt)
+        delay_seconds = self.calculate_delay(
+            current_attempt, retry_after, is_rate_limit
+        )
+        eta = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
         # Build kwargs with q_options containing task_name for Qraft linkage
         # The scheduler extracts q_options and passes it to async_task
@@ -281,13 +397,13 @@ class RetryPolicy:
             qraft_task.id,
             eta,
             schedule.id,
-            self.calculate_delay(current_attempt),
+            delay_seconds,
         )
 
         return schedule.id
 
 
-def handle_task_retry(qraft_task, attempt) -> bool:
+def handle_task_retry(qraft_task, attempt, result_text: str | None = None) -> bool:
     """
     Handle retry logic for a failed task.
 
@@ -297,6 +413,8 @@ def handle_task_retry(qraft_task, attempt) -> bool:
     Args:
         qraft_task: QraftTask that failed
         attempt: QraftTaskAttempt with exception info
+        result_text: Raw task result/traceback text, used to look for a
+            provider "retry after" hint when the failure is a rate limit
 
     Returns:
         True if retry was scheduled, False if exhausted or no policy
@@ -314,8 +432,12 @@ def handle_task_retry(qraft_task, attempt) -> bool:
     current_attempt = attempt.attempt_number
 
     if retry_policy.should_retry(current_attempt, exc_class_name):
+        is_rate_limit = retry_policy.is_rate_limit(exc_class_name)
+        retry_after = parse_retry_after(result_text) if is_rate_limit else None
         # Schedule retry with backoff delay
-        retry_policy.schedule_retry(qraft_task, current_attempt)
+        retry_policy.schedule_retry(
+            qraft_task, current_attempt, retry_after, is_rate_limit
+        )
         return True
 
     # All retries exhausted

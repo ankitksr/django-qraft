@@ -17,11 +17,17 @@ _POLL_MAX_INTERVAL = 2.0  # 2 seconds
 _POLL_BACKOFF_FACTOR = 1.5
 
 # Terminal statuses (no more processing expected)
-_TERMINAL_STATUSES = frozenset({
-    WorkflowStatus.SUCCEEDED,
-    WorkflowStatus.FAILED,
-    WorkflowStatus.CANCELLED,
-})
+_TERMINAL_STATUSES = frozenset(
+    {
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.CANCELLED,
+    }
+)
+
+# Statuses that stop result() polling: terminal states plus WAITING_APPROVAL,
+# since a chain parked on approval won't progress without external action.
+_POLL_STOP_STATUSES = _TERMINAL_STATUSES | {WorkflowStatus.WAITING_APPROVAL}
 
 
 def _validate_hook_path(hook_path: str | None) -> None:
@@ -38,9 +44,7 @@ def _validate_hook_path(hook_path: str | None) -> None:
     try:
         import_string(hook_path)
     except ImportError as e:
-        raise ValueError(
-            f"Hook path '{hook_path}' cannot be imported: {e}"
-        ) from e
+        raise ValueError(f"Hook path '{hook_path}' cannot be imported: {e}") from e
 
 
 class BaseWorkflow:
@@ -85,7 +89,11 @@ class BaseWorkflow:
 
     def _poll_until_terminal(self, timeout_ms: int | None) -> None:
         """
-        Poll until workflow reaches terminal state with exponential backoff.
+        Poll until workflow reaches a terminal state with exponential backoff.
+
+        Also returns on WAITING_APPROVAL: that status won't progress without
+        an external approve()/reject() call, so a caller blocked in result()
+        would otherwise hang until timeout. Control is handed back instead.
 
         Args:
             timeout_ms: Timeout in milliseconds. None means no waiting.
@@ -99,7 +107,7 @@ class BaseWorkflow:
         start = time.time()
         interval = _POLL_INITIAL_INTERVAL
 
-        while self.status not in _TERMINAL_STATUSES:
+        while self.status not in _POLL_STOP_STATUSES:
             elapsed_ms = (time.time() - start) * 1000
             if elapsed_ms > timeout_ms:
                 raise TimeoutError(

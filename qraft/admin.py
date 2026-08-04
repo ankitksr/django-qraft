@@ -51,6 +51,13 @@ def _colored_status(status, display, colors=None):
 # ── QraftTask ──────────────────────────────────────────────
 
 
+def _compact_usage(usage):
+    """Render a usage JSON dict compactly (e.g. 'input_tokens=120, cost=0.02')."""
+    if not usage:
+        return "-"
+    return ", ".join(f"{key}={value}" for key, value in usage.items())
+
+
 class QraftTaskAttemptInline(admin.TabularInline):
     """Inline display of task attempts within QraftTask admin."""
 
@@ -62,10 +69,16 @@ class QraftTaskAttemptInline(admin.TabularInline):
         "q2_task_id",
         "success",
         "exception_class",
+        "usage_display",
         "date_created",
         "date_completed",
     ]
     ordering = ["attempt_number"]
+
+    def usage_display(self, obj):
+        return _compact_usage(obj.usage)
+
+    usage_display.short_description = "Usage"
 
     def has_add_permission(self, request, obj=None):
         return False
@@ -180,6 +193,7 @@ class QraftTaskAttemptAdmin(admin.ModelAdmin):
         "attempt_number",
         "success_display",
         "exception_class",
+        "usage_display",
         "date_created",
         "date_completed",
     ]
@@ -192,10 +206,16 @@ class QraftTaskAttemptAdmin(admin.ModelAdmin):
         "q2_task_id",
         "success",
         "exception_class",
+        "usage_display",
         "date_created",
         "date_completed",
     ]
     ordering = ["-date_created"]
+
+    def usage_display(self, obj):
+        return _compact_usage(obj.usage)
+
+    usage_display.short_description = "Usage"
 
     def short_id(self, obj):
         return _short_uuid(obj.id)
@@ -341,7 +361,9 @@ class QraftChainModelAdmin(admin.ModelAdmin):
 
     def status_display(self, obj):
         return _colored_status(
-            obj.status, obj.get_status_display(), _WORKFLOW_STATUS_COLORS,
+            obj.status,
+            obj.get_status_display(),
+            _WORKFLOW_STATUS_COLORS,
         )
 
     status_display.short_description = "Status"
@@ -415,7 +437,9 @@ class QraftIterModelAdmin(admin.ModelAdmin):
 
     def status_display(self, obj):
         return _colored_status(
-            obj.status, obj.get_status_display(), _WORKFLOW_STATUS_COLORS,
+            obj.status,
+            obj.get_status_display(),
+            _WORKFLOW_STATUS_COLORS,
         )
 
     status_display.short_description = "Status"
@@ -490,7 +514,9 @@ class QraftBatchModelAdmin(admin.ModelAdmin):
 
     def status_display(self, obj):
         return _colored_status(
-            obj.status, obj.get_status_display(), _WORKFLOW_STATUS_COLORS,
+            obj.status,
+            obj.get_status_display(),
+            _WORKFLOW_STATUS_COLORS,
         )
 
     status_display.short_description = "Status"
