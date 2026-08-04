@@ -174,6 +174,7 @@ task_id = async_task(
 - [Development Guide](docs/development.md) - Contributing and local development
 - [Testing Guide](tests/README.md) - Running and writing tests
 - [Demo Application](demo/README.md) - Interactive feature demonstrations
+- [Roadmap](docs/roadmap.md) - Positioning and planned features
 
 ## Use Cases
 
