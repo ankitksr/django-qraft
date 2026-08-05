@@ -40,10 +40,18 @@ def _queued_q2_task_ids() -> set[str] | None:
 
     Those legitimately have no heartbeat - no worker has picked them up yet.
     OrmQ stores a signed, pickled pack; `OrmQ.task_id()` unsigns and parses it.
-    Returns None if the queue can't be read, meaning "unknown, don't reap".
+    Returns None whenever queue membership can't be established, meaning
+    "unknown, don't reap": a non-ORM broker (Redis) holds its queue where
+    this check can't see, so a long-queued unstarted task would look
+    orphaned and get duplicated.
     """
     try:
+        from django_q.brokers import get_broker
+        from django_q.brokers.orm import ORM
         from django_q.models import OrmQ
+
+        if not isinstance(get_broker(), ORM):
+            return None
 
         return {
             task_id
@@ -51,7 +59,7 @@ def _queued_q2_task_ids() -> set[str] | None:
             if task_id
         }
     except Exception:
-        logger.exception("Could not read the OrmQ queue; skipping unstarted attempts")
+        logger.exception("Could not read the broker queue; skipping unstarted attempts")
         return None
 
 

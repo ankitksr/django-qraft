@@ -172,3 +172,13 @@ class TestQueuedTaskIds:
         broker.enqueue(SignedPackage.dumps({"id": "queued-1", "name": "t"}))
 
         assert "queued-1" in _queued_q2_task_ids()
+
+    def test_returns_none_on_non_orm_broker(self):
+        """A Redis-style broker's queue is invisible here: report "unknown,
+        don't reap" so long-queued unstarted tasks aren't duplicated."""
+        from unittest.mock import Mock
+
+        from qraft.reaper import _queued_q2_task_ids
+
+        with patch("django_q.brokers.get_broker", return_value=Mock()):
+            assert _queued_q2_task_ids() is None
