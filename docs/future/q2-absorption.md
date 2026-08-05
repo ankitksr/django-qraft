@@ -112,6 +112,31 @@ loop must reproduce what Q2 already solved (signal handling, recycling,
 timeouts, backpressure), and it is the step that makes Qraft a queue rather
 than an extension.
 
+## Latency: DB as truth, wakeups as transport
+
+The queue table (phase 3) does not have to be slow. The latency of a polled
+Postgres queue comes from the poll interval, not from Postgres. Two additions
+close the gap to Redis:
+
+1. **`LISTEN`/`NOTIFY` wakeups.** The enqueue transaction sends `NOTIFY` on
+   commit; idle workers block on the notification instead of polling. Pickup
+   drops to single-digit milliseconds, idle databases stop receiving poll
+   queries, and the commit-ordering race disappears because `NOTIFY` fires
+   only on commit. Procrastinate has proven this pattern in production.
+2. **The claim query replaces the transport.** With `SELECT ... FOR UPDATE
+   SKIP LOCKED`, the worker claims work directly - no pusher, no pack
+   encoding, no broker hop.
+
+This inverts the broker question. The durable truth is always the database
+row; a message transport is only a wakeup hint, and losing a hint costs one
+poll interval, not a task. Under that model Redis becomes an optional
+accelerator (publish the task id as a wakeup), never a store - and the
+reliable-Redis problem (Streams, consumer groups, pending-entry reclaim)
+does not need to be solved at all. For Qraft's workloads - AI jobs that run
+for seconds to minutes - even the current sub-second poll is rarely the
+bottleneck; the win from `LISTEN`/`NOTIFY` is as much the removal of idle
+poll load as the latency itself.
+
 ## Sequencing and decision gates
 
 Phase 2 is low risk and self-contained; it can ship in a minor release with
