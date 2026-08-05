@@ -8,11 +8,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Async/await worker support for native asyncio tasks
+- `TaskContext`, deferred (`run_after`) and coroutine tasks on the `django.tasks` backend
+- Priority routing for scheduled retries
 - Enhanced monitoring and metrics
-- Task prioritization
 - Dead letter queue for failed tasks
 - Nested workflow support
+
+## [1.2.0] - 2026-08-05
+
+Positioning shift: durable background jobs and workflows for Django — Postgres only, no
+extra infra, built for AI workloads.
+
+### Added
+
+#### Durability
+- **Orphan reaper** (`qraft/reaper.py`): `reap_orphans()` finds attempts whose worker died
+  mid-run (task still `RUNNING`, attempt unresolved, no Django-Q2 `Task` row) and resolves
+  them through the normal retry path, marking them `exception_class="OrphanedTask"`. Runs
+  as a daemon thread beside the monitor process; settings `reap_interval` (60s) and
+  `reap_stale_after` (3600s)
+- **Broker receipt warning**: `QraftCluster.start()` warns when the configured broker
+  overrides neither `acknowledge()` nor `fail()` — in-flight tasks are lost on a worker
+  crash
+
+#### AI-workload primitives
+- **Rate-limit-aware retries**: `RATE_LIMIT_EXCEPTIONS` (RateLimited, RateLimitError,
+  TooManyRequests, ThrottlingException, ResourceExhausted, OverloadedError, …) retry even
+  under a restrictive `retry_exceptions` allowlist, back off exponentially regardless of
+  the configured strategy, and cap at `rate_limit_max_delay` (300s). `parse_retry_after()`
+  honors provider `Retry-After` hints as a floor
+- **Cross-worker throttle** (`qraft/throttle.py`): `throttled()` decorator and `acquire()`
+  over a DB token bucket (`RateBucket`), so N workers share one provider rate limit.
+  Raises `RateLimited` when empty, which reschedules with rate-limit backoff
+- **Idempotency keys**: unique `idempotency_key` on `QraftTask`; a repeat `async_task()`
+  returns the original call's Q2 task id instead of enqueueing again. Permanent dedupe —
+  a `FAILED`/`EXHAUSTED` task still blocks re-enqueue
+- **Usage and progress** (`qraft/context.py`): `record_usage()` accumulates numeric fields
+  into `QraftTaskAttempt.usage`, `report_progress()` merges into `QraftTask.progress`.
+  Both find the executing attempt through a `pre_execute` receiver, no argument threading.
+  `aggregate_usage()` and `aggregate_workflow_usage()` roll up across attempts and
+  workflows
+- **Priority lanes** (`qraft/brokers.py`): `QraftOrmBroker` drains `{list_key}--high`,
+  `{list_key}`, `{list_key}--low` in order on one ORM queue. Enqueue with
+  `qraft_options={'priority': 'high'|'low'}`; consume by setting
+  `Q_CLUSTER["broker_class"] = "qraft.brokers.QraftOrmBroker"`
+
+#### Workflows
+- **Approval-gated chain steps**: `chain.append(..., requires_approval=True)` parks the
+  chain in `WAITING_APPROVAL` at zero compute before that step. `QraftChain.approve()` and
+  `reject(reason)` resume or cancel it under a row lock with transition validation
+- **`result()` returns on parked chains**: `WAITING_APPROVAL` is a polling stop state, so
+  `result(wait=...)` hands back completed steps instead of blocking to the timeout
+
+#### django.tasks (DEP 14)
+- **`qraft.backend.QraftTaskBackend`**: engines Django 6.0's official Tasks API on Qraft's
+  pipeline. `supports_get_result` and `supports_priority`; deferred, coroutine, and
+  context-taking tasks are rejected by `validate_task()`. Status mapping
+  PENDING/RUNNING/SUCCEEDED/FAILED-EXHAUSTED → READY/RUNNING/SUCCESSFUL/FAILED. Import is
+  guarded, so the package stays import-safe on Django < 6.0
+
+### Changed
+- `qraft.models` now re-exports `RateBucket` and `TaskPriority` alongside the other models
+- `RetryPolicy` accepts `rate_limit_exceptions` and `rate_limit_max_delay`;
+  `calculate_delay()`/`next_eta()`/`schedule_retry()` take `retry_after` and
+  `is_rate_limit`
+- `qraft_hook_handler()` passes the raw task result to `handle_task_retry()` so
+  `Retry-After` hints can be parsed
+- `QraftSentinel.spawn_monitor()` spawns the monitor with the reaper thread attached
+
+### Database
+- Migration `0004_ai_workload_fields`: `QraftTask.idempotency_key` (unique),
+  `QraftTask.priority`, `QraftTask.progress`, `QraftTaskAttempt.usage`,
+  `QraftChainStep.requires_approval`, `WAITING_APPROVAL` workflow status choice, and the
+  new `RateBucket` table
+
+### Demo
+- New scenarios: `demo approval`, `demo ratelimit`, `demo usage`, `demo idempotent`,
+  `demo reaper`
+- New tasks: `throttled_task`, `llm_task`, `charge_task`, `review_task`, `publish_task`
+
+### Documentation
+- New `docs/ai-workloads.md` and `docs/django-tasks-backend.md`
+- `docs/workflows.md`: approval steps and the updated status lifecycle
+- `docs/roadmap.md`: shipped items collected at the top
+- README: new feature sections, repositioned tagline, Postgres requirement
+
+### Testing
+- New test modules: `test_approval.py`, `test_backend.py`, `test_brokers.py`,
+  `test_context.py`, `test_reaper.py`, `test_throttle.py`. Suite is 275 passing;
+  `test_backend.py` skips unless Django 6.0+ is installed
 
 ## [1.1.1] - 2026-02-17
 
@@ -213,7 +297,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
-[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/ankitksr/django-qraft/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/ankitksr/django-qraft/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/ankitksr/django-qraft/releases/tag/v1.0.0

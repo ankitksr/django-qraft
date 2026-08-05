@@ -27,7 +27,7 @@ This guide covers local setup, testing, code style, and common development tasks
 ### Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/django-qraft.git
+git clone https://github.com/ankitksr/django-qraft.git
 cd django-qraft
 ```
 

@@ -39,6 +39,36 @@ if chain.status == 'failed':
     chain.resume()
 ```
 
+### Approval steps
+
+Mark a step `requires_approval=True` and the chain parks in `WAITING_APPROVAL` immediately before that step runs. Nothing is queued and no worker is held while it waits.
+
+```python
+chain = QraftChain(on_cancelled='myapp.hooks.publish_rejected')
+chain.append('myapp.tasks.draft_release_notes', release_id)
+chain.append('myapp.tasks.publish', release_id, requires_approval=True)
+chain.run()
+```
+
+Resume or abandon it from anywhere — a view, the admin, a shell — by loading the chain by id:
+
+```python
+chain = QraftChain(chain_id=chain_id)
+if chain.status == 'waiting_approval':
+    chain.approve()              # queues the parked step, status → running
+    # or
+    chain.reject('not ready')    # status → cancelled, fires on_cancelled
+```
+
+`approve()` and `reject()` take a row lock and validate the transition, so two reviewers racing produce one decision and an `InvalidStatusTransition` for the loser.
+
+`result(wait=...)` returns as soon as the chain parks instead of blocking to the timeout: `WAITING_APPROVAL` cannot clear without an external decision. The returned `WorkflowResult` holds the steps completed so far.
+
+```python
+partial = chain.result(wait=30000)   # returns at once if parked
+print(len(partial))                  # steps finished before the gate
+```
+
 ### Getting results
 
 ```python
@@ -156,5 +186,7 @@ Workflow state is stored in the database:
 ```
 PENDING → RUNNING → SUCCEEDED
                   → FAILED → RUNNING (resume, chain only)
+                  → WAITING_APPROVAL → RUNNING   (approve, chain only)
+                                     → CANCELLED (reject)
          → CANCELLED (from PENDING or RUNNING)
 ```

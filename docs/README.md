@@ -12,8 +12,12 @@ Welcome to the Django-Qraft documentation! This guide will help you understand, 
 - [Dual-Phase Hooks](hooks.md) - Success and failure hook system
 - [Retry Policies](retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](threading.md) - Concurrency for I/O-bound tasks
+- [Workflow Primitives](workflows.md) - Chain, Iter, Batch, and approval steps
+- [AI Workloads](ai-workloads.md) - Rate limits, throttling, usage accounting, idempotency, reaper, priority lanes
 
 ### Advanced Topics
+- [django.tasks Backend](django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
+- [Roadmap](roadmap.md) - Positioning and planned features
 - [Architecture](architecture.md) - System design and extension patterns
 - [Development Guide](development.md) - Contributing and local development
 
@@ -215,6 +219,10 @@ QRAFT_CLUSTER = {
     # Hook behavior
     "sync_hooks": False,       # False=async (default), True=sync
     "grace_period": 30.0,      # Shutdown grace period
+
+    # Orphan reaper
+    "reap_interval": 60.0,     # Seconds between sweeps
+    "reap_stale_after": 3600.0,  # Unresolved seconds before an attempt is orphaned
 }
 ```
 
@@ -244,8 +252,8 @@ hooks = HookDispatch.objects.filter(qraft_task=task)
 - [CHANGELOG](../CHANGELOG.md) - Version history
 
 ### Support
-- **Issues**: [GitHub Issues](https://github.com/yourusername/django-qraft/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/django-qraft/discussions)
+- **Issues**: [GitHub Issues](https://github.com/ankitksr/django-qraft/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/ankitksr/django-qraft/discussions)
 
 ## Next Steps
 

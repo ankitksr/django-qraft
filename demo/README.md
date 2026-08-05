@@ -27,6 +27,11 @@ uv run python manage.py demo chain
 uv run python manage.py demo iter
 uv run python manage.py demo batch
 uv run python manage.py demo cancel
+uv run python manage.py demo approval
+uv run python manage.py demo ratelimit
+uv run python manage.py demo usage
+uv run python manage.py demo idempotent
+uv run python manage.py demo reaper
 
 # For performance comparison, see "Perf Demo" section below
 ```
@@ -110,6 +115,48 @@ Creates a chain of slow tasks, then immediately cancels it. Demonstrates:
 - `chain.cancel()` sets status to CANCELLED
 - In-flight tasks complete but no further steps are queued
 - The `on_cancelled` hook fires
+
+### Approval: Human-in-the-Loop Chain Step
+
+```bash
+uv run python manage.py demo approval
+```
+
+A two-step chain whose second step is gated with `requires_approval=True`. The chain parks in `WAITING_APPROVAL` after step 1, `result()` returns the completed step instead of blocking, then `chain.approve()` queues step 2 and the chain finishes.
+
+### Ratelimit: Token Bucket and Rate-Limit-Aware Retries
+
+```bash
+uv run python manage.py demo ratelimit
+```
+
+`throttled_task` is gated behind a `RateBucket` holding one token that refills at 0.01/s. Task 1 takes the token and succeeds. Task 2 raises `RateLimited`, and the demo prints the resulting `QraftTaskAttempt` and the `qraft_retry:<id>:<attempt>` Schedule row with its backoff `next_run`.
+
+The bucket is reset at the start of each run so the scenario repeats.
+
+### Usage: Token and Cost Accounting
+
+```bash
+uv run python manage.py demo usage
+```
+
+`llm_task` makes three mock-llm calls, each calling `record_usage()` and `report_progress()`. The demo prints the per-attempt usage, the `aggregate_usage()` rollup, and the last reported progress payload.
+
+### Idempotent: Deduplicated Enqueue
+
+```bash
+uv run python manage.py demo idempotent
+```
+
+Enqueues `charge_task` twice under one `idempotency_key`. Both calls return the same Q2 task id and only one `QraftTask` row exists — Mockco is charged once.
+
+### Reaper: Orphan Detection and Requeue
+
+```bash
+uv run python manage.py demo reaper [--stale-after 1.0]
+```
+
+Fabricates a crashed worker: a `RUNNING` QraftTask with an unresolved attempt, a bogus `q2_task_id`, and a backdated `date_created`. `reap_orphans()` marks the attempt `OrphanedTask` and schedules a retry; the demo then waits for the requeued attempt to succeed and prints the full attempt history.
 
 ### Perf: Threading Performance Comparison
 

@@ -12,57 +12,31 @@ dual-phase hooks, retry policies, and workflow enrichment (django-q2#202, #203, 
 retries, hooks, chaining, and workers from its first pass. No Django-native library today
 offers Canvas-depth workflows or AI-workload primitives.
 
-## 1. Foundation — earn the "durable" claim
+## Shipped in 1.2.0
 
-- **Postgres/ORM broker as the blessed default.** The Redis broker loses in-flight tasks
-  on worker crash (no message receipts — documented Django-Q2 limitation). Docs and demo
-  default to the ORM broker; Redis documented as at-your-own-risk.
-- **Orphan detection and auto-requeue.** Worker heartbeat on `QraftTaskAttempt`; a reaper
-  requeues attempts whose worker died mid-run instead of leaving tasks stuck in RUNNING.
-  Closes the crash-path gap upstream has in `MAX_ATTEMPTS`/`ack_failure` (django-q2#328).
+- **ORM broker as the blessed default.** `QraftCluster` warns at startup when the broker
+  implements no delivery receipts. Docs and demo run on Postgres + ORM.
+- **Orphan detection and auto-requeue.** `qraft.reaper.reap_orphans()`, run as a daemon
+  thread beside the monitor, resolves attempts whose worker died mid-run through the
+  normal retry path (`reap_interval`, `reap_stale_after`).
+- **django.tasks backend.** `qraft.backend.QraftTaskBackend` engines the DEP 14 API on
+  Qraft's pipeline — see [django-tasks-backend.md](django-tasks-backend.md).
+- **Rate-limit-aware retries.** `RATE_LIMIT_EXCEPTIONS`, `Retry-After` parsing, forced
+  exponential backoff capped by `rate_limit_max_delay`.
+- **Idempotency keys.** Unique `idempotency_key` on `QraftTask`; a repeat enqueue returns
+  the original task id.
+- **Token/cost accounting.** `record_usage()` per attempt, `aggregate_usage()` and
+  `aggregate_workflow_usage()` for rollups.
+- **Human-in-the-loop chain step.** `requires_approval=True` parks a chain in
+  `WAITING_APPROVAL`; `approve()`/`reject()` resume or cancel it.
+- **Cross-worker backpressure.** `qraft.throttle.throttled()` over a shared `RateBucket`
+  row.
+- **Priority lanes.** `qraft.brokers.QraftOrmBroker` drains high/default/low lanes on one
+  ORM queue.
+- **Progress reporting.** `report_progress()` writes to `QraftTask.progress`.
 
-## 2. django.tasks first-class support
-
-Implement the DEP 14 backend interface so Qraft is an *engine* for Django's official API:
-
-- `qraft.backend.QraftTaskBackend(BaseTaskBackend)` — `enqueue()`/`aenqueue()` map to
-  `qraft.tasks.async_task()`; `priority` and `queue_name` map to cluster routing;
-  `get_result()` reads `QraftTask`/`QraftTaskAttempt`.
-- `TaskContext.attempt` backed by our attempt tracking; result statuses mapped
-  (READY/RUNNING/SUCCESSFUL/FAILED ↔ PENDING/RUNNING/SUCCEEDED/FAILED-EXHAUSTED).
-- Qraft-specific options (retry policy, success/failure hooks, workflows) remain available
-  via our native API; the backend covers the standard surface so `@task` code stays
-  portable.
-
-This is a positioning play: teams adopt the official interface, Qraft supplies the
-missing execution, retries, and orchestration.
-
-## 3. AI-workload table stakes
-
-- **Rate-limit-aware retries.** Extend `RetryPolicy` with a distinct retryable class for
-  provider throttling (429/503/529): honor `Retry-After` when present, cap with jitter,
-  never count against the hard-error budget the same way.
-- **Idempotency keys.** Optional unique `idempotency_key` on `QraftTask`; `async_task()`
-  returns the existing task instead of double-enqueueing. Prevents duplicate side effects
-  (double charge, double email) on retries and redelivery.
-- **Token/cost accounting.** Optional per-attempt usage recording
-  (`model, input_tokens, output_tokens, cost`) on `QraftTaskAttempt`, aggregated at task
-  and workflow level, surfaced in admin.
-
-## 4. Differentiators
-
-- **Human-in-the-loop workflow step.** A chain step that parks in `WAITING_FOR_APPROVAL`
-  at zero compute and resumes on an external signal (model method + view helper). No
-  Django-native tool offers distributed pause/resume today.
-- **Cross-worker backpressure.** Shared token bucket (DB row per provider/tenant key) so
-  N workers don't retry a rate-limited provider in lockstep — per-process semaphores can't
-  coordinate this.
-- **Priority lanes.** Priority-within-cluster scheduling on top of existing
-  `ALT_CLUSTERS`/`cluster=` routing, so paying-tenant or interactive jobs preempt batch
-  work without a second deployment.
-- **Progress reporting.** Task-updatable progress state between RUNNING and terminal
-  (counter + free-form payload) so apps can show live agent-loop progress without polling
-  Django-Q2 internals; pairs with `progress_hook` on parallel workflows.
+Remaining from the original plan: `TaskContext` injection, deferred (`run_after`) and
+coroutine tasks on the django.tasks backend; priority routing for scheduled retries.
 
 ## Deliberately not planned
 

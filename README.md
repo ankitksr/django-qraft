@@ -5,7 +5,9 @@
 [![Django Version](https://img.shields.io/badge/django-4.2+-green.svg)](https://www.djangoproject.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Django-Qraft is a next-generation distributed task queue for Django, built as a drop-in enhancement of [Django-Q2](https://django-q2.readthedocs.io/). It extends Django-Q2 with advanced features while maintaining full backward compatibility.
+Durable background jobs and workflows for Django — Postgres only, no extra infra, built for AI workloads.
+
+Django-Qraft is a drop-in enhancement of [Django-Q2](https://django-q2.readthedocs.io/): Django-Q2 supplies the cluster runtime, Qraft owns task state, retries, hooks, and orchestration. Full backward compatibility.
 
 ## Features
 
@@ -93,7 +95,65 @@ batch.append('myapp.tasks.fetch_shipping', carrier='fedex')
 batch.run()
 ```
 
+Chain steps can park for human approval at zero compute:
+
+```python
+chain.append('myapp.tasks.publish', release_id, requires_approval=True)
+chain.run()
+# ... later, from a view or the admin
+QraftChain(chain_id=chain_id).approve()
+```
+
 [Learn more →](docs/workflows.md)
+
+### 🤖 AI-Workload Primitives
+Rate-limit-aware retries, shared token buckets, token/cost accounting, and idempotency keys for jobs that call metered providers.
+
+```python
+from qraft.throttle import throttled
+from qraft.context import record_usage
+
+@throttled(key='openai:acme-tenant', rate=10, capacity=20)
+def summarize(doc_id):
+    response = client.messages.create(...)
+    record_usage(model='claude-opus-4', input_tokens=..., cost=...)
+
+async_task('myapp.tasks.summarize', doc_id,
+    qraft_options={'idempotency_key': f'summary:{doc_id}', 'max_attempts': 5})
+```
+
+Provider throttling (429/503/529) retries with forced exponential backoff and honors `Retry-After`, separate from your hard-error budget.
+
+[Learn more →](docs/ai-workloads.md)
+
+### 🛟 Crash Recovery
+A reaper resolves attempts whose worker died mid-run instead of leaving tasks stuck in RUNNING. It runs alongside the monitor; the cluster warns at startup if the broker has no delivery receipts.
+
+```python
+QRAFT_CLUSTER = {"reap_interval": 60, "reap_stale_after": 3600}
+```
+
+[Learn more →](docs/ai-workloads.md#orphan-reaper)
+
+### 🎚️ Priority Lanes
+High, default, and low lanes on a single ORM queue — interactive jobs preempt batch work without a second deployment.
+
+```python
+Q_CLUSTER = {"orm": "default", "broker_class": "qraft.brokers.QraftOrmBroker"}
+
+async_task('myapp.tasks.answer', query, qraft_options={'priority': 'high'})
+```
+
+[Learn more →](docs/ai-workloads.md#priority-lanes)
+
+### 🧩 django.tasks Engine
+Qraft implements the Django 6.0 Tasks API (DEP 14), so `@task` code stays portable while Qraft supplies the execution, retries, and orchestration DEP 14 leaves out.
+
+```python
+TASKS = {"default": {"BACKEND": "qraft.backend.QraftTaskBackend"}}
+```
+
+[Learn more →](docs/django-tasks-backend.md)
 
 ### 🔌 Drop-in Compatible
 Fully compatible with Django-Q2 configuration and behavior. Use existing `Q_CLUSTER` settings or migrate to `QRAFT_CLUSTER`.
@@ -167,7 +227,9 @@ task_id = async_task(
 - [Dual-Phase Hooks](docs/hooks.md) - Success and failure hook system
 - [Retry Policies](docs/retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](docs/threading.md) - Concurrency for I/O-bound tasks
-- [Workflow Primitives](docs/workflows.md) - Chain, Iter, and Batch orchestration
+- [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, and approval steps
+- [AI Workloads](docs/ai-workloads.md) - Rate limits, throttling, usage accounting, idempotency, reaper, priority lanes
+- [django.tasks Backend](docs/django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
 
 ### Advanced Topics
 - [Architecture](docs/architecture.md) - System design and extension patterns
@@ -278,8 +340,9 @@ QraftCluster (extends Cluster)
 ## Requirements
 
 - Python 3.10+
-- Django 4.2+
+- Django 4.2+ (6.0+ for the `django.tasks` backend)
 - Django-Q2 1.8+
+- PostgreSQL — the throttle, reaper, and workflow dispatchers need real row locks
 
 ## Demo Application
 
@@ -303,6 +366,13 @@ python manage.py demo retry --fail-times 2 --max-attempts 4
 python manage.py demo chain -n 3
 python manage.py demo iter -n 5
 python manage.py demo batch -n 3
+
+# AI-workload demos
+python manage.py demo approval
+python manage.py demo ratelimit
+python manage.py demo usage
+python manage.py demo idempotent
+python manage.py demo reaper
 ```
 
 [Demo Guide →](demo/README.md)
@@ -365,7 +435,7 @@ ruff check qraft/
 
 Django-Qraft maintains full backward compatibility with Django-Q2:
 
-- ✅ All Django-Q2 broker types supported (Redis, ORM, SQS, etc.)
+- ✅ All Django-Q2 broker types work; the ORM broker on Postgres is the supported combination (brokers without delivery receipts lose in-flight tasks on a worker crash — the cluster warns at startup)
 - ✅ Existing `Q_CLUSTER` settings work (with deprecation warning)
 - ✅ Standard `qcluster` command continues to work
 - ✅ Tasks queued via Django-Q2's `async_task` work seamlessly
@@ -374,9 +444,10 @@ Django-Qraft maintains full backward compatibility with Django-Q2:
 ## Roadmap
 
 - [x] **v1.1.0**: Workflow primitives (Chain, Iter, Batch)
-- [ ] Async/await worker support for native asyncio tasks
+- [x] **v1.2.0**: Orphan reaper, rate-limit-aware retries, idempotency keys, usage accounting, approval steps, cross-worker throttling, priority lanes, `django.tasks` backend
+- [ ] `TaskContext`, deferred and coroutine tasks on the `django.tasks` backend
+- [ ] Priority routing for scheduled retries
 - [ ] Enhanced monitoring and metrics
-- [ ] Task prioritization
 - [ ] Dead letter queue for failed tasks
 - [ ] Nested workflow support
 

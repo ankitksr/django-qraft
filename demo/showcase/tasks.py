@@ -6,13 +6,27 @@ Each task is designed to demonstrate a specific capability:
 - slow_task: I/O-bound work (benefits from threading)
 - flaky_task: Random failures (tests hooks)
 - countdown_task: Fails N times then succeeds (tests retries)
+- throttled_task: DB token bucket + rate-limit-aware retries
+- llm_task: Token/cost accounting and progress reporting
+- charge_task: Idempotency-key deduplication
+- review_task / publish_task: Approval-gated chain steps
 """
 
 import logging
 import random
 import time
 
+from qraft.context import record_usage, report_progress
+from qraft.throttle import throttled
+
 _log = logging.getLogger("showcase")
+
+# Bucket key shared by the rate-limit demo. Tiny rate + capacity 1 means the
+# first task through takes the only token and everything after it is denied.
+RATE_BUCKET_KEY = "mock-llm-provider"
+RATE_BUCKET_RATE = 0.01
+RATE_BUCKET_CAPACITY = 1.0
+
 
 class TransientError(Exception):
     """A recoverable error that should trigger retries."""
@@ -81,11 +95,9 @@ def countdown_task(task_id: str, fail_times: int = 2) -> dict:
     """
     from qraft.models import QraftTask
 
-    qraft_task = (
-        QraftTask.objects
-        .filter(func="showcase.tasks.countdown_task", task_args__0=task_id)
-        .latest("date_created")
-    )
+    qraft_task = QraftTask.objects.filter(
+        func="showcase.tasks.countdown_task", task_args__0=task_id
+    ).latest("date_created")
     attempt = qraft_task.attempts.count() + 1
 
     if attempt <= fail_times:
@@ -105,6 +117,75 @@ def permanent_fail_task() -> None:
     Use with skip_exceptions=["PermanentError"] to test skipping retries.
     """
     raise PermanentError("This error should not be retried")
+
+
+@throttled(key=RATE_BUCKET_KEY, rate=RATE_BUCKET_RATE, capacity=RATE_BUCKET_CAPACITY)
+def throttled_task(label: str) -> dict:
+    """
+    Gated behind a shared DB token bucket.
+
+    Raises `qraft.throttle.RateLimited` when the bucket is empty. RateLimited
+    is a known rate-limit exception, so Qraft reschedules it with rate-limit
+    backoff instead of counting it as an ordinary hard failure.
+    """
+    _log.info("throttled_task %s: token acquired, calling mock-llm", label)
+    return {"label": label, "provider": "mock-llm"}
+
+
+def llm_task(prompt: str, calls: int = 2) -> dict:
+    """
+    Simulates an agent loop against a mock LLM, recording usage per call.
+
+    `record_usage()` accumulates numeric fields across calls within the same
+    attempt, so the totals below are the sum of all `calls` iterations.
+    """
+    total_in = total_out = 0
+    for step in range(calls):
+        report_progress(
+            current=step + 1, total=calls, message=f"calling mock-llm ({prompt})"
+        )
+        input_tokens = 120 + 10 * step
+        output_tokens = 40 + 5 * step
+        record_usage(
+            model="mock-llm",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=round((input_tokens * 3e-6) + (output_tokens * 1.5e-5), 6),
+        )
+        total_in += input_tokens
+        total_out += output_tokens
+
+    _log.info(
+        "llm_task %s: %d calls, %d in / %d out tokens",
+        prompt,
+        calls,
+        total_in,
+        total_out,
+    )
+    return {"prompt": prompt, "calls": calls}
+
+
+def charge_task(customer: str, amount: float) -> dict:
+    """
+    Stands in for a non-repeatable side effect (charging Mockco's card).
+
+    Enqueue it with an `idempotency_key` so a duplicate request never
+    produces a second charge.
+    """
+    _log.info("charge_task: charging %s %.2f", customer, amount)
+    return {"customer": customer, "amount": amount}
+
+
+def review_task(document: str) -> dict:
+    """Draft step of the approval chain: produces something a human signs off."""
+    _log.info("review_task: drafted %s", document)
+    return {"document": document, "state": "drafted"}
+
+
+def publish_task(document: str) -> dict:
+    """Approval-gated step: only runs after chain.approve()."""
+    _log.info("publish_task: published %s", document)
+    return {"document": document, "state": "published"}
 
 
 # =============================================================================
@@ -139,6 +220,10 @@ def on_progress(
     """Progress hook - called after each task in a parallel workflow completes."""
     _log.info(
         "PROGRESS: %s %s — %d/%d done (S:%d F:%d)",
-        workflow_type, workflow_id,
-        completed_count, total_count, success_count, failure_count,
+        workflow_type,
+        workflow_id,
+        completed_count,
+        total_count,
+        success_count,
+        failure_count,
     )

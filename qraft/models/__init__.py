@@ -11,7 +11,13 @@ from .mixins import (
     WorkflowStatus,
     WorkflowStatusMixin,
 )
-from .tasks import QraftTask, QraftTaskAttempt, TaskStatus
+from .tasks import (
+    QraftTask,
+    QraftTaskAttempt,
+    RateBucket,
+    TaskPriority,
+    TaskStatus,
+)
 
 # Workflow models
 from .workflows import (
@@ -25,6 +31,8 @@ __all__ = [
     # Tasks
     "QraftTask",
     "QraftTaskAttempt",
+    "RateBucket",
+    "TaskPriority",
     "TaskStatus",
     # Workflows
     "QraftChainModel",

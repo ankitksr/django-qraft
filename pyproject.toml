@@ -1,6 +1,6 @@
 [project]
 name = "django-qraft"
-version = "1.1.1"
+version = "1.2.0"
 description = "Django-Qraft is a next-gen distributed task queue for Django"
 authors = [
     {name = "Ankit Singh", email = "ankitksrdev@gmail.com"}
