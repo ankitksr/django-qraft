@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned
+- Coroutine tasks on the `django.tasks` backend
+- Priority routing for scheduled retries
+- Enhanced monitoring and metrics
+- Nested workflow support
+
+## [1.2.1] - 2026-08-05
+
 ### Added
 - **Execution lease with heartbeat** (`qraft/lease.py`): a worker stamps `date_started`
   and `heartbeat_at` on the attempt at `pre_execute` and refreshes `heartbeat_at` from a
@@ -61,12 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fires the hook) before the row is committed, and `save=False`/`cached=...` never produce
   the result row at all. All three now raise `ValueError` instead of silently corrupting
   tracking
-
-### Planned
-- Coroutine tasks on the `django.tasks` backend
-- Priority routing for scheduled retries
-- Enhanced monitoring and metrics
-- Nested workflow support
 
 ## [1.2.0] - 2026-08-05
 
@@ -351,7 +353,8 @@ extra infra, built for AI workloads.
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
-[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/ankitksr/django-qraft/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/ankitksr/django-qraft/compare/v1.0.0...v1.1.0
