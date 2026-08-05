@@ -1,602 +1,343 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>django-qraft — Lifecycle Map</title>
-<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  :root{
-    --bg:#F5F0E8; --text:#2D2A26; --text-mid:#4A4640; --text-secondary:#5C5750;
-    --text-light:#7A756C; --text-muted:#9A9489; --text-faint:#B5AFA5;
-    --border:#C8C1B4; --surface:rgba(255,255,252,0.7);
-    --red:#C0392B; --green:#1A8A6A; --purple:#6C5CE7; --orange:#E67E22; --blue:#2980B9;
+  :root {
+    --ink: #1a2233;
+    --muted: #5b6472;
+    --line: #c8cfd9;
+    --lane-a: #f4f7fb;
+    --lane-b: #eef4ee;
+    --lane-c: #fdf6ec;
+    --lane-d: #f5f0fa;
+    --ok: #15803d;
+    --retry: #d97706;
+    --crash: #dc2626;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
-  body{
-    background:var(--bg); color:var(--text);
-    font-family:'Caveat', cursive; font-size:20px; line-height:1.4;
-    -webkit-font-smoothing:antialiased;
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 64px;
+    background: #fff; color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
   }
-  body::before{
-    content:''; position:fixed; top:0; left:0; right:0; bottom:0;
-    background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
-    pointer-events:none; z-index:0;
-  }
-  .page{ max-width:1180px; margin:0 auto; padding:48px 28px 70px; position:relative; z-index:1; }
-  .title h1{ font-size:56px; font-weight:700; color:var(--text); transform:rotate(-0.8deg); line-height:1.05; }
-  .title p{ font-size:23px; font-weight:500; color:var(--text-secondary); margin-top:10px; max-width:820px; }
-  .section{ margin-top:14px; }
-  .section-label{
-    font-size:31px; font-weight:600; color:var(--text-mid);
-    display:inline-block; padding-bottom:4px; position:relative; margin-bottom:6px;
-  }
-  .section-label::after{
-    content:''; position:absolute; bottom:0; left:0; right:-8px; height:3px;
-    background:var(--text-mid); border-radius:2px; transform:rotate(-0.5deg); opacity:0.4;
-  }
-  .kicker{ font-size:20px; font-weight:500; color:var(--text-secondary); margin:2px 0 14px; max-width:900px; }
-  svg.diagram{ display:block; width:100%; height:auto; overflow:visible; }
-  .scroller{ overflow-x:auto; overflow-y:hidden; padding-bottom:4px; }
-  .scroller > svg{ min-width:880px; }
-  .legend{
-    display:flex; flex-wrap:wrap; gap:10px 22px; align-items:center;
-    background:var(--surface); border:2.5px solid var(--border); border-radius:10px;
-    padding:14px 20px; transform:rotate(-0.3deg); margin-bottom:8px;
-  }
-  .legend .item{ display:flex; align-items:center; gap:9px; font-size:20px; font-weight:500; color:var(--text-secondary); }
-  .swatch{ width:30px; height:20px; border-radius:5px; flex:none; }
-  .cards{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
-  .card{
-    background:var(--surface); border:2.5px solid var(--border); border-radius:10px;
-    padding:16px 20px 18px;
-  }
-  .card:nth-child(odd){ transform:rotate(-0.4deg); }
-  .card:nth-child(even){ transform:rotate(0.4deg); }
-  .card h3{ font-size:25px; font-weight:700; color:var(--text); margin-bottom:2px; }
-  .card .mod{ font-size:18px; font-weight:500; color:var(--text-light); margin-bottom:9px; }
-  .card ul{ list-style:none; }
-  .card li{ font-size:20px; font-weight:500; color:var(--text-secondary); padding-left:17px; position:relative; margin-bottom:5px; }
-  .card li::before{ content:'›'; position:absolute; left:0; color:var(--text-muted); font-weight:700; }
-  .notes{ background:rgba(255,255,252,0.55); border:2.5px dashed var(--border); border-radius:10px; padding:18px 24px 20px; }
-  .notes li{ list-style:none; font-size:20px; font-weight:500; color:var(--text-secondary); padding-left:20px; position:relative; margin-bottom:8px; }
-  .notes li::before{ content:'✱'; position:absolute; left:0; color:var(--red); opacity:0.65; }
-  .notes strong{ color:var(--text); font-weight:700; }
-  .foot{ text-align:center; margin-top:48px; font-size:20px; color:var(--text-muted); font-weight:500; transform:rotate(-0.3deg); }
-  @keyframes fadeSketchIn{ from{opacity:0; transform:translateY(12px) rotate(-0.5deg);} to{opacity:1; transform:translateY(0) rotate(0deg);} }
-  .anim{ animation:fadeSketchIn .5s ease-out both; }
-  .anim-d1{animation-delay:.08s} .anim-d2{animation-delay:.16s} .anim-d3{animation-delay:.24s}
+  main { max-width: 1640px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 18px; margin: 40px 0 10px; }
+  p.lede { color: var(--muted); margin: 0 0 20px; max-width: 900px; }
+  .diagram { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+  .diagram svg { display: block; width: 100%; min-width: 1100px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 10px 2px 0; color: var(--muted); font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 22px; height: 0; border-top: 3px solid; border-radius: 2px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; }
+  .card p, .card li { font-size: 13.5px; color: var(--ink); margin: 4px 0; }
+  .card ul { margin: 6px 0 0; padding-left: 18px; }
+  code { font-family: var(--mono); font-size: 0.86em; background: #f1f4f8; padding: 1px 5px; border-radius: 4px; }
+  ol.gotchas { max-width: 980px; padding-left: 22px; }
+  ol.gotchas li { margin: 8px 0; font-size: 14px; }
+  footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; }
+
+  text { font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif; fill: var(--ink); }
+  .t-title { font-size: 14px; font-weight: 600; }
+  .t-sub { font-size: 11.5px; fill: var(--muted); }
+  .t-mod { font-size: 10.5px; font-family: var(--mono); fill: #64748b; }
+  .t-lane { font-size: 12px; font-weight: 700; fill: #475569; letter-spacing: 0.08em; }
+  .t-step { font-size: 12px; font-weight: 700; fill: #fff; }
+  .t-edge { font-size: 11.5px; fill: var(--muted); }
+  .t-edge-retry { font-size: 11.5px; fill: var(--retry); font-weight: 600; }
+  .t-edge-crash { font-size: 11.5px; fill: var(--crash); font-weight: 600; }
+  .node { fill: #fff; stroke: #94a3b8; stroke-width: 1.4; }
+  .node-db { fill: #fbfdfb; stroke: var(--ok); }
+  .node-proc { fill: #fffdf8; stroke: var(--retry); }
+  .node-logic { fill: #fdfbff; stroke: #7c3aed; }
+  .node-crash { fill: #fff7f7; stroke: var(--crash); stroke-dasharray: 5 3; }
+  .edge { stroke: #1a2233; stroke-width: 2; fill: none; marker-end: url(#arr); }
+  .edge-retry { stroke: #d97706; stroke-width: 2; fill: none; marker-end: url(#arr-retry); }
+  .edge-crash { stroke: #dc2626; stroke-width: 2; stroke-dasharray: 6 4; fill: none; marker-end: url(#arr-crash); }
+  .edge-soft { stroke: #94a3b8; stroke-width: 1.6; stroke-dasharray: 3 4; fill: none; marker-end: url(#arr-soft); }
 </style>
 </head>
 <body>
+<main>
+  <h1>django-qraft — lifecycle map</h1>
+  <p class="lede">One spine: <strong>enqueue → queue → worker → monitor → hook handler</strong>. Everything else — retries, crash
+  recovery, workflows, hooks — branches off the hook handler. Postgres rows are the source of truth at every step.</p>
 
-<svg style="position:absolute;width:0;height:0;">
-  <defs>
-    <filter id="sketchy" filterUnits="userSpaceOnUse" x="-60" y="-60" width="2600" height="2600">
-      <feTurbulence type="turbulence" baseFrequency="0.03" numOctaves="4" seed="2" result="n"/>
-      <feDisplacementMap in="SourceGraphic" in2="n" scale="2.2" xChannelSelector="R" yChannelSelector="G"/>
-    </filter>
-    <filter id="sketchy2" filterUnits="userSpaceOnUse" x="-60" y="-60" width="2600" height="2600">
-      <feTurbulence type="turbulence" baseFrequency="0.035" numOctaves="4" seed="7" result="n"/>
-      <feDisplacementMap in="SourceGraphic" in2="n" scale="2.4" xChannelSelector="R" yChannelSelector="G"/>
-    </filter>
-    <filter id="sketchy3" filterUnits="userSpaceOnUse" x="-60" y="-60" width="2600" height="2600">
-      <feTurbulence type="turbulence" baseFrequency="0.028" numOctaves="4" seed="13" result="n"/>
-      <feDisplacementMap in="SourceGraphic" in2="n" scale="2.6" xChannelSelector="R" yChannelSelector="G"/>
-    </filter>
-  </defs>
-</svg>
+  <h2>1 · Task lifecycle — swimlanes</h2>
+  <div class="diagram">
+  <svg viewBox="0 0 1600 780" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#1a2233"/>
+      </marker>
+      <marker id="arr-retry" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#d97706"/>
+      </marker>
+      <marker id="arr-crash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#dc2626"/>
+      </marker>
+      <marker id="arr-soft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/>
+      </marker>
+    </defs>
 
-<div class="page">
+    <rect x="0" y="0"   width="1600" height="120" fill="#f4f7fb"/>
+    <rect x="0" y="120" width="1600" height="180" fill="#eef4ee"/>
+    <rect x="0" y="300" width="1600" height="190" fill="#fdf6ec"/>
+    <rect x="0" y="490" width="1600" height="290" fill="#f5f0fa"/>
+    <text class="t-lane" x="16" y="26">YOUR CODE</text>
+    <text class="t-lane" x="16" y="146">POSTGRES — STATE &amp; QUEUE (rows)</text>
+    <text class="t-lane" x="16" y="326">CLUSTER PROCESSES (qraft/cluster.py)</text>
+    <text class="t-lane" x="16" y="516">MONITOR &amp; DISPATCH</text>
 
-  <div class="title anim">
-    <h1>django-qraft — how a task actually flows</h1>
-    <svg style="width:100%;height:9px;display:block;margin-top:-2px;" preserveAspectRatio="none" viewBox="0 0 700 9">
-      <path d="M0,6 Q60,2 120,5 T250,4 T380,6 T520,3.5 T700,5.5" stroke="#2D2A26" stroke-width="3" fill="none" opacity="0.35" stroke-linecap="round"/>
-    </svg>
-    <p>One spine: enqueue → broker → worker → monitor → hook. Everything else (retry, crash recovery, workflows,
-       django.tasks, throttling) hangs off that spine. Every box carries the module that owns it.</p>
-  </div>
+    <g>
+      <rect class="node" x="60" y="40" width="250" height="64" rx="8"/>
+      <circle cx="60" cy="40" r="11" fill="#2563eb"/><text class="t-step" x="56" y="44">1</text>
+      <text class="t-title" x="76" y="60">async_task(func, …)</text>
+      <text class="t-sub" x="76" y="77">idempotency dedupe · priority lane</text>
+      <text class="t-sub" x="76" y="91">rejects sync / save=False / cached</text>
+      <text class="t-mod" x="248" y="56">tasks.py</text>
+    </g>
 
-  <div class="section" style="margin-top:30px;">
-    <div class="legend anim anim-d1">
-      <div class="item"><span class="swatch" style="background:rgba(26,138,106,0.16);border:2.5px solid #1A8A6A;"></span>OS process</div>
-      <div class="item"><span class="swatch" style="background:rgba(230,126,34,0.16);border:2.5px solid #E67E22;"></span>thread inside a process</div>
-      <div class="item"><span class="swatch" style="background:rgba(41,128,185,0.14);border:2.5px dashed #2980B9;"></span>database row / table</div>
-      <div class="item"><span class="swatch" style="background:rgba(108,92,231,0.14);border:2.5px solid #6C5CE7;"></span>qraft dispatch logic</div>
-      <div class="item"><span class="swatch" style="background:rgba(192,57,43,0.14);border:2.5px solid #C0392B;"></span>failure path</div>
-      <div class="item"><span class="swatch" style="background:rgba(154,148,137,0.14);border:2.5px dashed #9A9489;"></span>planned (not built)</div>
-    </div>
-  </div>
+    <g>
+      <rect class="node node-db" x="60" y="170" width="280" height="76" rx="8"/>
+      <circle cx="60" cy="170" r="11" fill="#2563eb"/><text class="t-step" x="56" y="174">2</text>
+      <text class="t-title" x="76" y="190">One transaction</text>
+      <text class="t-sub" x="76" y="207">QraftTask → RUNNING</text>
+      <text class="t-sub" x="76" y="221">QraftTaskAttempt #1 (q2_task_id known)</text>
+      <text class="t-sub" x="76" y="235">enqueue failure rolls everything back</text>
+    </g>
 
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:34px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,2 Q100,0 200,2.5 T400,1.5 T600,2.5 T700,2" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+    <g>
+      <rect class="node node-db" x="420" y="182" width="200" height="52" rx="8"/>
+      <text class="t-title" x="436" y="202">OrmQ pack</text>
+      <text class="t-sub" x="436" y="219">high / default / low lanes</text>
+      <text class="t-mod" x="552" y="198">brokers.py</text>
+    </g>
+
+    <g>
+      <rect class="node node-db" x="1210" y="170" width="330" height="76" rx="8"/>
+      <text class="t-title" x="1226" y="190">Schedule row (ONCE, next_run = ETA)</text>
+      <text class="t-sub" x="1226" y="207">func = qraft.runner.run_task (unwraps @task)</text>
+      <text class="t-sub" x="1226" y="221">marker "qraft:{id}:{n}" in q_options.task_name</text>
+      <text class="t-sub" x="1226" y="235">task → PENDING · Q2 scheduler fires it (~30s)</text>
+    </g>
+
+    <g>
+      <rect class="node node-proc" x="420" y="352" width="200" height="52" rx="8"/>
+      <circle cx="420" cy="352" r="11" fill="#2563eb"/><text class="t-step" x="416" y="356">3</text>
+      <text class="t-title" x="436" y="372">Pusher</text>
+      <text class="t-sub" x="436" y="389">broker → internal task queue</text>
+    </g>
+
+    <g>
+      <rect class="node node-proc" x="700" y="336" width="340" height="118" rx="8"/>
+      <circle cx="700" cy="336" r="11" fill="#2563eb"/><text class="t-step" x="696" y="340">4</text>
+      <text class="t-title" x="716" y="356">Worker executes the function</text>
+      <text class="t-sub" x="716" y="374">standard worker, or threaded_worker when threads&gt;1</text>
+      <text class="t-sub" x="716" y="392">pre_execute signal → lease: date_started + heartbeat</text>
+      <text class="t-sub" x="716" y="406">thread refreshes heartbeat_at every 30s (lease.py)</text>
+      <text class="t-sub" x="716" y="420">contextvar set → record_usage() / report_progress()</text>
+      <text class="t-sub" x="716" y="434">@throttled tasks draw from the RateBucket row here</text>
+    </g>
+
+    <g>
+      <rect class="node node-proc" x="700" y="540" width="240" height="56" rx="8"/>
+      <circle cx="700" cy="540" r="11" fill="#2563eb"/><text class="t-step" x="696" y="544">5</text>
+      <text class="t-title" x="716" y="560">Monitor saves the result</text>
+      <text class="t-sub" x="716" y="577">writes the Q2 Task row · hosts the reaper thread</text>
+    </g>
+
+    <g>
+      <rect class="node node-logic" x="1000" y="528" width="290" height="86" rx="8"/>
+      <circle cx="1000" cy="528" r="11" fill="#2563eb"/><text class="t-step" x="996" y="532">6</text>
+      <text class="t-title" x="1016" y="548">qraft_hook_handler</text>
+      <text class="t-sub" x="1016" y="565">lookup by q2_task_id (marker fallback for retries)</text>
+      <text class="t-sub" x="1016" y="579">update attempt + task under row lock</text>
+      <text class="t-sub" x="1016" y="593">retry check runs FIRST, then routing</text>
+      <text class="t-mod" x="1236" y="544">hooks.py</text>
+    </g>
+
+    <g>
+      <rect class="node node-logic" x="1330" y="430" width="250" height="74" rx="8"/>
+      <text class="t-title" x="1346" y="448">Workflow task?</text>
+      <text class="t-sub" x="1346" y="465">ChainDispatcher: next step · park for</text>
+      <text class="t-sub" x="1346" y="479">approval · complete or fail the chain</text>
+      <text class="t-sub" x="1346" y="493">ParallelDispatcher: counters, once-only hook</text>
+      <text class="t-mod" x="1488" y="444">dispatchers.py</text>
+    </g>
+    <g>
+      <rect class="node" x="1330" y="640" width="250" height="58" rx="8"/>
+      <text class="t-title" x="1346" y="658">Plain task</text>
+      <text class="t-sub" x="1346" y="675">success_hook / failure_hook queued as a</text>
+      <text class="t-sub" x="1346" y="689">new task (hook=None, HookDispatch row)</text>
+    </g>
+    <g>
+      <rect class="node node-crash" x="1000" y="640" width="290" height="58" rx="8"/>
+      <text class="t-title" x="1016" y="658">Failed, retries left?</text>
+      <text class="t-sub" x="1016" y="675">policy: skip &gt; rate-limit class &gt; allowlist</text>
+      <text class="t-sub" x="1016" y="689">Retry-After honored · capped backoff + jitter</text>
+      <text class="t-mod" x="1226" y="654">retry.py</text>
+    </g>
+
+    <g>
+      <rect class="node node-crash" x="320" y="620" width="370" height="96" rx="8"/>
+      <text class="t-title" x="336" y="640">Reaper (thread in the monitor)</text>
+      <text class="t-sub" x="336" y="658">every reap_interval: no Q2 result row AND heartbeat</text>
+      <text class="t-sub" x="336" y="672">stale &gt; max(3× interval, 90s) — or never started, past</text>
+      <text class="t-sub" x="336" y="686">reap_stale_after, pack gone (ORM broker only)</text>
+      <text class="t-sub" x="336" y="700">→ OrphanedTask → retry path · no policy → FAILED</text>
+      <text class="t-mod" x="598" y="636">reaper.py</text>
+    </g>
+
+    <path class="edge" d="M185 104 L185 168"/>
+    <path class="edge" d="M340 208 L418 208"/>
+    <path class="edge" d="M520 234 L520 350"/>
+    <path class="edge" d="M620 378 L698 384"/>
+    <path class="edge" d="M865 454 L825 538"/>
+    <text class="t-edge" x="845" y="505">result</text>
+    <path class="edge" d="M940 568 L998 570"/>
+
+    <path class="edge" d="M1290 552 L1355 504"/>
+    <text class="t-edge" x="1296" y="528">workflow</text>
+    <path class="edge" d="M1290 596 L1355 652"/>
+    <text class="t-edge" x="1302" y="633">plain</text>
+    <path class="edge-retry" d="M1145 614 L1145 638"/>
+
+    <path class="edge-retry" d="M1290 668 L1375 668 L1375 250"/>
+    <text class="t-edge-retry" x="1387" y="300">schedule retry / requeue</text>
+    <path class="edge-retry" d="M1210 210 L624 210"/>
+    <text class="t-edge-retry" x="660" y="200">scheduler fires → new pack (default lane) → marker fallback creates attempt N</text>
+
+    <path class="edge-soft" d="M1100 698 L1100 742 L1328 742"/>
+    <text class="t-edge" x="1114" y="734">no retries left → EXHAUSTED → failure hook → DLQ (dlq.py: dead_letters / requeue)</text>
+
+    <path class="edge-crash" d="M712 454 L520 618"/>
+    <text class="t-edge-crash" x="365" y="590">worker dies → heartbeat stops</text>
+    <path class="edge-crash" d="M690 700 L998 685"/>
+    <text class="t-edge-crash" x="736" y="722">reaped attempt joins the retry path</text>
+
+    <path class="edge-soft" d="M1450 168 L1450 120"/>
+    <text class="t-edge" x="1180" y="140">also written by: DLQ requeue · django.tasks run_after · deferred backend tasks</text>
   </svg>
-
-  <!-- ============ 1. PROCESS TREE ============ -->
-  <div class="section anim">
-    <div class="section-label">1 · The process tree (worker lifecycle)</div>
-    <div class="kicker">Qraft subclasses two django-q2 pieces and overrides three methods. Everything else is inherited.</div>
-    <div class="scroller">
-    <svg class="diagram" viewBox="0 0 1100 560" role="img" aria-label="Process tree diagram">
-      <g filter="url(#sketchy)">
-        <rect x="20" y="18" width="250" height="76" rx="8" fill="rgba(255,255,252,0.8)" stroke="#4A4640" stroke-width="2.5"/>
-        <rect x="340" y="18" width="280" height="76" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="700" y="18" width="290" height="76" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <path d="M272,56 Q305,50 336,56" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M336,56 l-11,-5 M336,56 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M622,56 Q662,62 696,56" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M696,56 l-11,-5 M696,56 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="30" y="270" width="250" height="80" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="380" y="270" width="300" height="80" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="770" y="270" width="300" height="80" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-
-        <path d="M845,96 Q600,150 165,266" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M165,266 l12,-4 M165,266 l1,-12" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M845,96 Q760,180 534,266" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M534,266 l12,-4 M534,266 l1,-12" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M900,96 Q930,180 918,266" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M918,266 l-6,-11 M918,266 l7,-11" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="378" y="404" width="146" height="76" rx="8" fill="rgba(255,255,252,0.8)" stroke="#7A756C" stroke-width="2.5"/>
-        <rect x="540" y="404" width="200" height="76" rx="8" fill="rgba(230,126,34,0.14)" stroke="#E67E22" stroke-width="2.5"/>
-        <path d="M470,352 Q460,378 452,400" stroke="#7A756C" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M600,352 Q615,378 628,400" stroke="#7A756C" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="768" y="404" width="140" height="76" rx="8" fill="rgba(255,255,252,0.8)" stroke="#7A756C" stroke-width="2.5"/>
-        <rect x="924" y="404" width="148" height="76" rx="8" fill="rgba(230,126,34,0.14)" stroke="#E67E22" stroke-width="2.5"/>
-        <path d="M860,352 Q848,378 838,400" stroke="#7A756C" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M960,352 Q985,378 998,400" stroke="#7A756C" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-      </g>
-
-      <g>
-        <text x="145" y="48" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">manage.py qraftcluster</text>
-        <text x="145" y="74" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/management/commands/qraftcluster.py</text>
-
-        <text x="480" y="48" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">QraftCluster.start()</text>
-        <text x="480" y="74" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/cluster.py</text>
-        <text x="480" y="122" font-size="17" font-weight="500" fill="#C0392B" text-anchor="middle">warns if broker overrides neither acknowledge() nor fail()</text>
-
-        <text x="845" y="48" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">QraftSentinel — process</text>
-        <text x="845" y="74" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/cluster.py (extends django_q Sentinel)</text>
-        <text x="845" y="130" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">guard loop every 0.5s → reincarnate dead procs, tick timers</text>
-        <text x="845" y="154" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">every ~30s → django_q scheduler() fires due Schedule rows</text>
-
-        <text x="155" y="300" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">Pusher</text>
-        <text x="155" y="326" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q — broker → internal task_queue</text>
-
-        <text x="530" y="300" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">Worker × N</text>
-        <text x="530" y="326" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">spawn_worker() picks the flavour</text>
-
-        <text x="920" y="300" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">Monitor</text>
-        <text x="920" y="326" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">spawn_monitor() → _monitor_with_reaper</text>
-
-        <text x="451" y="434" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">worker()</text>
-        <text x="451" y="458" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q · threads = 1</text>
-
-        <text x="640" y="434" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">threaded_worker()</text>
-        <text x="640" y="458" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/worker.py · threads &gt; 1</text>
-        <text x="640" y="502" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">ThreadPoolExecutor + Semaphore(max_inflight)</text>
-
-        <text x="838" y="434" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">monitor()</text>
-        <text x="838" y="458" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q</text>
-
-        <text x="998" y="434" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">reap loop</text>
-        <text x="998" y="458" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">daemon thread · qraft/reaper.py</text>
-        <text x="998" y="502" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">lives here: the monitor never forks</text>
-      </g>
-    </svg>
-    </div>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="border-color:#1a2233"></span> happy path</span>
+    <span><span class="swatch" style="border-color:#d97706"></span> retry loop</span>
+    <span><span class="swatch" style="border-color:#dc2626; border-top-style:dashed"></span> crash recovery</span>
+    <span><span class="swatch" style="border-color:#94a3b8; border-top-style:dashed"></span> secondary</span>
+    <span>Node outline: <span style="color:#15803d">green</span> = DB row · <span style="color:#d97706">amber</span> = process · <span style="color:#7c3aed">purple</span> = dispatch logic</span>
   </div>
 
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,2 Q120,3.5 210,1.5 T430,3 T620,1.5 T700,2.5" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+  <h2>2 · Process tree — who runs what</h2>
+  <div class="diagram">
+  <svg viewBox="0 0 1600 260" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#1a2233"/>
+      </marker>
+    </defs>
+    <g>
+      <rect class="node" x="40" y="90" width="270" height="56" rx="8"/>
+      <text class="t-title" x="56" y="110">manage.py qraftcluster</text>
+      <text class="t-sub" x="56" y="127">QraftCluster.start() · warns if broker lacks receipts</text>
+    </g>
+    <g>
+      <rect class="node node-proc" x="380" y="90" width="280" height="56" rx="8"/>
+      <text class="t-title" x="396" y="110">QraftSentinel (process)</text>
+      <text class="t-sub" x="396" y="127">guard 0.5s: reincarnate the dead · scheduler ~30s</text>
+    </g>
+    <g>
+      <rect class="node node-proc" x="760" y="20" width="260" height="52" rx="8"/>
+      <text class="t-title" x="776" y="40">Pusher (process)</text>
+      <text class="t-sub" x="776" y="57">broker → internal queue</text>
+    </g>
+    <g>
+      <rect class="node node-proc" x="760" y="100" width="260" height="52" rx="8"/>
+      <text class="t-title" x="776" y="120">Worker × N (processes)</text>
+      <text class="t-sub" x="776" y="137">threads&gt;1 → ThreadPoolExecutor + semaphore</text>
+    </g>
+    <g>
+      <rect class="node node-proc" x="760" y="180" width="260" height="52" rx="8"/>
+      <text class="t-title" x="776" y="200">Monitor (process)</text>
+      <text class="t-sub" x="776" y="217">+ reaper thread — the monitor never forks</text>
+    </g>
+    <path class="edge" d="M310 118 L378 118" style="marker-end:url(#arr2)"/>
+    <path class="edge" d="M660 104 L758 48" style="marker-end:url(#arr2)"/>
+    <path class="edge" d="M660 118 L758 124" style="marker-end:url(#arr2)"/>
+    <path class="edge" d="M660 132 L758 202" style="marker-end:url(#arr2)"/>
+    <g>
+      <rect class="node" x="1100" y="50" width="470" height="160" rx="8" style="stroke-dasharray:6 4; stroke:#94a3b8;"/>
+      <text class="t-title" x="1116" y="74" style="fill:#64748b">Planned — docs/future/q2-absorption.md</text>
+      <text class="t-sub" x="1116" y="96">Phase 2: SCHEDULED attempts with not_before + a dispatcher thread.</text>
+      <text class="t-sub" x="1116" y="110">The Schedule row and the marker fallback disappear.</text>
+      <text class="t-sub" x="1116" y="132">Phase 3: workers claim attempts via SELECT … FOR UPDATE SKIP LOCKED.</text>
+      <text class="t-sub" x="1116" y="146">Pusher, monitor, and broker disappear.</text>
+      <text class="t-sub" x="1116" y="168">LISTEN/NOTIFY: enqueue commit notifies; idle workers and the phase-2</text>
+      <text class="t-sub" x="1116" y="182">dispatcher wake on it instead of polling.</text>
+    </g>
   </svg>
-
-  <!-- ============ 2. HAPPY PATH ============ -->
-  <div class="section anim">
-    <div class="section-label">2 · The spine — one task, happy path</div>
-    <div class="kicker">Read it as a snake: left→right, then right→left, then left→right.</div>
-    <div class="scroller">
-    <svg class="diagram" viewBox="0 0 1100 790" role="img" aria-label="Happy path task lifecycle">
-      <g filter="url(#sketchy2)">
-        <!-- row 1 -->
-        <rect x="20" y="26" width="220" height="80" rx="8" fill="rgba(255,255,252,0.85)" stroke="#4A4640" stroke-width="2.5"/>
-        <rect x="290" y="26" width="270" height="80" rx="8" fill="rgba(255,255,252,0.85)" stroke="#4A4640" stroke-width="2.5"/>
-        <rect x="610" y="14" width="470" height="122" rx="8" fill="rgba(41,128,185,0.12)" stroke="#2980B9" stroke-width="2.5" stroke-dasharray="7,4"/>
-        <path d="M242,66 Q265,60 286,66" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M286,66 l-11,-5 M286,66 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M562,66 Q586,72 606,66" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M606,66 l-11,-5 M606,66 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <!-- row 2 -->
-        <rect x="790" y="220" width="290" height="80" rx="8" fill="rgba(41,128,185,0.12)" stroke="#2980B9" stroke-width="2.5" stroke-dasharray="7,4"/>
-        <rect x="430" y="220" width="290" height="80" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="20" y="204" width="340" height="112" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <path d="M935,140 Q948,182 935,216" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M935,216 l-6,-11 M935,216 l7,-11" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M786,260 Q754,254 726,260" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M726,260 l11,-5 M726,260 l11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M426,260 Q394,266 366,260" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M366,260 l11,-5 M366,260 l11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <!-- pre_execute inset -->
-        <rect x="20" y="358" width="340" height="132" rx="8" fill="rgba(230,126,34,0.13)" stroke="#E67E22" stroke-width="2.5"/>
-        <path d="M190,318 Q198,338 190,354" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M190,354 l-6,-11 M190,354 l7,-11" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <!-- row 3 -->
-        <rect x="430" y="396" width="290" height="86" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="790" y="396" width="290" height="86" rx="8" fill="rgba(108,92,231,0.13)" stroke="#6C5CE7" stroke-width="2.5"/>
-        <path d="M362,290 Q402,340 426,424" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M426,424 l-11,-4 M426,424 l-3,-12" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M722,438 Q756,432 786,438" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M786,438 l-11,-5 M786,438 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <!-- branch row -->
-        <rect x="20" y="620" width="290" height="120" rx="8" fill="rgba(192,57,43,0.12)" stroke="#C0392B" stroke-width="2.5"/>
-        <rect x="380" y="620" width="320" height="120" rx="8" fill="rgba(108,92,231,0.13)" stroke="#6C5CE7" stroke-width="2.5"/>
-        <rect x="770" y="620" width="310" height="120" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <path d="M900,520 Q740,556 300,616" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M300,616 l3,-12 M300,616 l11,-6" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M900,520 Q790,560 555,616" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M555,616 l4,-12 M555,616 l11,-5" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M940,520 Q932,570 928,616" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M928,616 l-6,-11 M928,616 l7,-11" stroke="#1A8A6A" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-      </g>
-
-      <g>
-        <text x="130" y="58" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">1 · async_task(…)</text>
-        <text x="130" y="83" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/tasks.py</text>
-        <text x="130" y="128" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">rejects sync=True, save=False, cached=…</text>
-
-        <text x="425" y="58" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">2 · dedupe + lane</text>
-        <text x="425" y="82" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">idempotency_key hit ⇒ return old q2 id</text>
-        <text x="425" y="102" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">priority high/low ⇒ QraftOrmBroker lane</text>
-        <text x="425" y="128" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/tasks.py · qraft/brokers.py</text>
-
-        <text x="845" y="44" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">3 · ONE transaction — _create_and_enqueue()</text>
-        <text x="845" y="70" font-size="18" font-weight="500" fill="#2D2A26" text-anchor="middle">QraftTask row → status RUNNING</text>
-        <text x="845" y="93" font-size="18" font-weight="500" fill="#2D2A26" text-anchor="middle">django_q async_task() → q2_task_id</text>
-        <text x="845" y="116" font-size="18" font-weight="500" fill="#2D2A26" text-anchor="middle">QraftTaskAttempt #1 carrying that q2_task_id</text>
-
-        <text x="935" y="252" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">4 · OrmQ row — pickled pack</text>
-        <text x="935" y="278" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q broker table (Postgres)</text>
-
-        <text x="575" y="252" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">5 · Pusher → task_queue</text>
-        <text x="575" y="278" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q · multiprocessing queue</text>
-
-        <text x="190" y="240" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">6 · Worker executes the function</text>
-        <text x="190" y="266" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q.worker  ·  or qraft/worker.py</text>
-        <text x="190" y="292" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">result pushed onto result_queue</text>
-
-        <text x="190" y="390" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">pre_execute signal — 2 receivers</text>
-        <text x="190" y="418" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/lease.py · stamps date_started + heartbeat_at,</text>
-        <text x="190" y="438" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">starts heartbeat thread (every heartbeat_interval, 30s)</text>
-        <text x="190" y="463" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/context.py · sets the contextvar ⇒</text>
-        <text x="190" y="483" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">record_usage() / report_progress() work inside the task</text>
-
-        <text x="575" y="428" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">7 · Monitor saves the result</text>
-        <text x="575" y="454" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">django_q.monitor writes the Task row</text>
-
-        <text x="935" y="428" font-size="22" font-weight="600" fill="#2D2A26" text-anchor="middle">8 · qraft_hook_handler(q2_task)</text>
-        <text x="935" y="454" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/hooks.py — called by the monitor</text>
-        <text x="935" y="500" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">fast path: attempt looked up by q2_task_id;</text>
-        <text x="935" y="520" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">attempt + task status written under select_for_update()</text>
-
-        <text x="165" y="654" font-size="21" font-weight="600" fill="#C0392B" text-anchor="middle">9a · failed?  retry check FIRST</text>
-        <text x="165" y="682" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">handle_task_retry() runs before any</text>
-        <text x="165" y="702" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">routing. Retry scheduled ⇒ return now.</text>
-        <text x="165" y="726" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/retry.py → see lane 3</text>
-
-        <text x="540" y="654" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">9b · workflow task?</text>
-        <text x="540" y="682" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">route_workflow_completion() →</text>
-        <text x="540" y="702" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">ChainDispatcher | ParallelDispatcher</text>
-        <text x="540" y="726" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/dispatchers.py — no task-level hooks</text>
-
-        <text x="925" y="654" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">9c · plain task</text>
-        <text x="925" y="682" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">success_hook / failure_hook queued</text>
-        <text x="925" y="702" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">as a task with hook=None (no recursion)</text>
-        <text x="925" y="726" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">HookDispatch row = the once-only guard</text>
-      </g>
-    </svg>
-    </div>
   </div>
 
-  <!-- workflow dispatch detail -->
-  <div class="section" style="margin-top:26px;">
-    <div class="cards">
-      <div class="card anim">
-        <h3>ChainDispatcher</h3>
-        <div class="mod">qraft/dispatchers.py</div>
-        <ul>
-          <li>Locks the chain, compares <em>current_step_index</em> — a duplicate delivery bails here.</li>
-          <li>Next step needs approval ⇒ park in WAITING_APPROVAL.</li>
-          <li>No next step ⇒ complete chain + chain-level hook.</li>
-          <li>Step failed <strong>and</strong> task is EXHAUSTED ⇒ chain FAILED. Mid-retry ⇒ do nothing.</li>
-        </ul>
-      </div>
-      <div class="card anim anim-d1">
-        <h3>ParallelDispatcher (iter / batch)</h3>
-        <div class="mod">qraft/dispatchers.py</div>
-        <ul>
-          <li>Only counts terminal attempts (succeeded, or task EXHAUSTED).</li>
-          <li>Increment under <em>select_for_update()</em>; <em>attempt.counted</em> flag makes it idempotent.</li>
-          <li>completed == total ⇒ workflow hook, once, via WorkflowHookDispatch.</li>
-          <li>Not yet complete ⇒ optional <em>progress_hook</em> fires each time.</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,3 Q90,1 190,2.5 T410,1 T590,3 T700,1.5" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-  </svg>
-
-  <!-- ============ 3. FAILURE / RETRY ============ -->
-  <div class="section anim">
-    <div class="section-label">3 · Failure lane — the retry round trip</div>
-    <div class="kicker">A retry leaves Qraft entirely and comes back through a django-q2 Schedule row. That round trip is what Phase 2 deletes.</div>
-    <div class="scroller">
-    <svg class="diagram" viewBox="0 0 1100 560" role="img" aria-label="Retry loop diagram">
-      <g filter="url(#sketchy3)">
-        <rect x="20" y="20" width="250" height="100" rx="8" fill="rgba(192,57,43,0.12)" stroke="#C0392B" stroke-width="2.5"/>
-        <rect x="320" y="20" width="300" height="130" rx="8" fill="rgba(255,255,252,0.85)" stroke="#4A4640" stroke-width="2.5"/>
-        <rect x="680" y="20" width="400" height="130" rx="8" fill="rgba(255,255,252,0.85)" stroke="#4A4640" stroke-width="2.5"/>
-        <path d="M272,68 Q296,62 316,68" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M316,68 l-11,-5 M316,68 l-11,5" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M622,80 Q652,74 676,80" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M676,80 l-11,-5 M676,80 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="660" y="230" width="420" height="140" rx="8" fill="rgba(41,128,185,0.12)" stroke="#2980B9" stroke-width="2.5" stroke-dasharray="7,4"/>
-        <path d="M880,154 Q892,196 880,226" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M880,226 l-6,-11 M880,226 l7,-11" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="330" y="252" width="290" height="96" rx="8" fill="rgba(26,138,106,0.12)" stroke="#1A8A6A" stroke-width="2.5"/>
-        <rect x="20" y="252" width="280" height="96" rx="8" fill="rgba(108,92,231,0.13)" stroke="#6C5CE7" stroke-width="2.5"/>
-        <path d="M656,300 Q640,294 626,300" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M626,300 l11,-5 M626,300 l11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M326,300 Q314,294 304,300" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M304,300 l11,-5 M304,300 l11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M145,248 Q120,190 145,124" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-dasharray="8,5"/>
-        <path d="M145,124 l-7,11 M145,124 l7,11" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="320" y="418" width="320" height="112" rx="8" fill="rgba(192,57,43,0.12)" stroke="#C0392B" stroke-width="2.5"/>
-        <rect x="690" y="418" width="390" height="112" rx="8" fill="rgba(41,128,185,0.12)" stroke="#2980B9" stroke-width="2.5" stroke-dasharray="7,4"/>
-        <path d="M470,154 Q450,290 476,414" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M476,414 l-8,-10 M476,414 l9,-8" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M642,474 Q668,468 686,474" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M686,474 l-11,-5 M686,474 l-11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-      </g>
-
-      <g>
-        <text x="145" y="52" font-size="21" font-weight="600" fill="#C0392B" text-anchor="middle">attempt failed</text>
-        <text x="145" y="80" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">exception_class parsed from</text>
-        <text x="145" y="100" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">the traceback tail</text>
-
-        <text x="470" y="52" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">handle_task_retry()</text>
-        <text x="470" y="76" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/retry.py</text>
-        <text x="470" y="102" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">order: max_attempts → skip_exceptions</text>
-        <text x="470" y="122" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">→ rate-limit set → retry_exceptions</text>
-        <text x="470" y="142" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">skip wins over the rate-limit set</text>
-
-        <text x="880" y="52" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">delay → eta</text>
-        <text x="880" y="78" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">fixed | linear | exponential, ± jitter</text>
-        <text x="880" y="100" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">rate limit ⇒ forced exponential;</text>
-        <text x="880" y="120" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">Retry-After parsed from result text, +10% jitter,</text>
-        <text x="880" y="140" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">capped by rate_limit_max_delay <tspan font-weight="600">after</tspan> jitter</text>
-
-        <text x="870" y="262" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">django_q Schedule row (ONCE, next_run = eta)</text>
-        <text x="870" y="290" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">func = qraft.runner.run_task  ·  args = repr((func, args, kwargs))</text>
-        <text x="870" y="312" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">name = qraft_retry:{id}:{n}</text>
-        <text x="870" y="334" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">marker qraft:{id}:{n} rides in kwargs → q_options.task_name</text>
-        <text x="870" y="358" font-size="17" font-weight="600" fill="#2980B9" text-anchor="middle">QraftTask status → PENDING</text>
-
-        <text x="475" y="286" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">Q2 scheduler fires it</text>
-        <text x="475" y="312" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">sentinel guard, ~30s granularity</text>
-        <text x="475" y="334" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">a 2s backoff can take 32s</text>
-
-        <text x="160" y="286" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">marker fallback</text>
-        <text x="160" y="312" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">hooks.py parses the task_name,</text>
-        <text x="160" y="334" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">get_or_create attempt N</text>
-        <text x="160" y="196" font-size="17" font-weight="600" fill="#6C5CE7" text-anchor="middle">loop</text>
-
-        <text x="480" y="452" font-size="21" font-weight="600" fill="#C0392B" text-anchor="middle">no retry left → EXHAUSTED</text>
-        <text x="480" y="480" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">failure_hook dispatched (or the</text>
-        <text x="480" y="500" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">workflow dispatcher takes over)</text>
-        <text x="480" y="522" font-size="16" font-weight="500" fill="#5C5750" text-anchor="middle">no policy at all ⇒ stays FAILED</text>
-
-        <text x="885" y="452" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">Dead letters</text>
-        <text x="885" y="478" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">dead_letters() = QraftTask in (FAILED, EXHAUSTED)</text>
-        <text x="885" y="500" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">requeue() writes the same Schedule + marker →</text>
-        <text x="885" y="520" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">next attempt on the same task · qraft/dlq.py</text>
-      </g>
-    </svg>
-    </div>
-  </div>
-
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,1.5 Q110,3 220,1 T440,3 T610,1.5 T700,3" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-  </svg>
-
-  <!-- ============ 4. CRASH RECOVERY ============ -->
-  <div class="section anim">
-    <div class="section-label">4 · Crash lane — the reaper</div>
-    <div class="kicker">django-q2 writes its Task row only at completion, so "no result row" alone proves nothing. The lease supplies the liveness signal.</div>
-    <div class="scroller">
-    <svg class="diagram" viewBox="0 0 1100 344" role="img" aria-label="Crash recovery diagram">
-      <g filter="url(#sketchy)">
-        <rect x="20" y="20" width="250" height="86" rx="8" fill="rgba(192,57,43,0.12)" stroke="#C0392B" stroke-width="2.5"/>
-        <rect x="320" y="20" width="300" height="86" rx="8" fill="rgba(230,126,34,0.14)" stroke="#E67E22" stroke-width="2.5"/>
-        <rect x="680" y="20" width="400" height="86" rx="8" fill="rgba(230,126,34,0.14)" stroke="#E67E22" stroke-width="2.5"/>
-        <path d="M272,62 Q296,56 316,62" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M316,62 l-11,-5 M316,62 l-11,5" stroke="#C0392B" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M622,62 Q652,68 676,62" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M676,62 l-11,-5 M676,62 l-11,5" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="330" y="176" width="750" height="150" rx="8" fill="rgba(41,128,185,0.10)" stroke="#2980B9" stroke-width="2.5" stroke-dasharray="7,4"/>
-        <path d="M880,110 Q892,144 880,172" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M880,172 l-6,-11 M880,172 l7,-11" stroke="#E67E22" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-
-        <rect x="20" y="176" width="280" height="150" rx="8" fill="rgba(108,92,231,0.13)" stroke="#6C5CE7" stroke-width="2.5"/>
-        <path d="M326,250 Q314,244 304,250" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M304,250 l11,-5 M304,250 l11,5" stroke="#4A4640" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-      </g>
-
-      <g>
-        <text x="145" y="52" font-size="21" font-weight="600" fill="#C0392B" text-anchor="middle">worker dies mid-task</text>
-        <text x="145" y="80" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">OOM kill · kill -9 · hard crash</text>
-
-        <text x="470" y="52" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">heartbeat_at goes stale</text>
-        <text x="470" y="80" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">the heartbeat thread died with it · qraft/lease.py</text>
-
-        <text x="880" y="52" font-size="21" font-weight="600" fill="#2D2A26" text-anchor="middle">reap_orphans() sweeps every reap_interval (60s)</text>
-        <text x="880" y="80" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">qraft/reaper.py — daemon thread beside the monitor</text>
-
-        <text x="705" y="208" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">what counts as orphaned</text>
-        <text x="705" y="238" font-size="18" font-weight="500" fill="#5C5750" text-anchor="middle">QraftTask still RUNNING  ·  attempt.success IS NULL  ·  no django_q Task row</text>
-        <text x="705" y="266" font-size="18" font-weight="500" fill="#5C5750" text-anchor="middle">AND heartbeat older than max(3 × heartbeat_interval, 90s)</text>
-        <text x="705" y="292" font-size="18" font-weight="500" fill="#5C5750" text-anchor="middle">OR never started + older than reap_stale_after (1h) + pack gone from OrmQ</text>
-        <text x="705" y="314" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">— that second branch is skipped entirely on a non-ORM broker</text>
-
-        <text x="160" y="208" font-size="20" font-weight="600" fill="#2D2A26" text-anchor="middle">reaped, under a row lock</text>
-        <text x="160" y="240" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">success = False</text>
-        <text x="160" y="262" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">exception_class = "OrphanedTask"</text>
-        <text x="160" y="288" font-size="17" font-weight="500" fill="#6C5CE7" text-anchor="middle">→ handle_task_retry() (lane 3)</text>
-        <text x="160" y="312" font-size="17" font-weight="500" fill="#5C5750" text-anchor="middle">no policy at all ⇒ task set FAILED</text>
-      </g>
-    </svg>
-    </div>
-  </div>
-
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,2.5 Q100,1 210,3 T420,1.5 T600,3 T700,1.5" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-  </svg>
-
-  <!-- ============ 5. SIDE ENTRANCES ============ -->
-  <div class="section anim">
-    <div class="section-label">5 · Side entrances onto the spine</div>
-    <div class="kicker">Four other ways work gets in. All of them land back on step 3 (or step 8) of the spine.</div>
-    <div class="cards">
-      <div class="card">
-        <h3>Workflows</h3>
-        <div class="mod">qraft/chain.py · iter.py · batch.py</div>
-        <ul>
-          <li><strong>Chain.run()</strong> → chain model + steps, then queues <em>one</em> step; the dispatcher queues the next.</li>
-          <li><strong>Iter.run() / Batch.run()</strong> → fan out every task at once, total_count set up front.</li>
-          <li>All go through <em>_create_workflow_task()</em>, which reuses the same one-transaction enqueue.</li>
-          <li>Workflow tasks never carry task-level hooks — workflow-level only.</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>django.tasks backend (Django 6)</h3>
-        <div class="mod">qraft/backend.py · qraft/runner.py</div>
-        <ul>
-          <li><strong>.enqueue()</strong> → <em>qraft.tasks.async_task</em> queuing <em>run_task</em>, which unwraps the <em>@task</em> decorator wrapper at execution time.</li>
-          <li><strong>run_after</strong> → Schedule + marker, exactly like a retry; attempt 1 is created only when it fires.</li>
-          <li><strong>takes_context=True</strong> bypasses async_task: it builds the QraftTask + attempt itself and queues <em>run_task_with_context</em>.</li>
-          <li><strong>get_result()</strong> reads QraftTask + its attempts.</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>Throttle</h3>
-        <div class="mod">qraft/throttle.py</div>
-        <ul>
-          <li><em>@throttled(key, rate)</em> withdraws tokens from a shared <strong>RateBucket</strong> row under select_for_update().</li>
-          <li>Denial raises <strong>RateLimited</strong> — a member of RATE_LIMIT_EXCEPTIONS, so lane 3 takes the rate-limit branch.</li>
-          <li>SQLite has no real row lock: correct, but not concurrency-safe there.</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>Priority lanes</h3>
-        <div class="mod">qraft/brokers.py</div>
-        <ul>
-          <li>Three lanes on one OrmQ table: <em>{key}--high</em>, <em>{key}</em>, <em>{key}--low</em>; first non-empty wins each dequeue.</li>
-          <li>Enqueue side always writes the lane; only a cluster running <strong>QraftOrmBroker</strong> drains high/low.</li>
-          <li>Known gap: a scheduled retry re-enters the default lane.</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,2 Q95,3.5 200,1.5 T400,3 T580,1 T700,2.5" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-  </svg>
-
-  <!-- ============ 6. PLANNED ============ -->
-  <div class="section anim">
-    <div class="section-label">6 · Planned — what disappears next</div>
-    <div class="kicker">Nothing below is built. Phase 1 (the lease) shipped in 1.2.1. Source: docs/future/q2-absorption.md.</div>
-    <div class="scroller">
-    <svg class="diagram" viewBox="0 0 1100 470" role="img" aria-label="Planned architecture">
-      <g filter="url(#sketchy2)">
-        <rect x="20" y="20" width="510" height="200" rx="10" fill="rgba(154,148,137,0.10)" stroke="#9A9489" stroke-width="2.8" stroke-dasharray="10,6"/>
-        <rect x="570" y="20" width="510" height="200" rx="10" fill="rgba(154,148,137,0.10)" stroke="#9A9489" stroke-width="2.8" stroke-dasharray="10,6"/>
-        <rect x="20" y="262" width="1060" height="180" rx="10" fill="rgba(154,148,137,0.10)" stroke="#9A9489" stroke-width="2.8" stroke-dasharray="10,6"/>
-        <path d="M534,120 Q554,114 566,120" stroke="#9A9489" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M566,120 l-11,-5 M566,120 l-11,5" stroke="#9A9489" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M300,352 Q470,346 620,352" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-dasharray="9,5"/>
-        <path d="M620,352 l-11,-5 M620,352 l-11,5" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-        <path d="M300,404 Q470,410 620,404" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-dasharray="9,5"/>
-        <path d="M620,404 l-11,-5 M620,404 l-11,5" stroke="#6C5CE7" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-      </g>
-
-      <g>
-        <text x="275" y="56" font-size="24" font-weight="700" fill="#4A4640" text-anchor="middle">Phase 2 — own scheduling</text>
-        <text x="275" y="90" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">Attempt gains <tspan font-weight="600">not_before</tspan> + a <tspan font-weight="600">SCHEDULED</tspan> state.</text>
-        <text x="275" y="116" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">A dispatcher thread (beside the monitor, like the</text>
-        <text x="275" y="138" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">reaper) polls due attempts and enqueues them.</text>
-        <text x="275" y="168" font-size="19" font-weight="500" fill="#C0392B" text-anchor="middle">Gone: Schedule rows, repr()/eval(), the ~30s</text>
-        <text x="275" y="190" font-size="19" font-weight="500" fill="#C0392B" text-anchor="middle">granularity, and the marker fallback in hooks.py.</text>
-        <text x="275" y="212" font-size="17" font-weight="500" fill="#7A756C" text-anchor="middle">new: qraft/scheduler.py · touches retry.py, dlq.py, backend.py</text>
-
-        <text x="825" y="56" font-size="24" font-weight="700" fill="#4A4640" text-anchor="middle">Phase 3 — own the worker loop</text>
-        <text x="825" y="90" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">Worker claims an attempt directly:</text>
-        <text x="825" y="114" font-size="19" font-weight="600" fill="#5C5750" text-anchor="middle">SELECT … FOR UPDATE SKIP LOCKED</text>
-        <text x="825" y="140" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">Executes, writes the result to the attempt row,</text>
-        <text x="825" y="162" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">dispatches hooks in-band.</text>
-        <text x="825" y="190" font-size="19" font-weight="500" fill="#C0392B" text-anchor="middle">Gone: pusher, monitor, broker, brokers.py.</text>
-        <text x="825" y="212" font-size="17" font-weight="500" fill="#7A756C" text-anchor="middle">gated on Phase 2 being stable + a real migration story</text>
-
-        <text x="550" y="298" font-size="24" font-weight="700" fill="#4A4640" text-anchor="middle">LISTEN / NOTIFY — where it plugs in</text>
-        <text x="160" y="340" font-size="19" font-weight="600" fill="#4A4640" text-anchor="middle">enqueue transaction commits</text>
-        <text x="160" y="362" font-size="18" font-weight="500" fill="#5C5750" text-anchor="middle">sends NOTIFY</text>
-        <text x="160" y="392" font-size="19" font-weight="600" fill="#4A4640" text-anchor="middle">an attempt becomes due</text>
-        <text x="160" y="414" font-size="18" font-weight="500" fill="#5C5750" text-anchor="middle">sends NOTIFY</text>
-        <text x="850" y="346" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">idle <tspan font-weight="600">worker</tspan> blocks on the notification instead of polling</text>
-        <text x="850" y="392" font-size="19" font-weight="500" fill="#5C5750" text-anchor="middle">idle <tspan font-weight="600">dispatcher</tspan> wakes instead of polling</text>
-        <text x="850" y="414" font-size="17" font-weight="500" fill="#7A756C" text-anchor="middle">(extrapolated — the doc only specifies the worker half)</text>
-        <text x="550" y="436" font-size="17" font-weight="500" fill="#7A756C" text-anchor="middle">a lost notification costs one poll interval, never a task — the DB row is always the truth</text>
-      </g>
-    </svg>
-    </div>
-  </div>
-
-  <svg class="sketch-divider" viewBox="0 0 700 4" preserveAspectRatio="none" style="display:block;margin:40px auto 26px;max-width:700px;height:4px;opacity:0.25;">
-    <path d="M0,2 Q120,1 230,3 T450,1.5 T620,3 T700,1.5" stroke="#C8C1B4" stroke-width="2.5" fill="none" stroke-linecap="round"/>
-  </svg>
-
-  <!-- ============ 7. GOTCHAS ============ -->
-  <div class="section anim">
-    <div class="section-label">7 · The bits that surprise you six months later</div>
-    <div class="notes" style="margin-top:12px;">
+  <h2>3 · Side entrances onto the spine</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>Workflows <code>chain.py · iter.py · batch.py</code></h3>
       <ul>
-        <li><strong>Retry is checked before workflow routing.</strong> A failing chain/iter/batch task that still has retries schedules one and returns — the dispatcher never sees it that round.</li>
-        <li><strong>skip_exceptions beats the rate-limit set.</strong> "Rate limits are always retryable" is only true relative to a restrictive <em>retry_exceptions</em> allowlist.</li>
-        <li><strong>A scheduled retry sets QraftTask → PENDING</strong>, not FAILED. FAILED only survives when there is no policy at all.</li>
-        <li><strong>The marker is not the Schedule's name.</strong> Schedule.name is <em>qraft_retry:{id}:{n}</em>; the marker <em>qraft:{id}:{n}</em> travels in kwargs as <em>q_options.task_name</em> and becomes the q2 Task name.</li>
-        <li><strong>Two cadences, not one.</strong> The sentinel guard loop runs every 0.5s (GUARD_CYCLE); the Q2 scheduler is what runs every ~30s.</li>
-        <li><strong>Heartbeat staleness has a floor.</strong> The reaper uses <em>max(3 × heartbeat_interval, 90s)</em>, and also requires the task RUNNING and the attempt unresolved.</li>
-        <li><strong>Non-ORM broker only disables half the reaper.</strong> Stale-heartbeat orphans are still reaped; only the never-started branch needs the OrmQ lookup.</li>
-        <li><strong>dead_letters() includes FAILED.</strong> A failure with no retry policy lands in the DLQ without ever being EXHAUSTED.</li>
-        <li><strong>post_execute cannot close the lease.</strong> It fires in the monitor, not the worker — the threaded worker calls <em>stop_heartbeat()</em> itself; other paths rely on the loop's own zero-row UPDATE or the deadline backstop.</li>
+        <li><code>QraftChain</code>: one step queued at a time; a gated step parks the chain in <code>WAITING_APPROVAL</code> until <code>approve()</code> / <code>reject()</code>.</li>
+        <li><code>QraftIter</code> / <code>QraftBatch</code>: fan out all tasks; locked counters + a <code>counted</code> flag; the workflow hook fires exactly once.</li>
+        <li>Workflow tasks carry workflow-level hooks only.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>django.tasks backend <code>backend.py</code> (Django ≥ 6)</h3>
+      <ul>
+        <li><code>@task.enqueue()</code> → the spine, via <code>qraft.runner.run_task</code> (unwraps the decorator's non-callable wrapper).</li>
+        <li><code>run_after</code> → Schedule row + marker, like a retry.</li>
+        <li><code>takes_context=True</code> → <code>run_task_with_context</code> builds the <code>TaskContext</code> worker-side.</li>
+        <li><code>get_result()</code> reads <code>QraftTask</code>; statuses map to READY / RUNNING / SUCCESSFUL / FAILED.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Throttle <code>throttle.py</code></h3>
+      <ul>
+        <li><code>@throttled(key, rate, capacity)</code> draws tokens from one shared <code>RateBucket</code> row under a row lock.</li>
+        <li>Empty bucket → <code>RateLimited</code> → the rate-limit retry class reschedules with backoff.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Priority lanes <code>brokers.py</code></h3>
+      <ul>
+        <li><code>QraftOrmBroker</code> drains <code>--high</code>, then default, then <code>--low</code> on one ORM queue.</li>
+        <li>Requires <code>Q_CLUSTER["broker_class"]</code>; on any other broker high/low tasks strand — never pass a priority on Redis.</li>
+        <li>Scheduled retries re-enter on the default lane (phase 2 fixes this).</li>
       </ul>
     </div>
   </div>
 
-  <div class="foot">django-qraft · Aug 2026 · sketched by Ankit</div>
-</div>
+  <h2>4 · The bits that surprise you six months later</h2>
+  <ol class="gotchas">
+    <li>The retry check runs <strong>before</strong> workflow routing; a retrying chain/iter step does not advance or count its workflow that round.</li>
+    <li><code>skip_exceptions</code> beats the rate-limit class; the rate-limit set only overrides a restrictive <code>retry_exceptions</code> allowlist.</li>
+    <li>A scheduled retry flips the task back to <code>PENDING</code>; the marker rides in <code>Schedule.kwargs → q_options.task_name</code>, not in <code>Schedule.name</code>.</li>
+    <li>Two cadences: the sentinel guard loop runs every 0.5s; the Q2 scheduler (which fires retries) every ~30s.</li>
+    <li>Heartbeat staleness = <code>max(3 × heartbeat_interval, 90s)</code>, and reaping also requires task <code>RUNNING</code> + attempt unresolved.</li>
+    <li>On a non-ORM broker the reaper skips only never-started attempts; stale-heartbeat orphans are still reaped.</li>
+    <li>A reaped task with no retry policy goes to <code>FAILED</code>, not <code>EXHAUSTED</code> — both land in <code>dead_letters()</code>.</li>
+    <li><code>ParallelDispatcher</code> also fires <code>progress_hook</code> on every non-final completion.</li>
+    <li><code>async_task</code> rejects <code>sync=True</code>, <code>save=False</code>, <code>cached</code> — attempt resolution needs a saved result after the attempt row exists.</li>
+    <li>The threaded worker stops its own heartbeat; <code>post_execute</code> fires in the monitor, so it cannot do that job alone.</li>
+    <li>Requeued <code>takes_context</code> tasks do not get <code>TaskContext</code> re-injected (documented gap).</li>
+    <li>Idempotency keys block re-enqueue permanently by default; <code>idempotency_retry_dead=True</code> reclaims a FAILED/EXHAUSTED key.</li>
+  </ol>
 
+  <footer>django-qraft lifecycle map · regenerate after architecture changes · source of truth: qraft/*.py</footer>
+</main>
 </body>
 </html>
