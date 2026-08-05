@@ -249,6 +249,7 @@ task_id = async_task(
 - [Testing Guide](tests/README.md) - Running and writing tests
 - [Demo Application](demo/README.md) - Interactive feature demonstrations
 - [Roadmap](docs/roadmap.md) - Positioning and planned features
+- [Test Drive](docs/test-drive.md) - Guided walkthrough of every demo scenario
 
 ## Use Cases
 
