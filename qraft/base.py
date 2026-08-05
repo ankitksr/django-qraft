@@ -119,13 +119,62 @@ class BaseWorkflow:
 
     def _build_workflow_result(self, tasks_qs) -> WorkflowResult:
         """Build a WorkflowResult from a queryset of QraftTask objects."""
-        task_results = []
-        for task in tasks_qs:
-            task_results.append(TaskResult.from_qraft_task(task))
-        return WorkflowResult(task_results=task_results)
+        return WorkflowResult(
+            task_results=[TaskResult.from_qraft_task(task) for task in tasks_qs]
+        )
 
     def __repr__(self):
         return (
             f"<{self.__class__.__name__} id={self._model.id}"
             f" status={self._model.status}>"
+        )
+
+
+class ParallelWorkflow(BaseWorkflow):
+    """
+    Shared surface for the fan-out primitives (iter/batch).
+
+    Both track the same completion counters and expose their tasks through
+    the same `tasks` reverse FK.
+    """
+
+    @property
+    def total_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.total_count
+
+    @property
+    def completed_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.completed_count
+
+    @property
+    def success_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.success_count
+
+    @property
+    def failure_count(self) -> int:
+        self._model.refresh_from_db()
+        return self._model.failure_count
+
+    def result(self, wait: int | None = None) -> WorkflowResult:
+        """
+        Get results from all tasks (unordered).
+
+        Args:
+            wait: Timeout in milliseconds to wait for completion
+
+        Raises:
+            TimeoutError: If wait is provided and the workflow doesn't
+                complete in time
+        """
+        self._poll_until_terminal(wait)
+        return self._build_workflow_result(self._model.tasks.all())
+
+    def __repr__(self):
+        return (
+            f"<{self.__class__.__name__} id={self._model.id}"
+            f" status={self._model.status}"
+            f" completed={self.completed_count}/{self.total_count}>"
         )

@@ -39,6 +39,27 @@ def _existing_task_for_key(idempotency_key: str) -> str | None:
     return attempt.q2_task_id
 
 
+def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
+    """
+    Create a QraftTask, queue it to Django-Q2, and record attempt 1.
+
+    All three happen in one transaction so a failed enqueue leaves no
+    half-built task behind.
+
+    Returns:
+        tuple[QraftTask, str]: the created task and its Django-Q2 task ID
+    """
+    with transaction.atomic():
+        qraft_task = QraftTask.objects.create(**qraft_metadata)
+        q2_task_id = q2_async_task(func, *args, **q2_kwargs)
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task,
+            attempt_number=1,
+            q2_task_id=q2_task_id,
+        )
+    return qraft_task, q2_task_id
+
+
 def async_task(
     func: str | Callable,
     *args,
@@ -215,19 +236,13 @@ def async_task(
     if broker is not None:
         q2_kwargs["broker"] = broker
 
-    # Create QraftTask, queue to Q2, and create attempt atomically.
     # A concurrent call with the same idempotency_key can lose the race here:
-    # IntegrityError aborts this transaction, so the fallback lookup below
+    # IntegrityError aborts that transaction, so the fallback lookup below
     # runs outside it, against the winner's already-committed row.
     try:
-        with transaction.atomic():
-            qraft_task = QraftTask.objects.create(**qraft_metadata)
-            q2_task_id = q2_async_task(func, *args, **q2_kwargs)
-            QraftTaskAttempt.objects.create(
-                qraft_task=qraft_task,
-                attempt_number=1,
-                q2_task_id=q2_task_id,
-            )
+        qraft_task, q2_task_id = _create_and_enqueue(
+            qraft_metadata, func, args, q2_kwargs
+        )
     except IntegrityError:
         existing_q2_task_id = (
             _existing_task_for_key(idempotency_key) if idempotency_key else None
@@ -279,10 +294,8 @@ def _create_workflow_task(
     """
     from qraft.models import QraftBatchModel, QraftIterModel
 
-    # Build retry policy
     retry_policy = RetryPolicy.from_options(qraft_options)
 
-    # Prepare Qraft metadata
     qraft_metadata = {
         "func": func,
         "task_args": args,
@@ -293,47 +306,23 @@ def _create_workflow_task(
         "success_hook": None,
         "failure_hook": None,
     }
-
-    # Add workflow parent linkage
     if qraft_iter_id:
         qraft_metadata["qraft_iter"] = QraftIterModel.objects.get(id=qraft_iter_id)
     elif qraft_batch_id:
         qraft_metadata["qraft_batch"] = QraftBatchModel.objects.get(id=qraft_batch_id)
 
-    # Queue via Django-Q2 with Qraft's global hook handler
-    # Use workflow ID as group for result aggregation
-    group = None
-    if qraft_iter_id:
-        group = str(qraft_iter_id)
-    elif qraft_batch_id:
-        group = str(qraft_batch_id)
-
-    # Extract cluster routing from qraft_options
-    cluster = qraft_options.get("cluster")
-
-    # Build q2_async_task kwargs
+    # Workflow ID doubles as the Q2 group, for result aggregation
+    workflow_id = qraft_iter_id or qraft_batch_id
     q2_kwargs = {
         "hook": "qraft.hooks.qraft_hook_handler",
-        "group": group,
+        "group": str(workflow_id) if workflow_id else None,
         **kwargs,
     }
+    cluster = qraft_options.get("cluster")
     if cluster is not None:
         q2_kwargs["cluster"] = cluster
 
-    # Create QraftTask, queue to Q2, and create attempt atomically
-    with transaction.atomic():
-        qraft_task = QraftTask.objects.create(**qraft_metadata)
-
-        try:
-            q2_task_id = q2_async_task(func, *args, **q2_kwargs)
-        except Exception:
-            raise
-
-        QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=1,
-            q2_task_id=q2_task_id,
-        )
+    qraft_task, q2_task_id = _create_and_enqueue(qraft_metadata, func, args, q2_kwargs)
 
     _logger.debug(
         "Created workflow QraftTask %s (q2: %s, iter=%s, batch=%s) for func %s",

@@ -5,6 +5,7 @@ import logging
 from django.db import transaction
 from django_q.tasks import async_task as q2_async_task
 
+from qraft.hooks import dispatch_hook_once
 from qraft.models import (
     QraftBatchModel,
     QraftChainModel,
@@ -222,8 +223,6 @@ class ParallelDispatcher:
         Returns:
             bool: True if workflow is now complete
         """
-        from qraft.models import QraftTaskAttempt
-
         with transaction.atomic():
             # Lock the attempt to check/set counted flag atomically
             attempt = QraftTaskAttempt.objects.select_for_update().get(
@@ -384,63 +383,47 @@ def _dispatch_workflow_hook(
         hook_args: Positional args for hook
         hook_kwargs: Keyword args for hook
     """
-    import uuid as _uuid
-
-    # Use get_or_create with placeholder to avoid TOCTOU race
-    placeholder_id = f"p-{_uuid.uuid4().hex[:30]}"
-    try:
-        with transaction.atomic():
-            dispatch, created = WorkflowHookDispatch.objects.get_or_create(
-                workflow_type=workflow_type,
-                workflow_id=workflow_id,
-                hook_type=hook_type,
-                defaults={
-                    "hook_path": hook_path,
-                    "q2_task_id": placeholder_id,
-                },
-            )
-
-        if not created:
-            _logger.debug(
-                "Workflow hook already dispatched: %s %s %s (q2_task_id=%s)",
-                workflow_type,
-                workflow_id,
-                hook_type,
-                dispatch.q2_task_id,
-            )
-            return
-
-        # Queue hook as async task
-        q2_task_id = q2_async_task(
+    dispatch_hook_once(
+        WorkflowHookDispatch,
+        {
+            "workflow_type": workflow_type,
+            "workflow_id": workflow_id,
+            "hook_type": hook_type,
+        },
+        hook_path,
+        lambda: q2_async_task(
             hook_path,
             *hook_args,
             hook=None,  # Prevent recursion
             **hook_kwargs,
-        )
+        ),
+    )
 
-        # Update with actual Q2 task ID
-        dispatch.q2_task_id = q2_task_id
-        dispatch.save(update_fields=["q2_task_id"])
 
-        _logger.info(
-            "Dispatched %s hook for %s %s (q2_task_id=%s)",
-            hook_type,
-            workflow_type,
-            workflow_id,
-            q2_task_id,
-        )
-    except Exception as e:
-        # Clean up dispatch record on failure
-        WorkflowHookDispatch.objects.filter(
-            workflow_type=workflow_type,
-            workflow_id=workflow_id,
-            hook_type=hook_type,
-            q2_task_id=placeholder_id,
-        ).delete()
-        _logger.exception(
-            "Failed to dispatch %s hook for %s %s: %s",
-            hook_type,
-            workflow_type,
-            workflow_id,
-            e,
-        )
+def route_workflow_completion(qraft_task, attempt) -> bool:
+    """
+    Hand a completed task to its workflow dispatcher.
+
+    Args:
+        qraft_task: QraftTask instance
+        attempt: QraftTaskAttempt instance
+
+    Returns:
+        bool: False if the task belongs to no workflow, so the caller falls
+        back to task-level hooks.
+    """
+    try:
+        step = qraft_task.chain_step
+    except QraftChainStep.DoesNotExist:
+        step = None
+
+    if step is not None:
+        ChainDispatcher(step.chain, step, attempt).handle()
+        return True
+
+    workflow = qraft_task.qraft_iter or qraft_task.qraft_batch
+    if workflow is not None:
+        ParallelDispatcher(workflow, attempt).handle()
+        return True
+
+    return False

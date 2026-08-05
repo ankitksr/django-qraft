@@ -4,6 +4,19 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
 
+def get_q2_task(q2_task_id):
+    """Return the Django-Q2 Task with this id, or None if it's gone."""
+    from django_q.models import Task as Q2Task
+
+    if not q2_task_id:
+        return None
+
+    try:
+        return Q2Task.objects.get(id=q2_task_id)
+    except Q2Task.DoesNotExist:
+        return None
+
+
 class WorkflowStatus(models.TextChoices):
     """Shared status enum for all workflow types."""
 

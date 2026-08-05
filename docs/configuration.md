@@ -76,16 +76,6 @@ Settings inherited from Django-Q2 (full compatibility maintained):
 
 **Note**: All Django-Q2 settings are fully supported. See [Django-Q2 documentation](https://django-q2.readthedocs.io/) for complete reference.
 
-### Additional Qraft Settings
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `store_success` | `bool` | `True` | Store successful task results |
-| `store_failure` | `bool` | `True` | Store failed task results |
-| `dashboard_enabled` | `bool` | `True` | Enable web dashboard |
-| `hook_timeout` | `int` | `60` | Hook execution timeout in seconds |
-| `store_success_limit` | `int` | `None` | Limit for stored successful results |
-
 ## Threading Settings
 
 Control multithreaded worker behavior:

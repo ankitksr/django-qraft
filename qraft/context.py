@@ -17,6 +17,11 @@ _current_q2_task_id: ContextVar[str | None] = ContextVar(
 )
 
 
+def _is_numeric(value) -> bool:
+    """Whether a usage value accumulates (bools are flags, not counters)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _on_pre_execute(sender, func, task, **kwargs):
     """django_q `pre_execute` receiver: record the executing task's q2 id."""
     _current_q2_task_id.set(task.get("id"))
@@ -59,12 +64,8 @@ def record_usage(**fields) -> None:
 
     usage = dict(attempt.usage or {})
     for key, value in fields.items():
-        is_numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
         existing = usage.get(key)
-        existing_numeric = isinstance(existing, (int, float)) and not isinstance(
-            existing, bool
-        )
-        if is_numeric and existing_numeric:
+        if _is_numeric(value) and _is_numeric(existing):
             usage[key] = existing + value
         else:
             usage[key] = value
@@ -110,8 +111,7 @@ def _sum_usage(usages) -> dict:
         if not usage:
             continue
         for key, value in usage.items():
-            is_numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
-            if is_numeric:
+            if _is_numeric(value):
                 aggregated[key] = aggregated.get(key, 0) + value
             else:
                 aggregated[key] = value

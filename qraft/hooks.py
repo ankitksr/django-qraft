@@ -15,16 +15,14 @@ from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
 from .conf import get_conf
-from .retry import handle_task_retry
+from .retry import QRAFT_MARKER_PREFIX, handle_task_retry
 
 _logger = logging.getLogger("django-q")
 
-# Regex to extract exception class from Python traceback
-# Matches lines like "module.path.ExceptionClass: message" or "ExceptionClass: message"
+# Traceback tail lines look like "module.path.ExceptionClass: message"
 _EXC_PATTERN = re.compile(r"^([\w.]+):\s", re.MULTILINE)
 
-# Max chars for placeholder UUID hex in HookDispatch.q2_task_id
-# Format: "p-{hex}" must fit in CharField(max_length=32)
+# "p-{hex}" placeholder must fit in the q2_task_id CharField(max_length=32)
 _PLACEHOLDER_HEX_LEN = 30
 
 
@@ -34,8 +32,6 @@ def _extract_exception_class(result: str | None) -> str | None:
 
     The result format from worker.py is: "<message> : <traceback>"
     The traceback ends with a line like: "module.ExceptionClass: message"
-
-    Uses regex matching against Python's standardized traceback format.
 
     Args:
         result: Task result string containing error info
@@ -47,13 +43,51 @@ def _extract_exception_class(result: str | None) -> str | None:
         return None
 
     matches = _EXC_PATTERN.findall(result)
-    if matches:
-        # Take the last match (the actual exception, not chained causes)
-        exc_path = matches[-1]
-        # Return just the class name (after the last dot if fully qualified)
-        return exc_path.rsplit(".", 1)[-1]
+    if not matches:
+        return None
 
-    return None
+    # Last match is the actual exception, not a chained cause; strip any
+    # module prefix to leave the bare class name.
+    return matches[-1].rsplit(".", 1)[-1]
+
+
+def dispatch_hook_once(dispatch_model, lookup: dict, hook_path: str, enqueue) -> None:
+    """
+    Queue a hook task at most once per `lookup`, tracked by `dispatch_model`.
+
+    A placeholder q2_task_id is written inside the same get_or_create that
+    claims the (unique) lookup, so two racing dispatchers can't both enqueue.
+    The row is removed again if enqueueing fails, leaving a later retry free
+    to dispatch.
+
+    Args:
+        dispatch_model: HookDispatch or WorkflowHookDispatch
+        lookup: Field values forming the model's uniqueness constraint
+        hook_path: Dotted import path to the hook function
+        enqueue: Zero-arg callable that queues the hook and returns its q2 id
+    """
+    placeholder_id = f"p-{uuid.uuid4().hex[:_PLACEHOLDER_HEX_LEN]}"
+    try:
+        with transaction.atomic():
+            dispatch, created = dispatch_model.objects.get_or_create(
+                **lookup,
+                defaults={"hook_path": hook_path, "q2_task_id": placeholder_id},
+            )
+
+        if not created:
+            _logger.debug("%s already dispatched, skipping", dispatch)
+            return
+
+        dispatch.q2_task_id = enqueue()
+        dispatch.save(update_fields=["q2_task_id"])
+
+        _logger.debug("Queued %s as task %s", dispatch, dispatch.q2_task_id)
+
+    except Exception:
+        dispatch_model.objects.filter(**lookup, q2_task_id=placeholder_id).delete()
+        _logger.exception(
+            "Failed to dispatch hook '%s' for %s", hook_path, dispatch_model.__name__
+        )
 
 
 def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
@@ -64,8 +98,6 @@ def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
 
     Returns None if the marker is invalid or the UUID is malformed.
     """
-    from .retry import QRAFT_MARKER_PREFIX
-
     parts = marker.split(":")
     if len(parts) != 3 or parts[0] != QRAFT_MARKER_PREFIX:
         return None
@@ -78,6 +110,78 @@ def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
         return None
 
 
+def _resolve_attempt(q2_task):
+    """
+    Find the QraftTaskAttempt a finished Django-Q2 task belongs to.
+
+    Initial attempts are pre-created by async_task() and found by q2 task id.
+    Retries are queued through a Schedule instead, so they carry a Qraft
+    marker in their task_name and their attempt row is created here.
+
+    Returns:
+        QraftTaskAttempt, or None if the task isn't a Qraft task.
+    """
+    from .models import QraftTask, QraftTaskAttempt
+
+    try:
+        attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
+            q2_task_id=q2_task.id
+        )
+    except QraftTaskAttempt.DoesNotExist:
+        pass
+    else:
+        _logger.debug(
+            "Processing QraftTask %s attempt %d (q2: %s) via query",
+            attempt.qraft_task_id,
+            attempt.attempt_number,
+            q2_task.id,
+        )
+        return attempt
+
+    if not q2_task.name or not q2_task.name.startswith(f"{QRAFT_MARKER_PREFIX}:"):
+        _logger.debug(
+            "No Qraft marker or attempt found for task %s, skipping", q2_task.id
+        )
+        return None
+
+    parsed = _parse_qraft_marker(q2_task.name)
+    if not parsed:
+        _logger.warning(
+            "Invalid Qraft marker '%s' for task %s", q2_task.name, q2_task.id
+        )
+        return None
+
+    qraft_task_id, attempt_number = parsed
+    try:
+        qraft_task = QraftTask.objects.get(id=qraft_task_id)
+    except QraftTask.DoesNotExist:
+        _logger.error("QraftTask %s not found", qraft_task_id)
+        return None
+
+    attempt, created = QraftTaskAttempt.objects.get_or_create(
+        qraft_task=qraft_task,
+        attempt_number=attempt_number,
+        defaults={"q2_task_id": q2_task.id},
+    )
+
+    if not created:
+        # get_or_create only caches the parent on the create branch
+        attempt.qraft_task = qraft_task
+        # Defensive: an existing attempt should already carry this q2 task id
+        if attempt.q2_task_id != q2_task.id:
+            attempt.q2_task_id = q2_task.id
+            attempt.save(update_fields=["q2_task_id"])
+
+    _logger.debug(
+        "Processing QraftTask %s attempt %d (q2: %s, created=%s) via task_name",
+        qraft_task.id,
+        attempt_number,
+        q2_task.id,
+        created,
+    )
+    return attempt
+
+
 def qraft_hook_handler(q2_task):
     """
     Global hook handler that dispatches Qraft hooks based on task outcome.
@@ -85,75 +189,16 @@ def qraft_hook_handler(q2_task):
     This is registered as the hook for all Qraft-enhanced tasks. Django-Q2
     calls this with the task object after completion.
 
-    Identifies Qraft tasks via:
-    1. Query-based lookup by q2_task.id (fast path for initial tasks)
-    2. Fallback to task_name parsing for retry tasks (which aren't pre-created)
-
     Args:
         q2_task: Django-Q2 Task object passed by the monitor process
     """
-    from .models import QraftTask, QraftTaskAttempt, TaskStatus
+    from .dispatchers import route_workflow_completion
+    from .models import QraftTask, TaskStatus
 
-    # Fast path: Try query-based lookup first (for initial tasks created via async_task)
-    try:
-        attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
-            q2_task_id=q2_task.id
-        )
-        qraft_task = attempt.qraft_task
-
-        _logger.debug(
-            "Processing QraftTask %s attempt %d (q2: %s) via query",
-            qraft_task.id,
-            attempt.attempt_number,
-            q2_task.id,
-        )
-
-    except QraftTaskAttempt.DoesNotExist:
-        # Fallback: Parse task_name for retry tasks
-        # (scheduled via Schedule, not async_task)
-        from .retry import QRAFT_MARKER_PREFIX
-
-        if not q2_task.name or not q2_task.name.startswith(f"{QRAFT_MARKER_PREFIX}:"):
-            _logger.debug(
-                "No Qraft marker or attempt found for task %s, skipping", q2_task.id
-            )
-            return
-
-        parsed = _parse_qraft_marker(q2_task.name)
-        if not parsed:
-            _logger.warning(
-                "Invalid Qraft marker '%s' for task %s", q2_task.name, q2_task.id
-            )
-            return
-
-        qraft_task_id, attempt_number = parsed
-
-        # Look up QraftTask
-        try:
-            qraft_task = QraftTask.objects.get(id=qraft_task_id)
-        except QraftTask.DoesNotExist:
-            _logger.error("QraftTask %s not found", qraft_task_id)
-            return
-
-        # Create attempt record for retry (initial attempts are created in async_task)
-        attempt, created = QraftTaskAttempt.objects.get_or_create(
-            qraft_task=qraft_task,
-            attempt_number=attempt_number,
-            defaults={"q2_task_id": q2_task.id},
-        )
-
-        # If attempt existed but q2_task_id differs (shouldn't happen, but defensive)
-        if not created and attempt.q2_task_id != q2_task.id:
-            attempt.q2_task_id = q2_task.id
-            attempt.save(update_fields=["q2_task_id"])
-
-        _logger.debug(
-            "Processing QraftTask %s attempt %d (q2: %s, created=%s) via task_name",
-            qraft_task.id,
-            attempt_number,
-            q2_task.id,
-            created,
-        )
+    attempt = _resolve_attempt(q2_task)
+    if attempt is None:
+        return
+    qraft_task = attempt.qraft_task
 
     # Update attempt outcome and task status atomically
     with transaction.atomic():
@@ -172,20 +217,15 @@ def qraft_hook_handler(q2_task):
         )
         qraft_task.save(update_fields=["status", "date_updated"])
 
-    # Handle retry logic for failed tasks BEFORE workflow/hook processing
-    if not q2_task.success:
-        if handle_task_retry(qraft_task, attempt, result_text=q2_task.result):
-            # Retry scheduled - task is not terminal yet, skip all further processing
-            return
+    # A scheduled retry means the task is not terminal yet
+    if not q2_task.success and handle_task_retry(
+        qraft_task, attempt, result_text=q2_task.result
+    ):
+        return
 
-    # Task is terminal (succeeded or exhausted) - proceed with completion handling
-    if _is_workflow_task(qraft_task):
-        # Workflow tasks: route to workflow dispatcher, skip task-level hooks
-        _handle_workflow_completion(qraft_task, attempt)
-    else:
-        # Standalone tasks: dispatch task-level hooks
-        dispatcher = HookDispatcher(qraft_task, attempt)
-        dispatcher.dispatch(q2_task)
+    # Workflow tasks get workflow-level hooks only, never task-level ones
+    if not route_workflow_completion(qraft_task, attempt):
+        HookDispatcher(qraft_task, attempt).dispatch(q2_task)
 
 
 class HookDispatcher:
@@ -253,14 +293,12 @@ class HookDispatcher:
             task: Django-Q2 Task instance
             hook_type: 'success' or 'failure' for logging
         """
-        conf = get_conf()
-
-        if conf.sync_hooks:
-            self._call_hook_sync(hook_path, args, kwargs, task, hook_type)
+        if get_conf().sync_hooks:
+            self._call_hook_sync(hook_path, args, kwargs, hook_type)
         else:
-            self._call_hook_async(hook_path, args, kwargs, task, hook_type)
+            self._call_hook_async(hook_path, args, kwargs, hook_type)
 
-    def _call_hook_async(self, hook_path, args, kwargs, task, hook_type):
+    def _call_hook_async(self, hook_path, args, kwargs, hook_type):
         """
         Queue hook as an async task over workers.
 
@@ -268,66 +306,20 @@ class HookDispatcher:
         """
         from .models import HookDispatch
 
-        try:
-            # Check if hook already dispatched (idempotency guard)
-            # Use a placeholder for q2_task_id to avoid unique constraint issues
-            # Format: p-{short_uuid} to fit in 32 chars (2 + 30 = 32)
-            placeholder_id = f"p-{uuid.uuid4().hex[:_PLACEHOLDER_HEX_LEN]}"
-            with transaction.atomic():
-                hook_dispatch, created = HookDispatch.objects.get_or_create(
-                    qraft_task=self.qraft_task,
-                    hook_type=hook_type,
-                    defaults={
-                        "hook_path": hook_path,
-                        "q2_task_id": placeholder_id,
-                    },
-                )
-
-            if not created:
-                _logger.debug(
-                    "Hook %s already dispatched for QraftTask %s, skipping",
-                    hook_type,
-                    self.qraft_task.id,
-                )
-                return
-
-            # Queue hook as async task (no Qraft hook handler to prevent recursion)
-            q2_task_id = q2_async_task(
+        dispatch_hook_once(
+            HookDispatch,
+            {"qraft_task": self.qraft_task, "hook_type": hook_type},
+            hook_path,
+            lambda: q2_async_task(
                 hook_path,
                 *args,
                 **kwargs,
                 task_name=f"hook:{hook_type}:{self.qraft_task.id}",
                 hook=None,  # No hook on hook tasks - prevents recursion
-            )
+            ),
+        )
 
-            # Update with actual Q2 task ID
-            hook_dispatch.q2_task_id = q2_task_id
-            hook_dispatch.save(update_fields=["q2_task_id"])
-
-            _logger.debug(
-                "Queued %s hook '%s' as task %s for QraftTask %s",
-                hook_type,
-                hook_path,
-                q2_task_id,
-                self.qraft_task.id,
-            )
-
-        except Exception as e:
-            # Clean up placeholder dispatch record on failure
-            HookDispatch.objects.filter(
-                qraft_task=self.qraft_task,
-                hook_type=hook_type,
-                q2_task_id=placeholder_id,
-            ).delete()
-            _logger.error(
-                "Failed to dispatch %s hook for QraftTask %s: %s",
-                hook_type,
-                self.qraft_task.id,
-                e,
-                exc_info=True,
-            )
-
-    def _call_hook_sync(self, hook_path, args, kwargs, task, hook_type):
+    def _call_hook_sync(self, hook_path, args, kwargs, hook_type):
         """
         Call hook synchronously (legacy behavior).
 
@@ -361,55 +353,3 @@ class HookDispatcher:
                 e,
                 exc_info=True,
             )
-
-
-def _is_workflow_task(qraft_task) -> bool:
-    """
-    Check if task belongs to any workflow.
-
-    Returns:
-        bool: True if task is part of chain/iter/batch
-    """
-    # Check chain membership via reverse OneToOne
-    try:
-        if hasattr(qraft_task, "chain_step") and qraft_task.chain_step is not None:
-            return True
-    except Exception:
-        pass
-
-    # Check iter/batch membership via FK
-    return qraft_task.qraft_iter is not None or qraft_task.qraft_batch is not None
-
-
-def _handle_workflow_completion(qraft_task, attempt):
-    """
-    Route to appropriate workflow dispatcher if task is part of a workflow.
-
-    Args:
-        qraft_task: QraftTask instance
-        attempt: QraftTaskAttempt instance
-    """
-    from .dispatchers import ChainDispatcher, ParallelDispatcher
-    from .models import QraftChainStep
-
-    # Check chain membership via reverse OneToOne
-    try:
-        chain_step = qraft_task.chain_step
-        if chain_step:
-            dispatcher = ChainDispatcher(chain_step.chain, chain_step, attempt)
-            dispatcher.handle()
-            return
-    except QraftChainStep.DoesNotExist:
-        pass
-
-    # Check iter membership
-    if qraft_task.qraft_iter:
-        dispatcher = ParallelDispatcher(qraft_task.qraft_iter, attempt)
-        dispatcher.handle()
-        return
-
-    # Check batch membership
-    if qraft_task.qraft_batch:
-        dispatcher = ParallelDispatcher(qraft_task.qraft_batch, attempt)
-        dispatcher.handle()
-        return

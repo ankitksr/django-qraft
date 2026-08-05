@@ -11,6 +11,7 @@ Django-Q2's existing utilities and patterns.
 import logging
 import pydoc
 import signal
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Value
@@ -39,8 +40,8 @@ from django_q.utils import close_old_django_connections, get_func_repr
 _logger = logging.getLogger("django-q")
 
 # Timer sentinel values for inter-process communication
-TIMER_IDLE = -1       # Worker is idle, no task executing
-TIMER_RECYCLE = -2    # Signal sentinel to recycle this worker
+TIMER_IDLE = -1  # Worker is idle, no task executing
+TIMER_RECYCLE = -2  # Signal sentinel to recycle this worker
 
 # Extra seconds added to task timeout for processing overhead
 TIMER_BUFFER = 3
@@ -272,20 +273,16 @@ def threaded_worker(
     if setproctitle:
         setproctitle.setproctitle(f"qcluster {proc_name} stopping (threaded)")
 
-    # Shutdown executor with grace period timeout
-    # wait=False would not wait for tasks, so we implement timeout manually
-    import threading
-
+    # ThreadPoolExecutor.shutdown() takes no timeout, so wait on it from a
+    # side thread to keep the grace period enforceable.
     shutdown_complete = threading.Event()
 
     def _shutdown_executor():
         executor.shutdown(wait=True, cancel_futures=False)
         shutdown_complete.set()
 
-    shutdown_thread = threading.Thread(target=_shutdown_executor, daemon=True)
-    shutdown_thread.start()
+    threading.Thread(target=_shutdown_executor, daemon=True).start()
 
-    # Wait for shutdown with timeout
     if not shutdown_complete.wait(timeout=grace_period):
         _logger.warning(
             "%s executor shutdown timed out after %.1fs, forcing exit",
@@ -293,9 +290,8 @@ def threaded_worker(
             grace_period,
         )
 
-    # Reset timer to idle
     with timer.get_lock():
         if timer.value > 0:
-            timer.value = -1
+            timer.value = TIMER_IDLE
 
     _logger.info("%s stopped doing work", proc_name)

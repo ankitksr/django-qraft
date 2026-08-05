@@ -6,17 +6,11 @@ from uuid import UUID
 from django.db import transaction
 
 from qraft.base import BaseWorkflow, _validate_hook_path
+from qraft.dispatchers import _dispatch_workflow_hook, _queue_chain_step
 from qraft.models import QraftChainModel, QraftChainStep, WorkflowStatus
-from qraft.results import WorkflowResult
+from qraft.results import TaskResult, WorkflowResult
 
 _logger = logging.getLogger("qraft.chain")
-
-
-def _queue_chain_step(chain, step):
-    """Queue a chain step as a QraftTask. Delegates to dispatchers."""
-    from qraft.dispatchers import _queue_chain_step as _dispatch
-
-    _dispatch(chain, step)
 
 
 class QraftChain(BaseWorkflow):
@@ -143,7 +137,7 @@ class QraftChain(BaseWorkflow):
                     **step_data,
                 )
 
-            self._model.status = WorkflowStatus.RUNNING
+            self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["status", "date_updated"])
 
             first_step = self._model.steps.get(step_index=0)
@@ -183,7 +177,7 @@ class QraftChain(BaseWorkflow):
         current_step = self._model.steps.get(step_index=self._model.current_step_index)
 
         with transaction.atomic():
-            self._model.status = WorkflowStatus.RUNNING
+            self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["status", "date_updated"])
 
             if current_step.qraft_task:
@@ -239,8 +233,6 @@ class QraftChain(BaseWorkflow):
         _logger.info("QraftChain %s rejected: %s", chain.id, reason)
 
         if chain.on_cancelled:
-            from qraft.dispatchers import _dispatch_workflow_hook
-
             _dispatch_workflow_hook(
                 workflow_type="chain",
                 workflow_id=chain.id,
@@ -271,16 +263,13 @@ class QraftChain(BaseWorkflow):
         """
         self._poll_until_terminal(wait)
 
-        from qraft.results import TaskResult
+        steps = self._model.steps.select_related("qraft_task").order_by("step_index")
 
         task_results = []
-        for step in self._model.steps.order_by("step_index"):
-            if step.qraft_task:
-                task_results.append(TaskResult.from_qraft_task(step.qraft_task))
-            else:
+        for step in steps:
+            # Steps are queued in order, so the first unqueued one ends the run
+            if not step.qraft_task:
                 break
+            task_results.append(TaskResult.from_qraft_task(step.qraft_task))
 
         return WorkflowResult(task_results=task_results)
-
-    def __repr__(self):
-        return f"<QraftChain id={self._model.id} status={self._model.status}>"

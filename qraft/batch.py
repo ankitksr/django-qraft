@@ -6,14 +6,13 @@ from uuid import UUID
 
 from django.db import transaction
 
-from qraft.base import BaseWorkflow, _validate_hook_path
+from qraft.base import ParallelWorkflow, _validate_hook_path
 from qraft.models import QraftBatchModel, WorkflowStatus
-from qraft.results import WorkflowResult
 
 _logger = logging.getLogger("qraft.batch")
 
 
-class QraftBatch(BaseWorkflow):
+class QraftBatch(ParallelWorkflow):
     """
     Parallel workflow primitive for different functions (fork-join).
 
@@ -75,26 +74,6 @@ class QraftBatch(BaseWorkflow):
 
         _logger.debug("Initialized QraftBatch %s", self._model.id)
 
-    @property
-    def total_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.total_count
-
-    @property
-    def completed_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.completed_count
-
-    @property
-    def success_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.success_count
-
-    @property
-    def failure_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.failure_count
-
     def append(
         self,
         func: str,
@@ -126,7 +105,9 @@ class QraftBatch(BaseWorkflow):
         self._tasks.append(task_data)
         _logger.debug(
             "Added task %d to batch %s: %s",
-            len(self._tasks), self._model.id, func,
+            len(self._tasks),
+            self._model.id,
+            func,
         )
 
     def add(
@@ -162,7 +143,7 @@ class QraftBatch(BaseWorkflow):
 
         with transaction.atomic():
             self._model.total_count = len(self._tasks)
-            self._model.status = WorkflowStatus.RUNNING
+            self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["total_count", "status", "date_updated"])
 
         from qraft.tasks import _create_workflow_task
@@ -177,34 +158,15 @@ class QraftBatch(BaseWorkflow):
             )
             _logger.debug(
                 "Queued batch task %d/%d (batch=%s, func=%s)",
-                idx + 1, len(self._tasks), self._model.id, task_data["func"],
+                idx + 1,
+                len(self._tasks),
+                self._model.id,
+                task_data["func"],
             )
 
         _logger.info(
             "Started QraftBatch %s with %d tasks",
-            self._model.id, len(self._tasks),
+            self._model.id,
+            len(self._tasks),
         )
         return self._model.id
-
-    def result(self, wait: int | None = None) -> WorkflowResult:
-        """
-        Get results from all tasks.
-
-        Args:
-            wait: Timeout in milliseconds to wait for completion
-
-        Returns:
-            WorkflowResult with task results (unordered)
-
-        Raises:
-            TimeoutError: If wait is provided and batch doesn't complete in time
-        """
-        self._poll_until_terminal(wait)
-        return self._build_workflow_result(self._model.tasks.all())
-
-    def __repr__(self):
-        return (
-            f"<QraftBatch id={self._model.id}"
-            f" status={self._model.status}"
-            f" completed={self.completed_count}/{self.total_count}>"
-        )

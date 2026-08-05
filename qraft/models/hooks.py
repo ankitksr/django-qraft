@@ -4,6 +4,8 @@ from uuid import uuid4
 
 from django.db import models
 
+from .mixins import get_q2_task
+
 
 class HookDispatch(models.Model):
     """
@@ -46,15 +48,7 @@ class HookDispatch(models.Model):
 
     def get_q2_task(self):
         """Retrieve the associated Django-Q2 Task if it exists."""
-        from django_q.models import Task as Q2Task
-
-        if not self.q2_task_id:
-            return None
-
-        try:
-            return Q2Task.objects.get(id=self.q2_task_id)
-        except Q2Task.DoesNotExist:
-            return None
+        return get_q2_task(self.q2_task_id)
 
     class Meta:
         app_label = "qraft"
@@ -115,15 +109,7 @@ class WorkflowHookDispatch(models.Model):
 
     def get_q2_task(self):
         """Retrieve the associated Django-Q2 Task if it exists."""
-        from django_q.models import Task as Q2Task
-
-        if not self.q2_task_id:
-            return None
-
-        try:
-            return Q2Task.objects.get(id=self.q2_task_id)
-        except Q2Task.DoesNotExist:
-            return None
+        return get_q2_task(self.q2_task_id)
 
     class Meta:
         app_label = "qraft"

@@ -5,6 +5,8 @@ from uuid import uuid4
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
+from .mixins import get_q2_task
+
 
 class QraftTask(models.Model):
     """
@@ -241,12 +243,7 @@ class QraftTaskAttempt(models.Model):
 
     def get_q2_task(self):
         """Retrieve the associated Django-Q2 Task if it exists."""
-        from django_q.models import Task as Q2Task
-
-        try:
-            return Q2Task.objects.get(id=self.q2_task_id)
-        except Q2Task.DoesNotExist:
-            return None
+        return get_q2_task(self.q2_task_id)
 
     class Meta:
         app_label = "qraft"

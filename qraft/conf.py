@@ -79,17 +79,6 @@ class QraftSettings(BaseSettings):
     # Nested retry default settings
     retry_defaults: RetryDefaultsSettings = Field(default_factory=RetryDefaultsSettings)
 
-    # Core settings with defaults
-    store_success: bool = Field(True, description="Store successful task results")
-    store_failure: bool = Field(True, description="Store failed task results")
-    dashboard_enabled: bool = Field(True, description="Enable the web dashboard")
-    hook_timeout: int = Field(60, description="Hook execution timeout in seconds")
-
-    # Additional settings for compatibility
-    store_success_limit: int | None = Field(
-        None, description="Limit for stored successful results"
-    )
-
     # Threading settings for multithreaded workers
     threads: int = Field(
         1,

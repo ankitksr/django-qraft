@@ -5,14 +5,13 @@ from uuid import UUID
 
 from django.db import transaction
 
-from qraft.base import BaseWorkflow, _validate_hook_path
+from qraft.base import ParallelWorkflow, _validate_hook_path
 from qraft.models import QraftIterModel, WorkflowStatus
-from qraft.results import WorkflowResult
 
 _logger = logging.getLogger("qraft.iter")
 
 
-class QraftIter(BaseWorkflow):
+class QraftIter(ParallelWorkflow):
     """
     Parallel workflow primitive for same function with many inputs.
 
@@ -81,26 +80,6 @@ class QraftIter(BaseWorkflow):
 
         _logger.debug("Initialized QraftIter %s for func %s", self._model.id, func)
 
-    @property
-    def total_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.total_count
-
-    @property
-    def completed_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.completed_count
-
-    @property
-    def success_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.success_count
-
-    @property
-    def failure_count(self) -> int:
-        self._model.refresh_from_db()
-        return self._model.failure_count
-
     def append(self, *args, **kwargs):
         """
         Add an item to the iter with the given arguments.
@@ -132,7 +111,7 @@ class QraftIter(BaseWorkflow):
 
         with transaction.atomic():
             self._model.total_count = len(self._items)
-            self._model.status = WorkflowStatus.RUNNING
+            self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["total_count", "status", "date_updated"])
 
         from qraft.tasks import _create_workflow_task
@@ -147,38 +126,18 @@ class QraftIter(BaseWorkflow):
             )
             _logger.debug(
                 "Queued iter task %d/%d (iter=%s)",
-                idx + 1, len(self._items), self._model.id,
+                idx + 1,
+                len(self._items),
+                self._model.id,
             )
 
         _logger.info(
             "Started QraftIter %s with %d items",
-            self._model.id, len(self._items),
+            self._model.id,
+            len(self._items),
         )
         return self._model.id
 
     def length(self) -> int:
         """Get the total number of items."""
         return self._model.total_count
-
-    def result(self, wait: int | None = None) -> WorkflowResult:
-        """
-        Get results from all tasks.
-
-        Args:
-            wait: Timeout in milliseconds to wait for completion
-
-        Returns:
-            WorkflowResult with task results (unordered)
-
-        Raises:
-            TimeoutError: If wait is provided and iter doesn't complete in time
-        """
-        self._poll_until_terminal(wait)
-        return self._build_workflow_result(self._model.tasks.all())
-
-    def __repr__(self):
-        return (
-            f"<QraftIter id={self._model.id}"
-            f" status={self._model.status}"
-            f" completed={self.completed_count}/{self.total_count}>"
-        )

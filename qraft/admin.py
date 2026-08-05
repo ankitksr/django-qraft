@@ -4,6 +4,7 @@ Django admin configuration for Qraft models.
 
 from django.contrib import admin
 from django.db.models import Count
+from django.urls import reverse
 from django.utils.html import format_html
 
 from .models import (
@@ -17,14 +18,10 @@ from .models import (
     WorkflowHookDispatch,
 )
 
-
-def _short_uuid(uuid_val):
-    """Return shortened UUID for display."""
-    return str(uuid_val)[:8] if uuid_val else "-"
-
+_DEFAULT_STATUS_COLOR = "#6c757d"
 
 _WORKFLOW_STATUS_COLORS = {
-    "pending": "#6c757d",
+    "pending": _DEFAULT_STATUS_COLOR,
     "running": "#007bff",
     "succeeded": "#28a745",
     "failed": "#dc3545",
@@ -37,18 +34,18 @@ _TASK_STATUS_COLORS = {
 }
 
 
-def _colored_status(status, display, colors=None):
+def _short_uuid(uuid_val):
+    """Return shortened UUID for display."""
+    return str(uuid_val)[:8] if uuid_val else "-"
+
+
+def _colored_status(status, display, colors):
     """Return HTML-formatted colored status badge."""
-    colors = colors or _TASK_STATUS_COLORS
-    color = colors.get(status, "#6c757d")
     return format_html(
         '<span style="color: {}; font-weight: bold;">{}</span>',
-        color,
+        colors.get(status, _DEFAULT_STATUS_COLOR),
         display,
     )
-
-
-# ── QraftTask ──────────────────────────────────────────────
 
 
 def _compact_usage(usage):
@@ -58,7 +55,82 @@ def _compact_usage(usage):
     return ", ".join(f"{key}={value}" for key, value in usage.items())
 
 
-class QraftTaskAttemptInline(admin.TabularInline):
+class _ReadOnly:
+    """Forbids adding and deleting; works for both ModelAdmin and inlines."""
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class _UsageDisplay:
+    """Renders the attempt `usage` JSON column."""
+
+    def usage_display(self, obj):
+        return _compact_usage(obj.usage)
+
+    usage_display.short_description = "Usage"
+
+
+class _ShortIdAdmin(_ReadOnly):
+    """Read-only admin that lists a truncated UUID primary key."""
+
+    def short_id(self, obj):
+        return _short_uuid(obj.id)
+
+    short_id.short_description = "ID"
+
+
+class _QraftTaskLinkAdmin(_ShortIdAdmin):
+    """Read-only admin for models pointing at a QraftTask."""
+
+    def qraft_task_link(self, obj):
+        url = reverse("admin:qraft_qrafttask_change", args=[obj.qraft_task_id])
+        return format_html('<a href="{}">{}</a>', url, _short_uuid(obj.qraft_task_id))
+
+    qraft_task_link.short_description = "Qraft Task"
+
+
+class _WorkflowAdmin(_ShortIdAdmin):
+    """Shared display helpers for the chain/iter/batch admins."""
+
+    # (model field, single-letter flag) shown in the Hooks column
+    _hook_flags = (("success_hook", "S"), ("failure_hook", "F"), ("on_cancelled", "C"))
+
+    def status_display(self, obj):
+        return _colored_status(
+            obj.status, obj.get_status_display(), _WORKFLOW_STATUS_COLORS
+        )
+
+    status_display.short_description = "Status"
+
+    def hooks_display(self, obj):
+        flags = [flag for field, flag in self._hook_flags if getattr(obj, field)]
+        return ", ".join(flags) or "-"
+
+    hooks_display.short_description = "Hooks"
+
+
+class _ParallelWorkflowAdmin(_WorkflowAdmin):
+    """Shared display helpers for the counter-tracking iter/batch admins."""
+
+    _hook_flags = _WorkflowAdmin._hook_flags + (("progress_hook", "P"),)
+
+    def counters_display(self, obj):
+        return (
+            f"{obj.completed_count}/{obj.total_count}"
+            f" (S:{obj.success_count} F:{obj.failure_count})"
+        )
+
+    counters_display.short_description = "Progress"
+
+
+# ── QraftTask ──────────────────────────────────────────────
+
+
+class QraftTaskAttemptInline(_UsageDisplay, _ReadOnly, admin.TabularInline):
     """Inline display of task attempts within QraftTask admin."""
 
     model = QraftTaskAttempt
@@ -75,19 +147,8 @@ class QraftTaskAttemptInline(admin.TabularInline):
     ]
     ordering = ["attempt_number"]
 
-    def usage_display(self, obj):
-        return _compact_usage(obj.usage)
 
-    usage_display.short_description = "Usage"
-
-    def has_add_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-
-class HookDispatchInline(admin.TabularInline):
+class HookDispatchInline(_ReadOnly, admin.TabularInline):
     """Inline display of hook dispatches within QraftTask admin."""
 
     model = HookDispatch
@@ -101,15 +162,9 @@ class HookDispatchInline(admin.TabularInline):
     ]
     ordering = ["-date_created"]
 
-    def has_add_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(QraftTask)
-class QraftTaskAdmin(admin.ModelAdmin):
+class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
     """Admin for QraftTask model."""
 
     list_display = [
@@ -160,13 +215,10 @@ class QraftTaskAdmin(admin.ModelAdmin):
         qs = super().get_queryset(request)
         return qs.annotate(_attempt_count=Count("attempts"))
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
     def status_display(self, obj):
-        return _colored_status(obj.status, obj.get_status_display())
+        return _colored_status(
+            obj.status, obj.get_status_display(), _TASK_STATUS_COLORS
+        )
 
     status_display.short_description = "Status"
 
@@ -176,15 +228,9 @@ class QraftTaskAdmin(admin.ModelAdmin):
     attempt_count.short_description = "Attempts"
     attempt_count.admin_order_field = "_attempt_count"
 
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(QraftTaskAttempt)
-class QraftTaskAttemptAdmin(admin.ModelAdmin):
+class QraftTaskAttemptAdmin(_UsageDisplay, _QraftTaskLinkAdmin, admin.ModelAdmin):
     """Admin for QraftTaskAttempt model."""
 
     list_display = [
@@ -212,24 +258,6 @@ class QraftTaskAttemptAdmin(admin.ModelAdmin):
     ]
     ordering = ["-date_created"]
 
-    def usage_display(self, obj):
-        return _compact_usage(obj.usage)
-
-    usage_display.short_description = "Usage"
-
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
-    def qraft_task_link(self, obj):
-        from django.urls import reverse
-
-        url = reverse("admin:qraft_qrafttask_change", args=[obj.qraft_task_id])
-        return format_html('<a href="{}">{}</a>', url, _short_uuid(obj.qraft_task_id))
-
-    qraft_task_link.short_description = "Qraft Task"
-
     def success_display(self, obj):
         if obj.success is None:
             return format_html('<span style="color: #6c757d;">Pending</span>')
@@ -240,15 +268,9 @@ class QraftTaskAttemptAdmin(admin.ModelAdmin):
 
     success_display.short_description = "Outcome"
 
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(HookDispatch)
-class HookDispatchAdmin(admin.ModelAdmin):
+class HookDispatchAdmin(_QraftTaskLinkAdmin, admin.ModelAdmin):
     """Admin for HookDispatch model."""
 
     list_display = [
@@ -271,30 +293,11 @@ class HookDispatchAdmin(admin.ModelAdmin):
     ]
     ordering = ["-date_created"]
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
-    def qraft_task_link(self, obj):
-        from django.urls import reverse
-
-        url = reverse("admin:qraft_qrafttask_change", args=[obj.qraft_task_id])
-        return format_html('<a href="{}">{}</a>', url, _short_uuid(obj.qraft_task_id))
-
-    qraft_task_link.short_description = "Qraft Task"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 # ── Workflow Models ──────────────────────────────────────────
 
 
-class QraftChainStepInline(admin.TabularInline):
+class QraftChainStepInline(_ReadOnly, admin.TabularInline):
     """Inline display of chain steps."""
 
     model = QraftChainStep
@@ -310,15 +313,9 @@ class QraftChainStepInline(admin.TabularInline):
     ]
     ordering = ["step_index"]
 
-    def has_add_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(QraftChainModel)
-class QraftChainModelAdmin(admin.ModelAdmin):
+class QraftChainModelAdmin(_WorkflowAdmin, admin.ModelAdmin):
     """Admin for QraftChainModel."""
 
     list_display = [
@@ -354,47 +351,15 @@ class QraftChainModelAdmin(admin.ModelAdmin):
         qs = super().get_queryset(request)
         return qs.annotate(_step_count=Count("steps"))
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
-    def status_display(self, obj):
-        return _colored_status(
-            obj.status,
-            obj.get_status_display(),
-            _WORKFLOW_STATUS_COLORS,
-        )
-
-    status_display.short_description = "Status"
-
     def step_count(self, obj):
         return getattr(obj, "_step_count", obj.steps.count())
 
     step_count.short_description = "Steps"
     step_count.admin_order_field = "_step_count"
 
-    def hooks_display(self, obj):
-        hooks = []
-        if obj.success_hook:
-            hooks.append("S")
-        if obj.failure_hook:
-            hooks.append("F")
-        if obj.on_cancelled:
-            hooks.append("C")
-        return ", ".join(hooks) or "-"
-
-    hooks_display.short_description = "Hooks"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(QraftIterModel)
-class QraftIterModelAdmin(admin.ModelAdmin):
+class QraftIterModelAdmin(_ParallelWorkflowAdmin, admin.ModelAdmin):
     """Admin for QraftIterModel."""
 
     list_display = [
@@ -430,51 +395,9 @@ class QraftIterModelAdmin(admin.ModelAdmin):
     ]
     ordering = ["-date_created"]
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
-    def status_display(self, obj):
-        return _colored_status(
-            obj.status,
-            obj.get_status_display(),
-            _WORKFLOW_STATUS_COLORS,
-        )
-
-    status_display.short_description = "Status"
-
-    def counters_display(self, obj):
-        return (
-            f"{obj.completed_count}/{obj.total_count}"
-            f" (S:{obj.success_count} F:{obj.failure_count})"
-        )
-
-    counters_display.short_description = "Progress"
-
-    def hooks_display(self, obj):
-        hooks = []
-        if obj.success_hook:
-            hooks.append("S")
-        if obj.failure_hook:
-            hooks.append("F")
-        if obj.on_cancelled:
-            hooks.append("C")
-        if obj.progress_hook:
-            hooks.append("P")
-        return ", ".join(hooks) or "-"
-
-    hooks_display.short_description = "Hooks"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(QraftBatchModel)
-class QraftBatchModelAdmin(admin.ModelAdmin):
+class QraftBatchModelAdmin(_ParallelWorkflowAdmin, admin.ModelAdmin):
     """Admin for QraftBatchModel."""
 
     list_display = [
@@ -507,51 +430,9 @@ class QraftBatchModelAdmin(admin.ModelAdmin):
     ]
     ordering = ["-date_created"]
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
-    def status_display(self, obj):
-        return _colored_status(
-            obj.status,
-            obj.get_status_display(),
-            _WORKFLOW_STATUS_COLORS,
-        )
-
-    status_display.short_description = "Status"
-
-    def counters_display(self, obj):
-        return (
-            f"{obj.completed_count}/{obj.total_count}"
-            f" (S:{obj.success_count} F:{obj.failure_count})"
-        )
-
-    counters_display.short_description = "Progress"
-
-    def hooks_display(self, obj):
-        hooks = []
-        if obj.success_hook:
-            hooks.append("S")
-        if obj.failure_hook:
-            hooks.append("F")
-        if obj.on_cancelled:
-            hooks.append("C")
-        if obj.progress_hook:
-            hooks.append("P")
-        return ", ".join(hooks) or "-"
-
-    hooks_display.short_description = "Hooks"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
 
 @admin.register(WorkflowHookDispatch)
-class WorkflowHookDispatchAdmin(admin.ModelAdmin):
+class WorkflowHookDispatchAdmin(_ShortIdAdmin, admin.ModelAdmin):
     """Admin for WorkflowHookDispatch model."""
 
     list_display = [
@@ -575,18 +456,7 @@ class WorkflowHookDispatchAdmin(admin.ModelAdmin):
     ]
     ordering = ["-date_created"]
 
-    def short_id(self, obj):
-        return _short_uuid(obj.id)
-
-    short_id.short_description = "ID"
-
     def workflow_id_short(self, obj):
         return _short_uuid(obj.workflow_id)
 
     workflow_id_short.short_description = "Workflow ID"
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False

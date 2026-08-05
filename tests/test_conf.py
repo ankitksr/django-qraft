@@ -6,7 +6,13 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from qraft.conf import QraftSettings, RetryBackoff, RetryDefaultsSettings, _cached_conf, get_conf
+from qraft.conf import (
+    QraftSettings,
+    RetryBackoff,
+    RetryDefaultsSettings,
+    _cached_conf,
+    get_conf,
+)
 
 
 class TestRetryDefaultsSettings:
@@ -67,10 +73,6 @@ class TestQraftSettings:
         """Test settings with default values from test configuration."""
         settings = QraftSettings()
 
-        assert settings.store_success is True
-        assert settings.store_failure is True
-        assert settings.dashboard_enabled is True
-        assert settings.hook_timeout == 60
         assert settings.threads == 1
         # In tests, max_inflight is set to 2 in test settings
         assert settings.max_inflight in (None, 2)
