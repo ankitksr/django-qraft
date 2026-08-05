@@ -250,6 +250,7 @@ task_id = async_task(
 - [Demo Application](demo/README.md) - Interactive feature demonstrations
 - [Roadmap](docs/roadmap.md) - Positioning and planned features
 - [Test Drive](docs/test-drive.md) - Guided walkthrough of every demo scenario
+- [Lifecycle Map](docs/lifecycle-map.html) - One-page visual reference for the task and worker lifecycle
 
 ## Use Cases
 
