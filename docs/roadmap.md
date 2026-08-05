@@ -38,6 +38,12 @@ offers Canvas-depth workflows or AI-workload primitives.
 Remaining from the original plan: `TaskContext` injection, deferred (`run_after`) and
 coroutine tasks on the django.tasks backend; priority routing for scheduled retries.
 
+## Architecture direction
+
+Incremental absorption of Django-Q2, one owned subsystem per phase: execution
+state (shipped, the lease), scheduling (phase 2), the worker loop (phase 3).
+Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
+
 ## Deliberately not planned
 
 - **Semantic/result caching** — app-layer concern; scope creep for a queue.
