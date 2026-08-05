@@ -80,7 +80,9 @@ class TestEndToEndWorkflows:
 
     @patch("qraft.hooks.q2_async_task")
     @patch("qraft.hooks.get_conf")
-    def test_hook_dispatch_workflow(self, mock_get_conf, mock_q2_async, qraft_task, qraft_task_attempt):
+    def test_hook_dispatch_workflow(
+        self, mock_get_conf, mock_q2_async, qraft_task, qraft_task_attempt
+    ):
         """Test complete hook dispatching workflow."""
         from unittest.mock import Mock
 
@@ -150,7 +152,9 @@ class TestEndToEndWorkflows:
         from django_q.models import Schedule
 
         schedule = Schedule.objects.get()
-        assert schedule.func == qraft_task.func
+        # Scheduled via the universal unwrapping runner, not the dotted path
+        # directly - see qraft.runner.run_task.
+        assert schedule.func == "qraft.runner.run_task"
         assert str(qraft_task.id) in schedule.name
 
     def test_retry_exhaustion_workflow(self, qraft_task, qraft_task_attempt):

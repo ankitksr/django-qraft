@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Execution lease with heartbeat** (`qraft/lease.py`): a worker stamps `date_started`
+  and `heartbeat_at` on the attempt at `pre_execute` and refreshes `heartbeat_at` from a
+  daemon thread every `heartbeat_interval` seconds (new setting, 30s) until the task ends.
+  New `QraftTaskAttempt.date_started` / `heartbeat_at` fields (migration
+  `0005_execution_lease`)
+
+### Fixed
+- **Reaper no longer reaps live long-running tasks.** The old predicate treated "no
+  Django-Q2 `Task` row" as worker death, but Django-Q2 writes that row only at completion,
+  so any task running past `reap_stale_after` was killed and requeued. `reap_orphans()`
+  now reaps on a stale lease heartbeat (older than `max(3 * heartbeat_interval, 90s)`), or
+  on a never-started attempt older than `reap_stale_after` whose pack is no longer in the
+  ORM broker queue. `reap_stale_after` stays as the never-started fallback knob
+
 - **Dead letter queue** (`qraft/dlq.py`): `dead_letters()` finds `FAILED`/`EXHAUSTED`
   tasks; `requeue()` re-enqueues one as the next attempt on the same `QraftTask`,
   preserving history and idempotency key. Admin gains a "Requeue selected dead tasks"
@@ -17,6 +31,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Schedule`, the same linkage used for retries. `takes_context=True` tasks get a real
   `TaskContext` injected worker-side via `run_task_with_context`, without disturbing the
   `QraftTask` record of the real target function/args/kwargs
+- **Status-aware idempotency keys** (`qraft/tasks.py`): `idempotency_retry_dead=True`
+  lets a `FAILED`/`EXHAUSTED` task's key be reclaimed by a new enqueue instead of
+  permanently blocking it. Default `False` keeps the existing permanent-dedupe behavior
+
+### Fixed
+- **Parallel workflow cancel race**: `ParallelDispatcher` re-checks workflow status under
+  the row lock inside `_atomic_increment()`, so a cancel racing the final task completion
+  is no longer overwritten back to `SUCCEEDED`/`FAILED`
+- **Chain double-queue on duplicate hook delivery**: `ChainDispatcher` now advances
+  `current_step_index` only while it still matches the completing step's index, checked
+  under a row lock, so a duplicate `qraft_hook_handler` delivery for the same step no
+  longer queues the next step twice
+- **Retries/DLQ requeue of `@task`-decorated functions**: `RetryPolicy.schedule_retry()`
+  and `dlq.requeue()` now schedule the new `qraft.runner.run_task` instead of the stored
+  dotted path directly, so a retried or requeued `django.tasks`-decorated function is
+  unwrapped and called correctly instead of resolving to the non-callable `@task` wrapper.
+  Requeued `takes_context=True` tasks still don't get `TaskContext` re-injected - out of
+  scope, see `docs/django-tasks-backend.md`
+- **Rate-limit delay cap now applied after jitter**: a `retry_after` hint near
+  `rate_limit_max_delay` could slip past the cap once jitter was added (e.g. 300s cap ->
+  330s). `parse_retry_after()` also floors sub-second hints to 1.0s, so a provider hint of
+  `0` can no longer produce a zero/negative retry delay
+
+### Changed
+- **`async_task()` rejects `sync=True`, `save=False`, and `cached=...`**: completion
+  tracking depends on the hook handler seeing a saved Django-Q2 result after the
+  `QraftTaskAttempt` row exists, and these modes all break that: `sync=True` finishes (and
+  fires the hook) before the row is committed, and `save=False`/`cached=...` never produce
+  the result row at all. All three now raise `ValueError` instead of silently corrupting
+  tracking
 
 ### Planned
 - Coroutine tasks on the `django.tasks` backend

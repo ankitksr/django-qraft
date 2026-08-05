@@ -64,12 +64,50 @@ class ChainDispatcher:
             # Else: retry is being scheduled, do nothing
 
     def _handle_step_success(self):
-        """Handle successful step completion."""
-        # Check if there's a next step
+        """Handle successful step completion.
+
+        A duplicate hook delivery for the same step must not advance (and
+        thus queue) the chain twice. The lock + current_step_index check
+        below is the guard: once this step's completion has advanced the
+        chain, current_step_index no longer matches the step index, so a
+        second delivery bails before touching anything.
+        """
         next_step = self.chain.steps.filter(step_index=self.step.step_index + 1).first()
 
-        if not next_step:
-            # Chain complete
+        with transaction.atomic():
+            chain = QraftChainModel.objects.select_for_update().get(id=self.chain.id)
+            if chain.current_step_index != self.step.step_index:
+                _logger.debug(
+                    "Chain %s: step %d already advanced past (current=%d), "
+                    "skipping duplicate completion",
+                    chain.id,
+                    self.step.step_index,
+                    chain.current_step_index,
+                )
+                return
+            self.chain = chain
+
+            if not next_step:
+                queue_next = False
+            elif next_step.requires_approval:
+                chain.current_step_index = next_step.step_index
+                chain.transition_to(WorkflowStatus.WAITING_APPROVAL)
+                chain.save(
+                    update_fields=["current_step_index", "status", "date_updated"]
+                )
+                _logger.info(
+                    "Chain %s: step %d succeeded, step %d requires approval, parked",
+                    chain.id,
+                    self.step.step_index,
+                    next_step.step_index,
+                )
+                return
+            else:
+                chain.current_step_index = next_step.step_index
+                chain.save(update_fields=["current_step_index", "date_updated"])
+                queue_next = True
+
+        if not queue_next:
             self._complete_chain(success=True)
             _logger.info(
                 "Chain %s: final step %d succeeded, chain complete",
@@ -77,30 +115,6 @@ class ChainDispatcher:
                 self.step.step_index,
             )
             return
-
-        if next_step.requires_approval:
-            with transaction.atomic():
-                chain = QraftChainModel.objects.select_for_update().get(
-                    id=self.chain.id
-                )
-                chain.current_step_index = next_step.step_index
-                chain.transition_to(WorkflowStatus.WAITING_APPROVAL)
-                chain.save(
-                    update_fields=["current_step_index", "status", "date_updated"]
-                )
-            self.chain = chain
-            _logger.info(
-                "Chain %s: step %d succeeded, step %d requires approval, parked",
-                self.chain.id,
-                self.step.step_index,
-                next_step.step_index,
-            )
-            return
-
-        # Queue next step
-        with transaction.atomic():
-            self.chain.current_step_index = next_step.step_index
-            self.chain.save(update_fields=["current_step_index", "date_updated"])
 
         _queue_chain_step(self.chain, next_step)
         _logger.info(
@@ -220,10 +234,29 @@ class ParallelDispatcher:
         Uses the `counted` flag on QraftTaskAttempt for idempotency -
         if this attempt was already counted, skip the increment.
 
+        The outer cancellation check in `handle()` reads the workflow
+        outside any lock, so a cancel can land between that check and this
+        method. Re-checking status here under `select_for_update()` closes
+        that window: a workflow cancelled in the meantime is left alone,
+        uncounted and uncompleted, instead of being flipped back to
+        SUCCEEDED/FAILED.
+
         Returns:
             bool: True if workflow is now complete
         """
         with transaction.atomic():
+            workflow = (
+                type(self.workflow).objects.select_for_update().get(id=self.workflow.id)
+            )
+            if workflow.status == WorkflowStatus.CANCELLED:
+                _logger.debug(
+                    "%s %s: cancelled under lock, skipping increment",
+                    self.workflow_type,
+                    workflow.id,
+                )
+                self.workflow = workflow
+                return False
+
             # Lock the attempt to check/set counted flag atomically
             attempt = QraftTaskAttempt.objects.select_for_update().get(
                 id=self.attempt.id
@@ -239,10 +272,6 @@ class ParallelDispatcher:
 
             attempt.counted = True
             attempt.save(update_fields=["counted"])
-
-            workflow = (
-                type(self.workflow).objects.select_for_update().get(id=self.workflow.id)
-            )
 
             workflow.completed_count += 1
             if self.attempt.success:

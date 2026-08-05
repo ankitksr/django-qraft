@@ -177,6 +177,28 @@ class TestParallelDispatcherCompletion:
         attempt.refresh_from_db()
         assert attempt.counted is False
 
+    def test_cancel_racing_final_completion_is_not_overwritten(self, db, iter_model):
+        """Regression: a cancel landing between the outer status check (in
+        `handle()`) and the locked increment (in `_atomic_increment()`) must
+        not be clobbered back to SUCCEEDED/FAILED by the completing task."""
+        attempt = _make_attempt("qraft_iter", iter_model, success=True)
+        dispatcher = ParallelDispatcher(iter_model, attempt)
+
+        # Simulate the interleaving directly: the outer `handle()` check saw
+        # RUNNING, but by the time `_atomic_increment` takes its lock, a
+        # concurrent cancel has already committed.
+        iter_model.status = WorkflowStatus.CANCELLED
+        iter_model.save(update_fields=["status"])
+
+        is_complete = dispatcher._atomic_increment()
+
+        assert is_complete is False
+        iter_model.refresh_from_db()
+        assert iter_model.status == WorkflowStatus.CANCELLED
+        assert iter_model.completed_count == 0
+        attempt.refresh_from_db()
+        assert attempt.counted is False
+
 
 class TestChainDispatcher:
     """Sequential continuation, failure short-circuit, and retry-in-progress."""
@@ -266,6 +288,28 @@ class TestChainDispatcher:
         assert chain.status == WorkflowStatus.RUNNING
         assert chain.current_step_index == 0
         assert step1.qraft_task is None
+
+    def test_duplicate_completion_delivery_queues_next_step_once(self, db):
+        """Regression: two deliveries of the same successful step completion
+        (e.g. a duplicate hook call) must queue the next step exactly once,
+        not overwrite step1.qraft_task with a second QraftTask."""
+        chain, (step0, step1) = self._chain_with_steps(2)
+        attempt = self._attempt_for_step(
+            step0, success=True, task_status=TaskStatus.SUCCEEDED
+        )
+
+        with patch("qraft.tasks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-next-1"
+            ChainDispatcher(chain, step0, attempt).handle()
+            mock_async.return_value = "q2-next-2"
+            ChainDispatcher(chain, step0, attempt).handle()
+
+        chain.refresh_from_db()
+        step1.refresh_from_db()
+        assert chain.current_step_index == 1
+        assert mock_async.call_count == 1
+        # step0's original task + exactly one new task for step1
+        assert QraftTask.objects.count() == 2
 
     def test_cancelled_chain_skips_processing(self, db):
         chain, (step0,) = self._chain_with_steps(1)

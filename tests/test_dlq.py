@@ -1,5 +1,6 @@
 """Tests for qraft.dlq module."""
 
+import ast
 from unittest.mock import Mock
 
 import pytest
@@ -62,7 +63,13 @@ class TestRequeue:
         schedule_id = requeue(task)
 
         schedule = Schedule.objects.get(id=schedule_id)
-        assert schedule.func == "test.module.function"
+        # Scheduled via the universal unwrapping runner, not the dotted path
+        # directly - see qraft.runner.run_task.
+        assert schedule.func == "qraft.runner.run_task"
+        func_path, args, kwargs = ast.literal_eval(schedule.args)
+        assert func_path == "test.module.function"
+        assert args == [1, 2]
+        assert kwargs == {"key": "value"}
         assert f"qraft:{task.id}:3" in schedule.kwargs
         assert "qraft_retry:" in schedule.name
         assert str(task.id) in schedule.name

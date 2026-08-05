@@ -229,6 +229,17 @@ class QraftTaskAttempt(models.Model):
 
     # Timing
     date_created = models.DateTimeField(auto_now_add=True)
+    date_started = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When a worker began executing this attempt",
+    )
+    heartbeat_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Last execution-lease heartbeat from the running worker",
+    )
     date_completed = models.DateTimeField(
         null=True,
         blank=True,

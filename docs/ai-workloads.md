@@ -91,13 +91,32 @@ async_task('billing.charge', invoice_id,
     qraft_options={'idempotency_key': f'charge:{invoice_id}'})
 ```
 
-The key is a permanent dedupe, not a "retry if it failed" signal: a `FAILED` or `EXHAUSTED` task still blocks re-enqueue. To run again, use a new key. Uniqueness is enforced by a DB constraint, so concurrent callers racing on one key still produce a single task.
+The key is a permanent dedupe by default, not a "retry if it failed" signal: a `FAILED` or `EXHAUSTED` task still blocks re-enqueue. To run again, use a new key. Uniqueness is enforced by a DB constraint, so concurrent callers racing on one key still produce a single task.
+
+Pass `idempotency_retry_dead=True` to change that: a `FAILED`/`EXHAUSTED` task under the key no longer blocks re-enqueue. The old task's key is cleared with a single race-tolerant `UPDATE` and the call proceeds as a fresh enqueue holding the key. A live (not yet terminal) task under the key is still deduped either way.
+
+```python
+async_task('billing.charge', invoice_id,
+    qraft_options={
+        'idempotency_key': f'charge:{invoice_id}',
+        'idempotency_retry_dead': True,
+    })
+```
 
 ## Orphan reaper
 
 If a worker dies mid-task — OOM kill, `kill -9`, hardware loss — the monitor never sees a result. The attempt stays unresolved and the task stays `RUNNING` forever. The reaper finds those and resolves them through the normal retry path.
 
-An attempt is orphaned when its task is `RUNNING`, the attempt has no outcome, it is older than `reap_stale_after`, and no Django-Q2 `Task` row exists for it. Reaped attempts are marked failed with `exception_class="OrphanedTask"` and handed to the retry policy; with no policy the task goes to `FAILED`.
+Liveness comes from a Qraft-owned execution lease, not from Django-Q2. Django-Q2 writes its `Task` row only at completion, so "no `Task` row" says nothing about whether the worker is alive. Instead, the worker stamps `date_started` and `heartbeat_at` on the attempt at `pre_execute` and refreshes `heartbeat_at` from a daemon thread every `heartbeat_interval` seconds until the task ends. A stale heartbeat is positive evidence that the worker died.
+
+An attempt is orphaned when its task is `RUNNING`, the attempt has no outcome, no Django-Q2 `Task` row exists for it, and either:
+
+- its heartbeat is older than `max(3 * heartbeat_interval, 90s)` — the worker started the task and died, or
+- it never heartbeat, is older than `reap_stale_after`, and its pack is no longer queued in the ORM broker — it was delivered to a worker that died before starting it.
+
+A long-running task is never reaped while it heartbeats, however far past `reap_stale_after` it runs.
+
+Reaped attempts are marked failed with `exception_class="OrphanedTask"` and handed to the retry policy; with no policy the task goes to `FAILED`.
 
 The reaper runs automatically as a daemon thread beside the monitor process in `QraftCluster`. Call it directly for tests or a one-off sweep:
 
@@ -109,9 +128,10 @@ reap_orphans(stale_after=300)   # returns the number of attempts reaped
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `reap_interval` | `60.0` | Seconds between sweeps |
-| `reap_stale_after` | `3600.0` | Seconds an attempt may go unresolved before it counts as orphaned |
+| `reap_stale_after` | `3600.0` | Seconds an attempt that never started may sit unresolved before it counts as orphaned |
+| `heartbeat_interval` | `30.0` | Seconds between lease heartbeats from a running worker |
 
-Set `reap_stale_after` above your longest task timeout. Too low and the reaper requeues work that is still running.
+`reap_stale_after` is now only the fallback for attempts that never reached `pre_execute`; running tasks are governed by the heartbeat. Lower `heartbeat_interval` to detect dead workers sooner, at the cost of one small `UPDATE` per task per interval.
 
 ## Broker choice
 

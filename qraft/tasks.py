@@ -39,6 +39,21 @@ def _existing_task_for_key(idempotency_key: str) -> str | None:
     return attempt.q2_task_id
 
 
+def _reclaim_dead_task_key(idempotency_key: str) -> None:
+    """
+    Clear a FAILED/EXHAUSTED task's idempotency key so a fresh enqueue can
+    claim it.
+
+    A single UPDATE scoped to the key and the dead statuses: race-tolerant
+    against a concurrent caller doing the same reclaim, since the losing
+    UPDATE just matches zero rows.
+    """
+    QraftTask.objects.filter(
+        idempotency_key=idempotency_key,
+        status__in=(TaskStatus.FAILED, TaskStatus.EXHAUSTED),
+    ).update(idempotency_key=None)
+
+
 def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
     """
     Create a QraftTask, queue it to Django-Q2, and record attempt 1.
@@ -94,8 +109,21 @@ def async_task(
         hook (str, optional):
             Legacy Django-Q2 hook. Deprecated. If no Qraft hooks are provided,
             this will be treated as a `success_hook` with a warning.
-        group, save, timeout, ack_failure, sync, cached, broker:
+        group, timeout, ack_failure, broker:
             Same semantics as Django-Q2 async_task.
+        save:
+            Same as Django-Q2, except `save=False` is rejected: Qraft's hook
+            handler resolves completion by reading the saved Django-Q2 Task
+            row, which `save=False` never writes.
+        sync:
+            Not supported - must be left `False`. Qraft's hook handler
+            expects the QraftTaskAttempt row to already exist when the task
+            finishes; a synchronous run finishes (and fires the hook)
+            in-process before `_create_and_enqueue` has committed that row.
+        cached:
+            Not supported - must be left `None`. A cached result is never
+            persisted as a Django-Q2 Task row, so the hook handler has
+            nothing to resolve completion against.
         task_name:
             Optional human-readable name for the task (appears in Django-Q2 admin).
             Fully preserved - Qraft uses database linkage instead of encoding metadata.
@@ -120,9 +148,16 @@ def async_task(
                 idempotency_key (str): caller-supplied dedupe key. A second
                     call with the same key is a no-op: it returns the
                     original call's q2_task_id instead of enqueueing again.
-                    The key is a permanent dedupe, not a "retry if failed"
-                    signal - even a FAILED/EXHAUSTED task blocks re-enqueue.
-                    Callers that want to run again must use a new key.
+                    The key is a permanent dedupe by default, not a "retry
+                    if failed" signal - even a FAILED/EXHAUSTED task blocks
+                    re-enqueue. Callers that want to run again must use a
+                    new key, unless idempotency_retry_dead is set.
+                idempotency_retry_dead (bool): when True, a FAILED/EXHAUSTED
+                    task under idempotency_key no longer blocks re-enqueue -
+                    its key is cleared and this call proceeds as a fresh
+                    enqueue holding the key. A live (not yet terminal) task
+                    under the key is still deduped either way. Default
+                    False preserves the permanent-dedupe behavior above.
                 priority ("high" | "default" | "low"): priority lane to
                     enqueue into. Only takes effect if the cluster's broker
                     is `qraft.brokers.QraftOrmBroker` (see that module's
@@ -133,6 +168,27 @@ def async_task(
     Returns:
         str: Django-Q2 Task ID (can be used to look up QraftTaskAttempt).
     """
+    if sync:
+        raise ValueError(
+            "async_task(sync=True) is not supported: completion tracking "
+            "relies on the QraftTaskAttempt row existing before the task "
+            "runs, but a synchronous run finishes (and fires the hook) "
+            "before that row is committed. Call the function directly for "
+            "synchronous execution."
+        )
+    if save is False:
+        raise ValueError(
+            "async_task(save=False) is not supported: the hook handler "
+            "resolves completion by reading the saved Django-Q2 Task row, "
+            "which save=False never writes."
+        )
+    if cached is not None:
+        raise ValueError(
+            "async_task(cached=...) is not supported: a cached result is "
+            "never persisted as a Django-Q2 Task row, so the hook handler "
+            "has nothing to resolve completion against."
+        )
+
     if q_options is None:
         q_options = {}
 
@@ -144,6 +200,8 @@ def async_task(
     # run again must use a new key.
     idempotency_key = qraft_options.get("idempotency_key")
     if idempotency_key:
+        if qraft_options.get("idempotency_retry_dead"):
+            _reclaim_dead_task_key(idempotency_key)
         existing_q2_task_id = _existing_task_for_key(idempotency_key)
         if existing_q2_task_id is not None:
             return existing_q2_task_id
@@ -229,10 +287,6 @@ def async_task(
         q2_kwargs["timeout"] = timeout
     if ack_failure is not None:
         q2_kwargs["ack_failure"] = ack_failure
-    if sync:
-        q2_kwargs["sync"] = sync
-    if cached is not None:
-        q2_kwargs["cached"] = cached
     if broker is not None:
         q2_kwargs["broker"] = broker
 

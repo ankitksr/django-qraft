@@ -282,3 +282,67 @@ class TestAsyncTaskIdempotency:
         async_task("test.function")
 
         assert QraftTask.objects.count() == 2
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_retry_dead_flag_reclaims_key_from_exhausted_task(self, mock_q2_async):
+        """A dead task under the key no longer blocks re-enqueue with the flag set."""
+        mock_q2_async.return_value = "q2-task-dead-1"
+        async_task("test.function", qraft_options={"idempotency_key": "dead-key"})
+        dead_task = QraftTask.objects.get()
+        dead_task.status = TaskStatus.EXHAUSTED
+        dead_task.save(update_fields=["status"])
+
+        mock_q2_async.return_value = "q2-task-dead-2"
+        second = async_task(
+            "test.function",
+            qraft_options={
+                "idempotency_key": "dead-key",
+                "idempotency_retry_dead": True,
+            },
+        )
+
+        assert second == "q2-task-dead-2"
+        assert QraftTask.objects.count() == 2
+        new_task = QraftTask.objects.exclude(id=dead_task.id).get()
+        assert new_task.idempotency_key == "dead-key"
+        dead_task.refresh_from_db()
+        assert dead_task.idempotency_key is None
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_retry_dead_flag_still_dedupes_live_task(self, mock_q2_async):
+        """A live (non-terminal) task under the key is still deduped, flag or not."""
+        mock_q2_async.return_value = "q2-task-live-1"
+        first = async_task(
+            "test.function", qraft_options={"idempotency_key": "live-key"}
+        )
+
+        mock_q2_async.return_value = "q2-task-live-2"
+        second = async_task(
+            "test.function",
+            qraft_options={
+                "idempotency_key": "live-key",
+                "idempotency_retry_dead": True,
+            },
+        )
+
+        assert second == first
+        assert QraftTask.objects.count() == 1
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_retry_dead_flag_default_unchanged(self, mock_q2_async):
+        """Without the flag, a dead task under the key still blocks re-enqueue."""
+        mock_q2_async.return_value = "q2-task-default-1"
+        first = async_task(
+            "test.function", qraft_options={"idempotency_key": "default-key"}
+        )
+        dead_task = QraftTask.objects.get()
+        dead_task.status = TaskStatus.FAILED
+        dead_task.save(update_fields=["status"])
+
+        mock_q2_async.return_value = "q2-task-default-2"
+        second = async_task(
+            "test.function", qraft_options={"idempotency_key": "default-key"}
+        )
+
+        assert second == first
+        assert QraftTask.objects.count() == 1

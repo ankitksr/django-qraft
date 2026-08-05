@@ -68,7 +68,9 @@ def parse_retry_after(text: str) -> float | None:
     for pattern in _RETRY_AFTER_PATTERNS:
         match = pattern.search(text)
         if match:
-            return float(match.group(1))
+            # Floor to 1s: a provider hint of "0" or a sub-second value
+            # must never produce a zero/negative retry delay.
+            return max(1.0, float(match.group(1)))
 
     return None
 
@@ -136,6 +138,10 @@ class RetryPolicy:
             raise ValueError("jitter_max must be between 0.0 and 1.0")
         if self.backoff_strategy not in {strategy.value for strategy in RetryBackoff}:
             raise ValueError(f"Invalid backoff strategy: {self.backoff_strategy}")
+        if self.base_delay < 0:
+            raise ValueError("base_delay must be >= 0")
+        if self.rate_limit_max_delay <= 0:
+            raise ValueError("rate_limit_max_delay must be > 0")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]):
@@ -276,10 +282,11 @@ class RetryPolicy:
         """
         if retry_after is not None:
             # Honor the provider's hint as a floor - only add a small positive
-            # jitter, never reduce below what it asked for.
-            delay = min(retry_after, self.rate_limit_max_delay)
-            delay += random.uniform(0, delay * 0.1)
-            return int(delay)
+            # jitter, never reduce below what it asked for. The cap is
+            # applied after jitter, so a hint near the cap can't slip past it
+            # (capping before jitter let a 300s cap yield up to 330s).
+            delay = retry_after + random.uniform(0, retry_after * 0.1)
+            return int(min(delay, self.rate_limit_max_delay))
 
         if is_rate_limit:
             # Rate limits back off exponentially regardless of the configured
@@ -338,9 +345,11 @@ class RetryPolicy:
         """
         Schedule a retry for a failed task using Django-Q2's Schedule model.
 
-        Schedules the original task function directly (no wrapper). Uses
-        q_options to pass task_name for Qraft linkage - the scheduler extracts
-        q_options from kwargs and passes it to async_task.
+        Schedules ``qraft.runner.run_task``, which resolves and calls the
+        original task function (unwrapping a django.tasks ``@task`` wrapper
+        when present). Uses q_options to pass task_name for Qraft linkage -
+        the scheduler extracts q_options from kwargs and passes it to
+        async_task.
 
         Args:
             qraft_task: QraftTask model instance
@@ -362,26 +371,33 @@ class RetryPolicy:
         )
         eta = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
-        # Build kwargs with q_options containing task_name for Qraft linkage
-        # The scheduler extracts q_options and passes it to async_task
+        # q_options carries the task_name for Qraft linkage - the scheduler
+        # pops it and passes it to async_task, so it never reaches the
+        # scheduled function itself.
         marker = QRAFT_MARKER_FMT.format(
             prefix=QRAFT_MARKER_PREFIX,
             task_id=qraft_task.id,
             attempt=next_attempt,
         )
-        retry_kwargs = {
-            **qraft_task.task_kwargs,
-            "q_options": {"task_name": marker},
-        }
+        schedule_kwargs = {"q_options": {"task_name": marker}}
 
         with transaction.atomic():
+            # Scheduled via qraft.runner.run_task rather than qraft_task.func
+            # directly: a @task-decorated function's dotted path resolves to
+            # the non-callable django.tasks wrapper, not the function itself.
             schedule = Schedule.objects.create(
                 name=QRAFT_RETRY_NAME_FMT.format(
                     task_id=qraft_task.id, attempt=next_attempt
                 ),
-                func=qraft_task.func,
-                args=repr(tuple(qraft_task.task_args)),
-                kwargs=repr(retry_kwargs),
+                func="qraft.runner.run_task",
+                args=repr(
+                    (
+                        qraft_task.func,
+                        list(qraft_task.task_args),
+                        qraft_task.task_kwargs,
+                    )
+                ),
+                kwargs=repr(schedule_kwargs),
                 hook="qraft.hooks.qraft_hook_handler",
                 schedule_type=Schedule.ONCE,
                 next_run=eta,

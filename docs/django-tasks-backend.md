@@ -56,6 +56,8 @@ Qraft dispatches the raw target function straight to Django-Q2, so the context c
 
 For a deferred (`run_after`) task, `context.attempt` reads `0` during the first run rather than `1`: the attempt row isn't created until the hook handler runs, after that first run has already completed.
 
+A `takes_context=True` task that gets retried or requeued (via `qraft.dlq.requeue()`) does not get `TaskContext` re-injected on that run - not supported yet.
+
 ## Priority mapping
 
 `django.tasks` priority is an integer in `[-100, 100]`; Qraft has three lanes. Sign decides the lane, so the exact integer does not survive a round trip through `get_result()`.

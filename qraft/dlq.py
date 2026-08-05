@@ -58,16 +58,21 @@ def requeue(qraft_task: QraftTask) -> str:
     marker = QRAFT_MARKER_FMT.format(
         prefix=QRAFT_MARKER_PREFIX, task_id=qraft_task.id, attempt=next_attempt
     )
-    retry_kwargs = {**qraft_task.task_kwargs, "q_options": {"task_name": marker}}
+    schedule_kwargs = {"q_options": {"task_name": marker}}
 
     with transaction.atomic():
+        # Scheduled via qraft.runner.run_task rather than qraft_task.func
+        # directly: a @task-decorated function's dotted path resolves to the
+        # non-callable django.tasks wrapper, not the function itself.
         schedule = Schedule.objects.create(
             name=QRAFT_RETRY_NAME_FMT.format(
                 task_id=qraft_task.id, attempt=next_attempt
             ),
-            func=qraft_task.func,
-            args=repr(tuple(qraft_task.task_args)),
-            kwargs=repr(retry_kwargs),
+            func="qraft.runner.run_task",
+            args=repr(
+                (qraft_task.func, list(qraft_task.task_args), qraft_task.task_kwargs)
+            ),
+            kwargs=repr(schedule_kwargs),
             hook="qraft.hooks.qraft_hook_handler",
             schedule_type=Schedule.ONCE,
             next_run=datetime.now(timezone.utc),

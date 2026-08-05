@@ -1,10 +1,10 @@
 # Roadmap
 
 Positioning: **durable background jobs and workflows for Django — Postgres only, no extra
-infra, built for AI workloads.** Django-Q2 provides the cluster runtime; Qraft owns task
-state, retries, hooks, and orchestration. Features compete with Procrastinate/Chancy on
-Django-nativeness and with Temporal/Hatchet-class systems on "no new infra to operate",
-not with Celery/Dramatiq on raw broker throughput.
+infra, with primitives for jobs that call metered AI providers.** Django-Q2 provides the
+cluster runtime; Qraft owns task state, retries, hooks, and orchestration. Features compete
+with Procrastinate/Chancy on Django-nativeness and with Temporal/Hatchet-class systems on
+"no new infra to operate", not with Celery/Dramatiq on raw broker throughput.
 
 Why these bets: Django-Q2 upstream is in maintenance mode and has declined or stalled on
 dual-phase hooks, retry policies, and workflow enrichment (django-q2#202, #203, #327).

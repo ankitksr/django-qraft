@@ -5,7 +5,7 @@
 [![Django Version](https://img.shields.io/badge/django-4.2+-green.svg)](https://www.djangoproject.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Durable background jobs and workflows for Django — Postgres only, no extra infra, built for AI workloads.
+Durable background jobs and workflows for Django — Postgres only, no extra infra, with primitives for jobs that call metered AI providers.
 
 Django-Qraft is a drop-in enhancement of [Django-Q2](https://django-q2.readthedocs.io/): Django-Q2 supplies the cluster runtime, Qraft owns task state, retries, hooks, and orchestration. Full backward compatibility.
 

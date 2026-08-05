@@ -106,8 +106,14 @@ class QraftSettings(BaseSettings):
     reap_stale_after: float = Field(
         3600.0,
         gt=0,
-        description="Seconds a RUNNING attempt may go without a Q2 result "
+        description="Seconds an attempt that never started may sit unresolved "
         "before it is treated as orphaned",
+    )
+    heartbeat_interval: float = Field(
+        30.0,
+        gt=0,
+        description="Seconds between execution-lease heartbeats from a running "
+        "worker; the reaper treats a heartbeat older than 3x this as dead",
     )
 
     def get_max_inflight(self) -> int:

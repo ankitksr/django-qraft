@@ -1,5 +1,6 @@
 """Tests for qraft.retry module."""
 
+import ast
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -68,6 +69,21 @@ class TestRetryPolicy:
         """Test validation of backoff strategy."""
         with pytest.raises(ValueError, match="Invalid backoff strategy"):
             RetryPolicy(backoff_strategy="invalid")
+
+    @pytest.mark.parametrize("base_delay", [-1.0, -0.01])
+    def test_validation_base_delay_rejects_negative(self, base_delay):
+        with pytest.raises(ValueError, match="base_delay must be >= 0"):
+            RetryPolicy(base_delay=base_delay)
+
+    def test_validation_base_delay_allows_zero(self):
+        assert RetryPolicy(base_delay=0.0).base_delay == 0.0
+
+    @pytest.mark.parametrize("rate_limit_max_delay", [0.0, -10.0])
+    def test_validation_rate_limit_max_delay_rejects_non_positive(
+        self, rate_limit_max_delay
+    ):
+        with pytest.raises(ValueError, match="rate_limit_max_delay must be > 0"):
+            RetryPolicy(rate_limit_max_delay=rate_limit_max_delay)
 
     def test_from_dict(self):
         """Test creating policy from dictionary."""
@@ -323,7 +339,13 @@ class TestRetryPolicy:
 
         # Verify schedule was created
         schedule = Schedule.objects.get(id=schedule_id)
-        assert schedule.func == "test.module.function"
+        # Scheduled via the universal unwrapping runner, not the dotted path
+        # directly - see qraft.runner.run_task.
+        assert schedule.func == "qraft.runner.run_task"
+        func_path, args, kwargs = ast.literal_eval(schedule.args)
+        assert func_path == "test.module.function"
+        assert args == [1, 2]
+        assert kwargs == {"key": "value"}
         assert schedule.schedule_type == Schedule.ONCE
         assert "qraft_retry:" in schedule.name
         assert str(task.id) in schedule.name
@@ -508,6 +530,13 @@ class TestRateLimitRetries:
         assert parse_retry_after(None) is None
         assert parse_retry_after("") is None
 
+    @pytest.mark.parametrize(
+        "text",
+        ["retry_after=0", "retry-after: 0.2", "try again in 0 seconds"],
+    )
+    def test_parse_retry_after_floors_sub_second_values(self, text):
+        assert parse_retry_after(text) == 1.0
+
     def test_calculate_delay_honors_retry_after(self):
         policy = RetryPolicy(base_delay=10.0, jitter=False)
 
@@ -522,6 +551,18 @@ class TestRateLimitRetries:
         delay = policy.calculate_delay(1, retry_after=1000.0)
 
         assert delay <= 33  # capped at 30 + 10% jitter headroom
+
+    def test_calculate_delay_cap_applies_after_jitter_not_before(self):
+        """
+        A retry_after right at the cap must never end up above it: jitter is
+        added first, then the cap is applied - not the other way around
+        (cap-then-jitter previously let a 300s cap slip through as 330s).
+        """
+        policy = RetryPolicy(base_delay=10.0, rate_limit_max_delay=300.0)
+
+        delays = [policy.calculate_delay(1, retry_after=300.0) for _ in range(20)]
+
+        assert all(d <= 300 for d in delays)
 
     def test_calculate_delay_is_rate_limit_uses_exponential_regardless_of_strategy(
         self,

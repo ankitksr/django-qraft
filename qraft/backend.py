@@ -50,6 +50,8 @@ from qraft.brokers import QraftOrmBroker, priority_list_key
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.tasks import TaskPriority
 from qraft.retry import QRAFT_MARKER_FMT, QRAFT_MARKER_PREFIX
+from qraft.runner import _resolve_target
+from qraft.runner import run_task as run_task  # re-exported: resolved by dotted path
 from qraft.tasks import async_task as qraft_async_task
 
 _logger = logging.getLogger("qraft")
@@ -325,16 +327,3 @@ def run_task_with_context(func_path, qraft_task_id, backend_alias, args, kwargs)
     task_result = task_backends[backend_alias].get_result(qraft_task_id)
     context = TaskContext(task_result=task_result)
     return func(context, *args, **kwargs)
-
-
-def run_task(func_path, args, kwargs):
-    """Worker-side entry point for plain django.tasks targets."""
-    return _resolve_target(func_path)(*args, **kwargs)
-
-
-def _resolve_target(func_path):
-    """Resolve a dotted path, unwrapping the @task decorator's wrapper."""
-    func = import_string(func_path)
-    if isinstance(func, Task):
-        func = func.func
-    return func

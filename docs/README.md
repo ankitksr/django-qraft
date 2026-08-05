@@ -222,7 +222,8 @@ QRAFT_CLUSTER = {
 
     # Orphan reaper
     "reap_interval": 60.0,     # Seconds between sweeps
-    "reap_stale_after": 3600.0,  # Unresolved seconds before an attempt is orphaned
+    "reap_stale_after": 3600.0,  # Unresolved seconds before a never-started attempt is orphaned
+    "heartbeat_interval": 30.0,  # Seconds between execution-lease heartbeats
 }
 ```
 

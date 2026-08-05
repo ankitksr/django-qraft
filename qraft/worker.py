@@ -138,6 +138,11 @@ def _execute_task_in_thread(
             _logger.error("Failed to queue error result for task")
 
     finally:
+        # Close the execution lease: post_execute fires in the monitor process,
+        # so the worker has to stop its own heartbeat thread.
+        from .lease import stop_heartbeat
+
+        stop_heartbeat(task.get("id"))
         # Always close connections after task execution
         close_old_django_connections()
         # Reset timer to idle after task completion
