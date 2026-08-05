@@ -32,10 +32,29 @@ result.status   # TaskResultStatus
 |------|-------|-------|
 | `supports_get_result` | yes | Reads `QraftTask`/`QraftTaskAttempt` |
 | `supports_priority` | yes | Maps to Qraft's three lanes |
-| `supports_defer` | no | `run_after` is not wired into Qraft's pipeline |
+| `supports_defer` | yes | `run_after` schedules through Django-Q2's `Schedule` model |
 | `supports_async_task` | no | Coroutine tasks are not executed by Qraft workers |
 
-`validate_task()` also rejects `takes_context=True`: Qraft calls the target function with the stored args and kwargs, and has no layer to inject a leading context argument.
+### Deferred execution (`run_after`)
+
+```python
+result = summarize.using(run_after=timezone.now() + timedelta(hours=1)).enqueue(doc_id)
+result.status  # READY - nothing has run yet
+```
+
+A deferred task creates its `QraftTask` immediately (`PENDING`, no attempts yet) and a Django-Q2 `Schedule` (`ONCE`, firing at `run_after`) carrying a Qraft marker, the same linkage mechanism used for scheduled retries. The attempt row - and the usual `RUNNING`/`SUCCEEDED`/`FAILED` transitions - only appear once the schedule actually fires.
+
+### `TaskContext` (`takes_context`)
+
+```python
+@task(takes_context=True)
+def summarize(context, doc_id):
+    context.attempt  # 1, 2, ... across retries
+```
+
+Qraft dispatches the raw target function straight to Django-Q2, so the context can't be injected by the caller - `QraftTaskBackend` queues a small worker-side wrapper (`qraft.backend.run_task_with_context`) instead, which builds a `TaskContext` from `get_result()` and calls the real function with it. `QraftTask.func`/args/kwargs still record the real target, so `get_result()` is unaffected.
+
+For a deferred (`run_after`) task, `context.attempt` reads `0` during the first run rather than `1`: the attempt row isn't created until the hook handler runs, after that first run has already completed.
 
 ## Priority mapping
 
@@ -66,3 +85,5 @@ A fresh `enqueue()` reports `RUNNING`, not `READY`: Qraft marks a task `RUNNING`
 ## Qraft options
 
 Retry policies, dual-phase hooks, workflows, idempotency keys, and throttling stay on the native API — `django.tasks` has no place to express them. Use `qraft.tasks.async_task()` where you need them and the standard `@task` API everywhere else; both write the same `QraftTask` records.
+
+For a live end-to-end run, see `demo tasks-api` in the demo application.

@@ -104,12 +104,15 @@ LOGGING = {
 
 # Django-Q2 configuration (ORM broker)
 # Baseline cluster: standard Django-Q2 without threading
+# broker_class is QraftOrmBroker so the "demo priority" scenario's high-lane
+# tasks are actually drained ahead of default/low (see qraft/brokers.py).
 Q_CLUSTER = {
     "name": "baseline",
     "workers": 2,
     "timeout": 300,
     "retry": 600,
     "orm": "default",
+    "broker_class": "qraft.brokers.QraftOrmBroker",
     # Alternative cluster for performance comparison (multi-worker + threading)
     "ALT_CLUSTERS": {
         "qraft": {
@@ -118,8 +121,15 @@ Q_CLUSTER = {
             "timeout": 300,
             "retry": 600,
             "orm": "default",
+            "broker_class": "qraft.brokers.QraftOrmBroker",
         }
     },
+}
+
+# Official django.tasks (DEP 14, Django 6.0+) API, engined by Qraft. See
+# `demo tasks-api` and docs/django-tasks-backend.md.
+TASKS = {
+    "default": {"BACKEND": "qraft.backend.QraftTaskBackend"},
 }
 
 # Qraft configuration

@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Dead letter queue** (`qraft/dlq.py`): `dead_letters()` finds `FAILED`/`EXHAUSTED`
+  tasks; `requeue()` re-enqueues one as the next attempt on the same `QraftTask`,
+  preserving history and idempotency key. Admin gains a "Requeue selected dead tasks"
+  bulk action
+- **`django.tasks` deferred execution and `TaskContext`** (`qraft/backend.py`):
+  `supports_defer` schedules `run_after` tasks through a marker-carrying Django-Q2
+  `Schedule`, the same linkage used for retries. `takes_context=True` tasks get a real
+  `TaskContext` injected worker-side via `run_task_with_context`, without disturbing the
+  `QraftTask` record of the real target function/args/kwargs
+
 ### Planned
-- `TaskContext`, deferred (`run_after`) and coroutine tasks on the `django.tasks` backend
+- Coroutine tasks on the `django.tasks` backend
 - Priority routing for scheduled retries
 - Enhanced monitoring and metrics
-- Dead letter queue for failed tasks
 - Nested workflow support
 
 ## [1.2.0] - 2026-08-05

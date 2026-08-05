@@ -14,6 +14,9 @@ Usage:
     python manage.py demo usage     # Token/cost accounting
     python manage.py demo idempotent# Idempotency keys
     python manage.py demo reaper    # Orphan detection and requeue
+    python manage.py demo tasks-api # Official django.tasks API end-to-end
+    python manage.py demo priority  # High-priority task passing a backlog
+    python manage.py demo progress  # Live progress polling
 """
 
 import time
@@ -104,6 +107,15 @@ class Command(BaseCommand):
             help="Seconds before an unresolved attempt counts as orphaned",
         )
 
+        subparsers.add_parser("tasks-api", help="Official django.tasks API demo")
+        subparsers.add_parser("priority", help="Priority lane demo")
+
+        progress = subparsers.add_parser("progress", help="Live progress polling demo")
+        progress.add_argument("--steps", type=int, default=5, help="Number of steps")
+        progress.add_argument(
+            "--delay", type=float, default=0.5, help="Delay between steps (seconds)"
+        )
+
     def handle(self, *args, **options):
         scenario = options.get("scenario")
 
@@ -124,6 +136,9 @@ class Command(BaseCommand):
             self.stdout.write("  usage      - Token/cost accounting")
             self.stdout.write("  idempotent - Idempotency keys")
             self.stdout.write("  reaper     - Orphan detection and requeue")
+            self.stdout.write("  tasks-api  - Official django.tasks API end-to-end")
+            self.stdout.write("  priority   - High-priority task passing a backlog")
+            self.stdout.write("  progress   - Live progress polling")
             return
 
         self.stdout.write("")
@@ -152,6 +167,12 @@ class Command(BaseCommand):
             self._demo_idempotent()
         elif scenario == "reaper":
             self._demo_reaper(options["stale_after"])
+        elif scenario == "tasks-api":
+            self._demo_tasks_api()
+        elif scenario == "priority":
+            self._demo_priority()
+        elif scenario == "progress":
+            self._demo_progress(options["steps"], options["delay"])
 
     def _demo_hooks(self, count: int):
         """Demonstrate dual-phase hooks with mixed success/failure tasks."""
@@ -764,6 +785,162 @@ class Command(BaseCommand):
                 f"success={retry_attempt.success} "
                 f"exception={retry_attempt.exception_class}"
             )
+
+    def _demo_tasks_api(self):
+        """Demonstrate the official django.tasks API engined by Qraft."""
+        from django.tasks import TaskResultStatus
+
+        from showcase.tasks import summarize_task
+
+        self.stdout.write(self.style.HTTP_INFO("=== DJANGO.TASKS API DEMO ===\n"))
+        self.stdout.write(
+            "summarize_task is a plain @task-decorated function. enqueue() and\n"
+            "get_result() are the standard django.tasks API; qraft.backend."
+            "QraftTaskBackend\nruns it through the normal Qraft pipeline "
+            "underneath.\n"
+        )
+
+        document = f"Mockco-brief-{uuid.uuid4().hex[:6]}"
+        result = summarize_task.enqueue(document)
+        self.stdout.write(f"\n  Enqueued: result.id={result.id}")
+        self.stdout.write(f"  Initial status: {result.status}")
+
+        seen_statuses = [result.status]
+        deadline = time.time() + 30
+        while time.time() < deadline and result.status not in (
+            TaskResultStatus.SUCCESSFUL,
+            TaskResultStatus.FAILED,
+        ):
+            time.sleep(0.5)
+            result.refresh()
+            if result.status != seen_statuses[-1]:
+                seen_statuses.append(result.status)
+                self.stdout.write(f"  Status -> {result.status}")
+
+        self.stdout.write("\n  Status transitions: " + " -> ".join(seen_statuses))
+        if result.status == TaskResultStatus.SUCCESSFUL:
+            self.stdout.write(
+                self.style.SUCCESS(f"  Return value: {result.return_value}")
+            )
+        else:
+            self.stdout.write(
+                self.style.ERROR(f"  Did not succeed (status={result.status})")
+            )
+            self._print_cluster_reminder()
+
+    def _demo_priority(self):
+        """Demonstrate a high-priority task overtaking a queued backlog."""
+        self.stdout.write(self.style.HTTP_INFO("=== PRIORITY LANE DEMO ===\n"))
+        self.stdout.write(
+            "Queueing 5 slow LOW-priority tasks, then 1 fast HIGH-priority\n"
+            "task. The cluster's broker is qraft.brokers.QraftOrmBroker, which\n"
+            "drains high before default/low, so the high task should finish\n"
+            "first despite being queued last.\n"
+        )
+
+        run_id = uuid.uuid4().hex[:6]
+        backlog_ids = []
+        for i in range(5):
+            q2_id = async_task(
+                "showcase.tasks.slow_task",
+                2.0,
+                task_name=f"priority-low-{run_id}-{i}",
+                qraft_options={"priority": "low"},
+            )
+            backlog_ids.append(q2_id)
+        self.stdout.write(f"  Queued 5 low-priority tasks: {backlog_ids}")
+
+        high_id = async_task(
+            "showcase.tasks.noop_task",
+            "Mockco-urgent",
+            task_name=f"priority-high-{run_id}",
+            qraft_options={"priority": "high"},
+        )
+        self.stdout.write(f"  Queued 1 high-priority task: {high_id}\n")
+
+        all_ids = backlog_ids + [high_id]
+        completion_order = []
+
+        def all_resolved():
+            for q2_id in all_ids:
+                if q2_id not in completion_order and self._attempt_resolved(q2_id):
+                    completion_order.append(q2_id)
+            return len(completion_order) == len(all_ids)
+
+        if not self._poll(all_resolved, timeout=30):
+            self.stdout.write(self.style.ERROR("  Not all tasks completed in time"))
+            self._print_cluster_reminder()
+            return
+
+        self.stdout.write(self.style.SUCCESS("  Completion order:"))
+        for position, q2_id in enumerate(completion_order, start=1):
+            label = "HIGH" if q2_id == high_id else "low"
+            self.stdout.write(f"    {position}. [{label}] {q2_id}")
+
+        high_position = completion_order.index(high_id) + 1
+        if high_position == 1:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "\n  High-priority task finished first, ahead of the "
+                    "5-item low-priority backlog."
+                )
+            )
+        else:
+            self.stdout.write(
+                self.style.ERROR(
+                    f"\n  High-priority task finished in position "
+                    f"{high_position}, not first. Check that the cluster's "
+                    "broker_class is qraft.brokers.QraftOrmBroker."
+                )
+            )
+
+    def _demo_progress(self, steps: int, delay: float):
+        """Demonstrate polling QraftTask.progress while a task runs."""
+        from qraft.models import QraftTaskAttempt
+
+        self.stdout.write(self.style.HTTP_INFO("=== LIVE PROGRESS DEMO ===\n"))
+        self.stdout.write(
+            f"progress_task reports progress over {steps} steps ({delay}s apart).\n"
+            "Polling QraftTask.progress while it runs.\n"
+        )
+
+        q2_task_id = async_task(
+            "showcase.tasks.progress_task", steps=steps, delay=delay
+        )
+        self.stdout.write(f"\n  Queued (q2: {q2_task_id})")
+
+        last_progress = None
+        deadline = time.time() + steps * delay + 30
+        while time.time() < deadline:
+            try:
+                attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
+                    q2_task_id=q2_task_id
+                )
+            except QraftTaskAttempt.DoesNotExist:
+                time.sleep(0.2)
+                continue
+
+            progress = attempt.qraft_task.progress
+            if progress != last_progress:
+                self.stdout.write(f"  progress: {progress}")
+                last_progress = progress
+
+            if attempt.success is not None:
+                break
+            time.sleep(0.2)
+
+        attempt.refresh_from_db()
+        if attempt.success:
+            self.stdout.write(
+                self.style.SUCCESS(f"\n  Final progress: {last_progress}")
+            )
+        else:
+            self.stdout.write(
+                self.style.ERROR(
+                    f"\n  Task did not succeed (success={attempt.success})"
+                )
+            )
+            self._print_cluster_reminder()
 
     @staticmethod
     def _attempt_resolved(q2_task_id: str) -> bool:

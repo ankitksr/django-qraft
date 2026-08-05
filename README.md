@@ -135,6 +135,18 @@ QRAFT_CLUSTER = {"reap_interval": 60, "reap_stale_after": 3600}
 
 [Learn more →](docs/ai-workloads.md#orphan-reaper)
 
+### 💀 Dead Letter Queue
+`dead_letters()` finds tasks that failed permanently; `requeue()` re-enqueues one as the next attempt on the same task, preserving history. Also available as an admin bulk action.
+
+```python
+from qraft.dlq import dead_letters, requeue
+
+for task in dead_letters():
+    requeue(task)
+```
+
+[Learn more →](docs/dlq.md)
+
 ### 🎚️ Priority Lanes
 High, default, and low lanes on a single ORM queue — interactive jobs preempt batch work without a second deployment.
 

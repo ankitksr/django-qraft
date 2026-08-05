@@ -2,11 +2,12 @@
 Django admin configuration for Qraft models.
 """
 
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.db.models import Count
 from django.urls import reverse
 from django.utils.html import format_html
 
+from .dlq import requeue
 from .models import (
     HookDispatch,
     QraftBatchModel,
@@ -195,6 +196,7 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
     ]
     inlines = [QraftTaskAttemptInline, HookDispatchInline]
     ordering = ["-date_created"]
+    actions = ["requeue_dead_tasks"]
 
     fieldsets = [
         (None, {"fields": ["id", "status", "func", "date_created", "date_updated"]}),
@@ -227,6 +229,23 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
 
     attempt_count.short_description = "Attempts"
     attempt_count.admin_order_field = "_attempt_count"
+
+    @admin.action(description="Requeue selected dead tasks")
+    def requeue_dead_tasks(self, request, queryset):
+        requeued = skipped = 0
+        for task in queryset:
+            try:
+                requeue(task)
+            except ValueError:
+                skipped += 1
+            else:
+                requeued += 1
+
+        self.message_user(
+            request,
+            f"Requeued {requeued} task(s); skipped {skipped} not in a dead state.",
+            level=messages.WARNING if skipped else messages.INFO,
+        )
 
 
 @admin.register(QraftTaskAttempt)

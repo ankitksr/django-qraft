@@ -10,11 +10,15 @@ Each task is designed to demonstrate a specific capability:
 - llm_task: Token/cost accounting and progress reporting
 - charge_task: Idempotency-key deduplication
 - review_task / publish_task: Approval-gated chain steps
+- summarize_task: django.tasks (@task) API demo target
+- progress_task: Reports incremental progress over several steps
 """
 
 import logging
 import random
 import time
+
+from django.tasks import task
 
 from qraft.context import record_usage, report_progress
 from qraft.throttle import throttled
@@ -174,6 +178,30 @@ def charge_task(customer: str, amount: float) -> dict:
     """
     _log.info("charge_task: charging %s %.2f", customer, amount)
     return {"customer": customer, "amount": amount}
+
+
+@task
+def summarize_task(document: str) -> dict:
+    """
+    Enqueued via the official django.tasks API (`summarize_task.enqueue(...)`),
+    engined by `qraft.backend.QraftTaskBackend` on top of the normal Qraft
+    pipeline (QraftTask/QraftTaskAttempt rows, hook handler, etc).
+    """
+    _log.info("summarize_task: summarizing %s", document)
+    return {"document": document, "summary": f"{document} (mock-llm summary)"}
+
+
+def progress_task(steps: int = 5, delay: float = 0.5) -> dict:
+    """
+    Slow task that reports incremental progress via report_progress().
+
+    A caller can poll `QraftTask.progress` while this runs to watch the
+    current/total counters change in near real time.
+    """
+    for step in range(1, steps + 1):
+        report_progress(current=step, total=steps, message=f"step {step}/{steps}")
+        time.sleep(delay)
+    return {"steps": steps}
 
 
 def review_task(document: str) -> dict:

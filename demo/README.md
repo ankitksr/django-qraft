@@ -158,6 +158,30 @@ uv run python manage.py demo reaper [--stale-after 1.0]
 
 Fabricates a crashed worker: a `RUNNING` QraftTask with an unresolved attempt, a bogus `q2_task_id`, and a backdated `date_created`. `reap_orphans()` marks the attempt `OrphanedTask` and schedules a retry; the demo then waits for the requeued attempt to succeed and prints the full attempt history.
 
+### Tasks-API: Official django.tasks Backend
+
+```bash
+uv run python manage.py demo tasks-api
+```
+
+Enqueues a `@task`-decorated function through Django 6.0's official `django.tasks` API (`enqueue()`, `get_result()`), executed by `qraft.backend.QraftTaskBackend` on the normal Qraft pipeline. Prints the status transitions and the return value. The demo environment requires Django >= 6.0.
+
+### Priority: High-Priority Task Passes a Backlog
+
+```bash
+uv run python manage.py demo priority
+```
+
+Queues five slow low-priority tasks, then one high-priority task. The cluster broker is `qraft.brokers.QraftOrmBroker`, which drains the high lane first; the completion order shows the high task finishing ahead of the backlog.
+
+### Progress: Live Progress Polling
+
+```bash
+uv run python manage.py demo progress [--steps 5] [--delay 0.5]
+```
+
+A slow task calls `report_progress()` on each step; the command polls `QraftTask.progress` and prints each change live.
+
 ### Perf: Threading Performance Comparison
 
 This demo compares **baseline Django-Q2** (no threading) vs **Qraft's multithreaded workers** side-by-side.
