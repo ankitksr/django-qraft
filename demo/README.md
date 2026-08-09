@@ -143,7 +143,7 @@ The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 | Key | Proves |
 | --- | --- |
 | `bench.delay` | A 2-second delay through qraft's dispatcher is served in about 2 seconds; the same ask through a django-q2 `Schedule` waits for the ~30-second scheduler tick. |
-| `bench.throughput` | Qraft's bookkeeping (task + attempt rows, lease, status updates) costs a bounded factor over raw django-q2 on the same workers; the measured numbers land in the notes. |
+| `bench.throughput` | Qraft's bookkeeping costs a bounded factor over raw django-q2 on no-op tasks, and converges to parity once tasks hold a worker for even 100 ms; the measured numbers land in the notes. |
 | `bench.pickup` | The p95 gap between enqueue and a worker starting the task stays in low seconds. |
 
 ## How a scenario proves anything

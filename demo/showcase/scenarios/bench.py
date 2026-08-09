@@ -98,8 +98,8 @@ def delay(ctx):
     group="bench",
     title="Throughput: qraft overhead over raw q2",
     proves="Qraft's extra bookkeeping (task + attempt rows, lease, status "
-    "updates) costs a bounded, small factor over raw django-q2 on the same "
-    "workers.",
+    "updates) costs a bounded, small factor over raw django-q2 on no-op "
+    "tasks, and converges to parity as soon as tasks do real work.",
 )
 def throughput(ctx):
     run = ctx.run
@@ -160,6 +160,48 @@ def throughput(ctx):
         qraft_wall < 5 * q2_wall,
         f"q2 {q2_wall:.1f}s vs qraft {qraft_wall:.1f}s",
     )
+
+    # The realistic pass: the same comparison once tasks hold a worker for
+    # 100 ms, which is still far below any real API call. The fixed per-task
+    # cost stops being visible and the two rates converge.
+    m = 20
+    started = time.monotonic()
+    for index in range(1, m + 1):
+        q2_async_task(
+            "showcase.tasks.sleep_task",
+            run,
+            f"q2s-{index:02d}",
+            seconds=0.1,
+            group=f"{run}-q2s",
+        )
+    q2_real = ctx.wait(
+        "q2: realistic load executed",
+        lambda: Success.objects.filter(group=f"{run}-q2s").count() >= m,
+        timeout=120,
+    )
+    q2s_wall = time.monotonic() - started
+
+    started = time.monotonic()
+    for index in range(1, m + 1):
+        async_task("showcase.tasks.sleep_task", run, f"qrs-{index:02d}", seconds=0.1)
+    qraft_real = ctx.wait(
+        "qraft: realistic load executed",
+        lambda: ctx.events(kind=Event.TASK).filter(name__startswith="qrs-").count()
+        >= m,
+        timeout=120,
+    )
+    qrs_wall = time.monotonic() - started
+
+    if q2_real and qraft_real:
+        ctx.note(
+            f"realistic (100ms tasks) {m}: q2 {q2s_wall:.1f}s ({m / q2s_wall:.0f}/s), "
+            f"qraft {qrs_wall:.1f}s ({m / qrs_wall:.0f}/s) — parity under real work"
+        )
+        ctx.check(
+            "parity under real work (< 1.5x)",
+            qrs_wall < 1.5 * q2s_wall,
+            f"q2 {q2s_wall:.1f}s vs qraft {qrs_wall:.1f}s",
+        )
 
 
 @scenario(
