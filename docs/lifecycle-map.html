@@ -123,10 +123,11 @@
 
     <g>
       <rect class="node node-db" x="1210" y="170" width="330" height="76" rx="8"/>
-      <text class="t-title" x="1226" y="190">Schedule row (ONCE, next_run = ETA)</text>
-      <text class="t-sub" x="1226" y="207">func = qraft.runner.run_task (unwraps @task)</text>
-      <text class="t-sub" x="1226" y="221">marker "qraft:{id}:{n}" in q_options.task_name</text>
-      <text class="t-sub" x="1226" y="235">task → PENDING · Q2 scheduler fires it (~30s)</text>
+      <text class="t-title" x="1226" y="190">SCHEDULED attempt row (not_before = ETA)</text>
+      <text class="t-sub" x="1226" y="207">final attempt # · lane + cluster preserved</text>
+      <text class="t-sub" x="1226" y="221">task → PENDING · dispatcher claims it when due</text>
+      <text class="t-sub" x="1226" y="235">CAS scheduled→queued · stamps q2_task_id</text>
+      <text class="t-mod" x="1462" y="186">scheduler.py</text>
     </g>
 
     <g>
@@ -151,14 +152,14 @@
       <rect class="node node-proc" x="700" y="540" width="240" height="56" rx="8"/>
       <circle cx="700" cy="540" r="11" fill="#2563eb"/><text class="t-step" x="696" y="544">5</text>
       <text class="t-title" x="716" y="560">Monitor saves the result</text>
-      <text class="t-sub" x="716" y="577">writes the Q2 Task row · hosts the reaper thread</text>
+      <text class="t-sub" x="716" y="577">Q2 Task row · threads: dispatcher, reaper, retention</text>
     </g>
 
     <g>
       <rect class="node node-logic" x="1000" y="528" width="290" height="86" rx="8"/>
       <circle cx="1000" cy="528" r="11" fill="#2563eb"/><text class="t-step" x="996" y="532">6</text>
       <text class="t-title" x="1016" y="548">qraft_hook_handler</text>
-      <text class="t-sub" x="1016" y="565">lookup by q2_task_id (marker fallback for retries)</text>
+      <text class="t-sub" x="1016" y="565">lookup by q2_task_id (marker = pre-2.0 fallback)</text>
       <text class="t-sub" x="1016" y="579">update attempt + task under row lock</text>
       <text class="t-sub" x="1016" y="593">retry check runs FIRST, then routing</text>
       <text class="t-mod" x="1236" y="544">hooks.py</text>
@@ -187,13 +188,14 @@
     </g>
 
     <g>
-      <rect class="node node-crash" x="320" y="620" width="370" height="96" rx="8"/>
-      <text class="t-title" x="336" y="640">Reaper (thread in the monitor)</text>
-      <text class="t-sub" x="336" y="658">every reap_interval: no Q2 result row AND heartbeat</text>
-      <text class="t-sub" x="336" y="672">stale &gt; max(3× interval, 90s) — or never started, past</text>
-      <text class="t-sub" x="336" y="686">reap_stale_after, pack gone (ORM broker only)</text>
-      <text class="t-sub" x="336" y="700">→ OrphanedTask → retry path · no policy → FAILED</text>
-      <text class="t-mod" x="598" y="636">reaper.py</text>
+      <rect class="node node-crash" x="320" y="612" width="370" height="112" rx="8"/>
+      <text class="t-title" x="336" y="632">Reaper (thread in the monitor)</text>
+      <text class="t-sub" x="336" y="650">every reap_interval: no Q2 result row AND heartbeat</text>
+      <text class="t-sub" x="336" y="664">stale &gt; max(3× interval, 90s) — or never started, past</text>
+      <text class="t-sub" x="336" y="678">reap_stale_after, pack gone (ORM broker only)</text>
+      <text class="t-sub" x="336" y="692">→ OrphanedTask → retry path · no policy → FAILED</text>
+      <text class="t-sub" x="336" y="706">re-arms QUEUED-but-never-enqueued → SCHEDULED</text>
+      <text class="t-mod" x="598" y="628">reaper.py</text>
     </g>
 
     <path class="edge" d="M185 104 L185 168"/>
@@ -213,12 +215,12 @@
     <path class="edge-retry" d="M1290 668 L1375 668 L1375 250"/>
     <text class="t-edge-retry" x="1387" y="300">schedule retry / requeue</text>
     <path class="edge-retry" d="M1210 210 L624 210"/>
-    <text class="t-edge-retry" x="660" y="200">scheduler fires → new pack (default lane) → marker fallback creates attempt N</text>
+    <text class="t-edge-retry" x="660" y="200">dispatcher enqueues at the exact ETA → same lane, same cluster → fast-path lookup</text>
 
     <path class="edge-soft" d="M1100 698 L1100 742 L1328 742"/>
     <text class="t-edge" x="1114" y="734">no retries left → EXHAUSTED → failure hook → DLQ (dlq.py: dead_letters / requeue)</text>
 
-    <path class="edge-crash" d="M712 454 L520 618"/>
+    <path class="edge-crash" d="M712 454 L520 610"/>
     <text class="t-edge-crash" x="365" y="590">worker dies → heartbeat stops</text>
     <path class="edge-crash" d="M690 700 L998 685"/>
     <text class="t-edge-crash" x="736" y="722">reaped attempt joins the retry path</text>
@@ -251,7 +253,7 @@
     <g>
       <rect class="node node-proc" x="380" y="90" width="280" height="56" rx="8"/>
       <text class="t-title" x="396" y="110">QraftSentinel (process)</text>
-      <text class="t-sub" x="396" y="127">guard 0.5s: reincarnate the dead · scheduler ~30s</text>
+      <text class="t-sub" x="396" y="127">guard 0.5s: reincarnate the dead · Q2 scheduler idle</text>
     </g>
     <g>
       <rect class="node node-proc" x="760" y="20" width="260" height="52" rx="8"/>
@@ -266,7 +268,7 @@
     <g>
       <rect class="node node-proc" x="760" y="180" width="260" height="52" rx="8"/>
       <text class="t-title" x="776" y="200">Monitor (process)</text>
-      <text class="t-sub" x="776" y="217">+ reaper thread — the monitor never forks</text>
+      <text class="t-sub" x="776" y="217">+ dispatcher · reaper · retention — never forks</text>
     </g>
     <path class="edge" d="M310 118 L378 118" style="marker-end:url(#arr2)"/>
     <path class="edge" d="M660 104 L758 48" style="marker-end:url(#arr2)"/>
@@ -274,13 +276,13 @@
     <path class="edge" d="M660 132 L758 202" style="marker-end:url(#arr2)"/>
     <g>
       <rect class="node" x="1100" y="50" width="470" height="160" rx="8" style="stroke-dasharray:6 4; stroke:#94a3b8;"/>
-      <text class="t-title" x="1116" y="74" style="fill:#64748b">Planned — docs/future/q2-absorption.md</text>
-      <text class="t-sub" x="1116" y="96">Phase 2: SCHEDULED attempts with not_before + a dispatcher thread.</text>
-      <text class="t-sub" x="1116" y="110">The Schedule row and the marker fallback disappear.</text>
+      <text class="t-title" x="1116" y="74" style="fill:#64748b">Roadmap — docs/future/q2-absorption.md</text>
+      <text class="t-sub" x="1116" y="96">Phase 2 ✓ shipped: SCHEDULED attempts + the dispatcher own every delay.</text>
+      <text class="t-sub" x="1116" y="110">No Schedule rows; the marker is a pre-2.0 compatibility path only.</text>
       <text class="t-sub" x="1116" y="132">Phase 3: workers claim attempts via SELECT … FOR UPDATE SKIP LOCKED.</text>
       <text class="t-sub" x="1116" y="146">Pusher, monitor, and broker disappear.</text>
-      <text class="t-sub" x="1116" y="168">LISTEN/NOTIFY: enqueue commit notifies; idle workers and the phase-2</text>
-      <text class="t-sub" x="1116" y="182">dispatcher wake on it instead of polling.</text>
+      <text class="t-sub" x="1116" y="168">LISTEN/NOTIFY: scheduler.notify() is the seam; an enqueue commit will</text>
+      <text class="t-sub" x="1116" y="182">wake idle workers and the dispatcher instead of polling.</text>
     </g>
   </svg>
   </div>
@@ -299,7 +301,7 @@
       <h3>django.tasks backend <code>backend.py</code> (Django ≥ 6)</h3>
       <ul>
         <li><code>@task.enqueue()</code> → the spine, via <code>qraft.runner.run_task</code> (unwraps the decorator's non-callable wrapper).</li>
-        <li><code>run_after</code> → Schedule row + marker, like a retry.</li>
+        <li><code>run_after</code> → SCHEDULED attempt row; the dispatcher enqueues it at the exact ETA.</li>
         <li><code>takes_context=True</code> → <code>run_task_with_context</code> builds the <code>TaskContext</code> worker-side.</li>
         <li><code>get_result()</code> reads <code>QraftTask</code>; statuses map to READY / RUNNING / SUCCESSFUL / FAILED.</li>
       </ul>
@@ -316,7 +318,15 @@
       <ul>
         <li><code>QraftOrmBroker</code> drains <code>--high</code>, then default, then <code>--low</code> on one ORM queue.</li>
         <li>Requires <code>Q_CLUSTER["broker_class"]</code>; on any other broker high/low tasks strand — never pass a priority on Redis.</li>
-        <li>Scheduled retries re-enter on the default lane (phase 2 fixes this).</li>
+        <li>A dispatched retry rebuilds its lane key from the task's own priority and target cluster — the lane and the cluster survive the delay.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Retention sweep <code>retention.py</code></h3>
+      <ul>
+        <li>Off by default. Set <code>retention_days</code> and/or <code>retention_max_tasks</code>; an explicit <code>Q_CLUSTER["save_limit"]</code> is inherited as the count bound.</li>
+        <li>A thread in the monitor runs the sweep every <code>retention_interval</code> (default 1&nbsp;h).</li>
+        <li>Only terminal rows go; a workflow is pruned as one unit; deletes run in batches of <code>retention_batch_size</code>.</li>
       </ul>
     </div>
   </div>
@@ -325,8 +335,10 @@
   <ol class="gotchas">
     <li>The retry check runs <strong>before</strong> workflow routing; a retrying chain/iter step does not advance or count its workflow that round.</li>
     <li><code>skip_exceptions</code> beats the rate-limit class; the rate-limit set only overrides a restrictive <code>retry_exceptions</code> allowlist.</li>
-    <li>A scheduled retry flips the task back to <code>PENDING</code>; the marker rides in <code>Schedule.kwargs → q_options.task_name</code>, not in <code>Schedule.name</code>.</li>
-    <li>Two cadences: the sentinel guard loop runs every 0.5s; the Q2 scheduler (which fires retries) every ~30s.</li>
+    <li>A delayed attempt is a <code>SCHEDULED</code> row; ownership is decided by the compare-and-swap to <code>QUEUED</code>, not by <code>SKIP LOCKED</code> (that is a contention optimisation only).</li>
+    <li><code>dispatch_interval</code> (0.5s) is a ceiling on idle polling, not a floor on delay — the dispatcher sleeps exactly until the next <code>not_before</code>.</li>
+    <li>A claim that dies between the CAS and the enqueue is re-armed to <code>SCHEDULED</code> by the reaper; an overdue <code>SCHEDULED</code> row is never reaped — it is live work waiting for a dispatcher.</li>
+    <li>Every cluster runs a dispatcher against the same table; an attempt with <code>cluster=NULL</code> runs on whichever cluster claims it.</li>
     <li>Heartbeat staleness = <code>max(3 × heartbeat_interval, 90s)</code>, and reaping also requires task <code>RUNNING</code> + attempt unresolved.</li>
     <li>On a non-ORM broker the reaper skips only never-started attempts; stale-heartbeat orphans are still reaped.</li>
     <li>A reaped task with no retry policy goes to <code>FAILED</code>, not <code>EXHAUSTED</code> — both land in <code>dead_letters()</code>.</li>
