@@ -1,6 +1,5 @@
 """Tests for qraft.hooks module."""
 
-from datetime import datetime
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,7 +11,6 @@ from qraft.hooks import (
     qraft_hook_handler,
 )
 from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt, TaskStatus
-from qraft.retry import handle_task_retry
 
 
 class TestExtractExceptionClass:
@@ -81,7 +79,9 @@ class TestParseQraftMarker:
 class TestQraftHookHandler:
     """Tests for qraft_hook_handler function."""
 
-    def test_handler_with_query_lookup(self, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_handler_with_query_lookup(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test handler using fast query-based lookup."""
         mock_q2_task_success.id = qraft_task_attempt.q2_task_id
 
@@ -98,6 +98,30 @@ class TestQraftHookHandler:
 
             # Verify dispatcher was called
             mock_dispatcher.assert_called_once()
+
+    def test_handler_query_diet_on_plain_task(
+        self, db, mock_q2_task_success, django_assert_max_num_queries
+    ):
+        """
+        The monitor serializes on this handler, so the plain-task hot path is
+        query-budgeted: resolve (workflow membership joined in), the locked
+        status update, and nothing else. A membership lookup creeping back in
+        busts the ceiling.
+        """
+        task = QraftTask.objects.create(
+            func="test.module.plain", status=TaskStatus.RUNNING
+        )
+        QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=1, q2_task_id="q2-diet-1"
+        )
+        mock_q2_task_success.id = "q2-diet-1"
+
+        # 6 = resolve + savepoint/release pair + locked select + 2 updates
+        with django_assert_max_num_queries(6):
+            qraft_hook_handler(mock_q2_task_success)
+
+        task.refresh_from_db()
+        assert task.status == TaskStatus.SUCCEEDED
 
     def test_handler_with_task_name_parsing(self, qraft_task, mock_q2_task_success):
         """Test handler with task_name parsing for retry tasks."""
@@ -127,7 +151,9 @@ class TestQraftHookHandler:
             # Dispatcher should not be called
             mock_dispatcher.assert_not_called()
 
-    def test_handler_with_failed_task(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
+    def test_handler_with_failed_task(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
         """Test handler with failed task (no retry policy)."""
         mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
         qraft_task.retry_policy = {}  # No retry policy
@@ -141,7 +167,7 @@ class TestQraftHookHandler:
             assert qraft_task_attempt.success is False
             assert qraft_task_attempt.exception_class == "ValueError"
 
-            # Verify task status is FAILED (no retry policy means no change to EXHAUSTED)
+            # No retry policy, so FAILED rather than EXHAUSTED
             qraft_task.refresh_from_db()
             assert qraft_task.status == TaskStatus.FAILED
 
@@ -163,7 +189,9 @@ class TestQraftHookHandler:
 class TestHookDispatcher:
     """Tests for HookDispatcher class."""
 
-    def test_dispatch_success_hook(self, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_dispatch_success_hook(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test dispatching success hook."""
         qraft_task.success_hook = "test.hooks.on_success"
         qraft_task.save()
@@ -181,7 +209,9 @@ class TestHookDispatcher:
                 hook_type="success",
             )
 
-    def test_dispatch_failure_hook_without_retry(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
+    def test_dispatch_failure_hook_without_retry(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
         """Test dispatching failure hook when no retry is needed."""
         qraft_task.failure_hook = "test.hooks.on_failure"
         qraft_task.retry_policy = {}  # No retry policy
@@ -200,8 +230,10 @@ class TestHookDispatcher:
                 hook_type="failure",
             )
 
-    def test_dispatch_failure_always_dispatches_hook(self, qraft_task, qraft_task_attempt, mock_q2_task_failure):
-        """Test that dispatch() always dispatches failure hook (retry is handled separately)."""
+    def test_dispatch_failure_always_dispatches_hook(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
+        """dispatch() always fires the failure hook; retry is handled separately."""
         qraft_task.failure_hook = "test.hooks.on_failure"
         qraft_task.save()
 
@@ -224,7 +256,9 @@ class TestHookDispatcher:
                 hook_type="failure",
             )
 
-    def test_dispatch_no_hook_configured(self, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_dispatch_no_hook_configured(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test dispatch when no hooks are configured."""
         qraft_task.success_hook = None
         qraft_task.failure_hook = None
@@ -239,7 +273,9 @@ class TestHookDispatcher:
             mock_call.assert_not_called()
 
     @patch("qraft.hooks.q2_async_task")
-    def test_call_hook_async(self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_call_hook_async(
+        self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test async hook dispatching."""
         mock_q2_async.return_value = "hook-task-123"
 
@@ -271,7 +307,9 @@ class TestHookDispatcher:
         assert hook_dispatch.q2_task_id == "hook-task-123"
 
     @patch("qraft.hooks.q2_async_task")
-    def test_call_hook_async_idempotency(self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_call_hook_async_idempotency(
+        self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test that hooks are only dispatched once (idempotency)."""
         mock_q2_async.return_value = "hook-task-123"
 
@@ -300,7 +338,9 @@ class TestHookDispatcher:
         mock_q2_async.assert_not_called()
 
     @patch("qraft.hooks.import_string")
-    def test_call_hook_sync(self, mock_import, qraft_task, qraft_task_attempt, mock_q2_task_success):
+    def test_call_hook_sync(
+        self, mock_import, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
         """Test synchronous hook calling."""
         mock_hook = Mock()
         mock_import.return_value = mock_hook
@@ -320,7 +360,6 @@ class TestHookDispatcher:
 
         # Verify hook was called synchronously
         mock_hook.assert_called_once_with(1, 2, key="value")
-
 
 
 @pytest.mark.django_db

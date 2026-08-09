@@ -189,9 +189,15 @@ def _resolve_attempt(q2_task):
     from .models import QraftTaskAttempt
 
     try:
-        attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
-            q2_task_id=q2_task.id
-        )
+        # chain_step (and its chain) ride along on the one lookup the monitor
+        # serializes on: workflow membership never changes after creation, so
+        # the joined answer stays authoritative and the routing step needs no
+        # query of its own for the common, workflow-less task.
+        attempt = QraftTaskAttempt.objects.select_related(
+            "qraft_task",
+            "qraft_task__chain_step",
+            "qraft_task__chain_step__chain",
+        ).get(q2_task_id=q2_task.id)
     except QraftTaskAttempt.DoesNotExist:
         pass
     else:
@@ -252,8 +258,10 @@ def qraft_hook_handler(q2_task):
     ):
         return
 
-    # Workflow tasks get workflow-level hooks only, never task-level ones
-    if not route_workflow_completion(qraft_task, attempt):
+    # Workflow tasks get workflow-level hooks only, never task-level ones.
+    # Routed with the pre-lock instance: its select_related already answered
+    # the membership question, and membership is immutable after creation.
+    if not route_workflow_completion(attempt.qraft_task, attempt):
         HookDispatcher(qraft_task, attempt).dispatch(q2_task)
 
 
