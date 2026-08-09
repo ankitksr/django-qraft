@@ -30,6 +30,7 @@ _MODULES = (
     "showcase.scenarios.durability",
     "showcase.scenarios.ai",
     "showcase.scenarios.djangotasks",
+    "showcase.scenarios.bench",
 )
 
 

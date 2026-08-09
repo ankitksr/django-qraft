@@ -44,7 +44,7 @@ This one command does all of the work:
 
 1. It resets the database.
 2. It starts the worker clusters that the scenarios need.
-3. It runs all 29 scenarios.
+3. It runs all 32 scenarios.
 4. It stops the clusters.
 5. It prints a PASS/FAIL matrix and sets the exit code.
 
@@ -60,7 +60,8 @@ uv run python manage.py demo run core.hooks wf.chain
 ```
 
 `demo list` shows each scenario and what it proves. `--group` limits the run
-to one group: `core`, `workflows`, `durability`, `ai`, or `django-tasks`.
+to one group: `core`, `workflows`, `durability`, `ai`, `django-tasks`, or
+`bench`.
 
 To keep the clusters after the run, add `--keep-clusters`.
 
@@ -83,6 +84,14 @@ The page shows:
 You can start any scenario from the page and watch it run. The page polls the
 server; it does not load anything from the network.
 
+Two more panels create load by hand:
+
+- **Clusters** — start or stop any worker profile with one button.
+- **Soak** — put long mock API calls on the `soak` cluster. Set the task
+  count, the duration range, and the failure rate, then click start. The
+  panel boots the `soak` cluster when necessary. Watch the task table for
+  the pickup order, the heartbeat age, the progress, and the retries.
+
 For per-object detail, use the Django admin at
 http://127.0.0.1:8000/admin/qraft/.
 
@@ -103,6 +112,10 @@ http://127.0.0.1:8000/admin/qraft/.
 - **django-tasks** — enqueue and result retrieval through
   `QraftTaskBackend`; `run_after`; `takes_context`; honest reporting of
   `supports_priority`.
+- **bench** — qraft against plain django-q2 on the same workers: delay
+  precision (a 2-second ask against the ~30-second scheduler tick),
+  throughput overhead, and pickup latency. The measured numbers are in the
+  notes of each run.
 
 `demo/README.md` lists each scenario and its claim.
 

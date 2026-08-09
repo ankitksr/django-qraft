@@ -7,12 +7,14 @@ Django admin, which `qraft.admin` already furnishes, rather than rebuilding
 per-object detail pages here.
 """
 
+import json
+import random
 import threading
 import uuid
 
 from django.db import connection
 from django.db.models import Count
-from django.http import Http404, JsonResponse
+from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
@@ -196,7 +198,11 @@ def state(request):
             "now": now.isoformat(),
             "counts": counts,
             "queued": OrmQ.objects.count(),
-            "scheduled": Schedule.objects.count(),
+            # Qraft-owned SCHEDULED attempts plus any legacy pre-2.0 Schedules.
+            "scheduled": QraftTaskAttempt.objects.filter(
+                state=QraftTaskAttempt.AttemptState.SCHEDULED
+            ).count()
+            + Schedule.objects.count(),
             "clusters": sorted(_clusters().running()),
             "tasks": tasks,
             "workflows": workflows,
@@ -285,6 +291,70 @@ def run_scenario(request, key: str):
 
     threading.Thread(target=work, daemon=True).start()
     return JsonResponse({"started": True})
+
+
+@require_POST
+def start_cluster(request, name: str):
+    """Boot one worker cluster from the dashboard."""
+    if name not in PROFILES:
+        raise Http404(name)
+    _clusters().ensure([name])
+    return JsonResponse({"started": name})
+
+
+@require_POST
+def stop_cluster(request, name: str):
+    """Stop one worker cluster from the dashboard."""
+    if name not in PROFILES:
+        raise Http404(name)
+    _clusters().stop(name)
+    return JsonResponse({"stopped": name})
+
+
+# Bounds for the soak panel, so a typo cannot enqueue an afternoon of work.
+SOAK_MAX_COUNT = 200
+SOAK_MAX_SECONDS = 3600.0
+
+
+@require_POST
+def start_soak(request):
+    """
+    Fan out long fake-API tasks onto the soak cluster.
+
+    Each task sleeps a random duration in [min_seconds, max_seconds], reports
+    progress as it goes, and fails a `fail_pct` share of the time so retries
+    show up too. The regular task table is the watcher.
+    """
+    from qraft.tasks import async_task
+
+    try:
+        params = json.loads(request.body or "{}")
+        count = min(int(params.get("count", 8)), SOAK_MAX_COUNT)
+        low = min(float(params.get("min_seconds", 180)), SOAK_MAX_SECONDS)
+        high = min(float(params.get("max_seconds", 600)), SOAK_MAX_SECONDS)
+        fail_pct = max(0.0, min(float(params.get("fail_pct", 20)), 100.0))
+    except (ValueError, TypeError):
+        return HttpResponseBadRequest("count, min_seconds, max_seconds, fail_pct")
+    if count < 1 or low <= 0 or high < low:
+        return HttpResponseBadRequest("need count >= 1 and 0 < min <= max")
+
+    _clusters().ensure(["soak"])
+    run = f"soak-{uuid.uuid4().hex[:6]}"
+    for index in range(1, count + 1):
+        async_task(
+            "showcase.tasks.fake_api_task",
+            run,
+            f"api-{index:02d}",
+            seconds=round(random.uniform(low, high), 1),
+            fail_pct=fail_pct,
+            cluster="soak",
+            qraft_options={
+                "max_attempts": 3,
+                "base_delay": 10.0,
+                "backoff_strategy": "exponential",
+            },
+        )
+    return JsonResponse({"run": run, "count": count})
 
 
 @require_POST

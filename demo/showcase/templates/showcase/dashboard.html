@@ -134,6 +134,19 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
 .chip.running { color: var(--run); border-color: var(--run); }
 .chip.gated::after { content: " ⏸"; color: var(--warn); }
 
+.cluster { display: flex; gap: 8px; align-items: center; padding: 4px 12px;
+           border-bottom: 1px solid var(--line); }
+.cluster:last-child { border-bottom: 0; }
+.cluster .key { flex: 1; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle);
+       display: inline-block; }
+.dot.on { background: var(--ok); }
+.soak label { display: inline-flex; align-items: center; gap: 4px;
+              margin: 0 8px 6px 0; color: var(--dim); font-size: 11px; }
+.soak input { width: 58px; font: inherit; background: var(--panel2);
+              color: var(--ink); border: 1px solid var(--line);
+              border-radius: 5px; padding: 2px 6px; }
+
 .feed { max-height: 260px; overflow: auto; padding: 4px 0; }
 .feed div { padding: 1px 12px; white-space: nowrap; overflow: hidden;
             text-overflow: ellipsis; }
@@ -179,6 +192,33 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
     </section>
 
     <section>
+      <h2>Soak — fake API load</h2>
+      <div class="body soak">
+        <label>tasks <input id="soak-count" type="number" value="8" min="1" max="200"></label>
+        <label>min s <input id="soak-min" type="number" value="180" min="1"></label>
+        <label>max s <input id="soak-max" type="number" value="600" min="1"></label>
+        <label>fail % <input id="soak-fail" type="number" value="20" min="0" max="100"></label>
+        <button id="soak-start">start</button>
+        <div class="legend" style="padding:6px 0 0">Fans long mock API calls onto the
+        “soak” cluster (boots it if needed — the first start takes a few seconds).
+        Watch pickup order, heartbeat age, progress and retries in the task table.</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Clusters</h2>
+      <div id="clusterlist">
+        {% for name, why in profiles.items %}
+        <div class="cluster" title="{{ why }}">
+          <span class="dot" data-cluster-dot="{{ name }}"></span>
+          <span class="key">{{ name }}</span>
+          <button data-cluster="{{ name }}" data-op="start">start</button>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section>
       <h2>Rate buckets</h2>
       <div id="buckets"><div class="empty">none yet</div></div>
     </section>
@@ -188,12 +228,6 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
       <div id="usage"><div class="empty">none yet</div></div>
     </section>
 
-    <section>
-      <h2>Cluster profiles</h2>
-      <div class="legend">
-        {% for name, why in profiles.items %}<b>{{ name }}</b> — {{ why }}<br>{% endfor %}
-      </div>
-    </section>
   </div>
 
   <div>
@@ -276,6 +310,35 @@ $("run-all").onclick = async () => {
       }, 1000);
     });
   }
+};
+
+document.querySelectorAll("[data-cluster]").forEach((button) => {
+  button.onclick = async () => {
+    button.disabled = true;
+    button.textContent = "…";
+    await fetch(`/clusters/${button.dataset.cluster}/${button.dataset.op}/`,
+                {method: "POST", headers: {"X-CSRFToken": CSRF}});
+    poll();
+  };
+});
+
+$("soak-start").onclick = async () => {
+  const button = $("soak-start");
+  button.disabled = true;
+  button.textContent = "…";
+  await fetch("/soak/start/", {
+    method: "POST",
+    headers: {"X-CSRFToken": CSRF, "Content-Type": "application/json"},
+    body: JSON.stringify({
+      count: Number($("soak-count").value),
+      min_seconds: Number($("soak-min").value),
+      max_seconds: Number($("soak-max").value),
+      fail_pct: Number($("soak-fail").value),
+    }),
+  });
+  button.disabled = false;
+  button.textContent = "start";
+  poll();
 };
 
 const TILES = ["pending", "running", "succeeded", "failed", "exhausted"];
@@ -365,6 +428,16 @@ function render(state) {
   });
   document.querySelectorAll("[data-run]").forEach((button) => {
     button.disabled = state.active.length > 0;
+  });
+
+  document.querySelectorAll("[data-cluster]").forEach((button) => {
+    const on = state.clusters.includes(button.dataset.cluster);
+    button.dataset.op = on ? "stop" : "start";
+    button.textContent = on ? "stop" : "start";
+    button.disabled = false;
+  });
+  document.querySelectorAll("[data-cluster-dot]").forEach((dot) => {
+    dot.classList.toggle("on", state.clusters.includes(dot.dataset.clusterDot));
   });
 
   $("run-count").textContent = state.runs.length;

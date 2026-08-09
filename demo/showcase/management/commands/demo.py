@@ -28,7 +28,14 @@ class Command(BaseCommand):
                 action.add_argument("keys", nargs="+", help="Scenario keys to run")
             action.add_argument(
                 "--group",
-                choices=["core", "workflows", "durability", "ai", "django-tasks"],
+                choices=[
+                    "core",
+                    "workflows",
+                    "durability",
+                    "ai",
+                    "django-tasks",
+                    "bench",
+                ],
                 help="Limit to one group",
             )
             action.add_argument(
@@ -113,8 +120,9 @@ class Command(BaseCommand):
         manager = ClusterManager(log=lambda message: self.stdout.write(f"  {message}"))
         self.stdout.write("Starting worker clusters for the dashboard...")
         # "lanes" is left down: the priority scenario needs to fill the lanes
-        # before a consumer exists and starts that cluster itself.
-        manager.ensure([name for name in PROFILES if name != "lanes"])
+        # before a consumer exists and starts that cluster itself. "soak" boots
+        # on demand from the dashboard's soak panel.
+        manager.ensure([name for name in PROFILES if name not in ("lanes", "soak")])
 
         from showcase import views
 

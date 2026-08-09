@@ -216,8 +216,8 @@ def reaper_kill(ctx):
     "dur.reaper-retry-crash",
     group="durability",
     title="Orphan reaper reclaims a crash during a retry attempt",
-    proves="An attempt that only exists because a retry Schedule fired is "
-    "still leased, so killing its worker is reclaimable too.",
+    proves="A retry attempt — created SCHEDULED by qraft's dispatcher, not by "
+    "async_task() — is still leased, so killing its worker is reclaimable too.",
 )
 def reaper_retry_crash(ctx):
     run, label = ctx.run, "retry-crash"

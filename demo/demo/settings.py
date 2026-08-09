@@ -129,6 +129,9 @@ Q_CLUSTER = {
         # One worker and a one-deep hand-off queue, so completion order is a
         # faithful reading of dequeue order rather than of worker races.
         "lanes": {"workers": 1, "queue_limit": 1},
+        # Long fake-API tasks. The 60s base timeout would kill them, so this
+        # profile gets 30 minutes; `retry` (3600) still exceeds it.
+        "soak": {"workers": 4, "timeout": 1800},
     },
 }
 
@@ -161,6 +164,7 @@ QRAFT_CLUSTER = {
         "throttle-a": {},
         "throttle-b": {},
         "lanes": {},
+        "soak": {"max_inflight": 4},
     },
 }
 

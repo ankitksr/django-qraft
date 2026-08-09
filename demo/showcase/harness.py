@@ -48,7 +48,7 @@ class Scenario:
 
 
 REGISTRY: dict[str, Scenario] = {}
-GROUP_ORDER = ("core", "workflows", "durability", "ai", "django-tasks")
+GROUP_ORDER = ("core", "workflows", "durability", "ai", "django-tasks", "bench")
 
 
 def scenario(

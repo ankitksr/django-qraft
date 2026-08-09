@@ -30,6 +30,7 @@ PROFILES = {
     "throttle-a": "2 workers sharing a rate bucket with throttle-b",
     "throttle-b": "2 workers sharing a rate bucket with throttle-a",
     "lanes": "1 worker, drains high then default then low",
+    "soak": "4 process workers, 30 min timeout, for long fake-API tasks",
 }
 
 # Seconds to wait for a cluster to execute its first probe task.

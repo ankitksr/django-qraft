@@ -8,6 +8,7 @@ anything else.
 
 import logging
 import os
+import random
 import time
 
 from django.db.models import F
@@ -135,9 +136,9 @@ def crash_on_attempt(
     """
     Fail normally, then hang on `crash_attempt` so that attempt can be killed.
 
-    The attempt that hangs is reached through a retry Schedule, so its
-    QraftTaskAttempt row is created by the marker lease rather than by
-    async_task(). That is the path the reaper has to be able to see.
+    The attempt that hangs is reached through a dispatched retry, so its
+    QraftTaskAttempt row was created SCHEDULED by qraft's scheduler rather
+    than by async_task(). That is the path the reaper has to be able to see.
     """
     attempt = bump(f"{run}:{label}")
     record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
@@ -178,6 +179,32 @@ def llm_task(run: str, label: str, calls: int = 2) -> dict:
             cost_usd=0.002,
         )
     return {"label": label, "calls": calls}
+
+
+def fake_api_task(
+    run: str, label: str, seconds: float = 300.0, fail_pct: float = 0.0
+) -> dict:
+    """
+    Mock external API call for the soak panel: a long hold with visible vitals.
+
+    Sleeps `seconds` in slices, reports progress each slice (the lease thread
+    keeps the heartbeat fresh on its own), and — with probability `fail_pct` —
+    raises a TransientError partway through, so the watcher can see the retry
+    path fire under load. Records a little mock usage on success.
+    """
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt, seconds=seconds)
+    steps = max(4, int(seconds // 15))
+    fail_at = None
+    if fail_pct and random.random() * 100 < fail_pct:
+        fail_at = random.randint(1, max(1, steps // 2))
+    for step in range(1, steps + 1):
+        report_progress(current=step, total=steps, message=f"api call {step}/{steps}")
+        if step == fail_at:
+            raise TransientError(f"{label} upstream 502 on attempt {attempt}")
+        time.sleep(seconds / steps)
+    record_usage(model="mock-api", cost_usd=0.01)
+    return {"label": label, "attempt": attempt, "seconds": seconds}
 
 
 def progress_task(run: str, label: str, steps: int = 4, delay: float = 0.3) -> dict:

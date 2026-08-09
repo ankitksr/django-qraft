@@ -33,7 +33,7 @@ in `IMMEDIATE` mode; heavier parallel runs can still contend.
 make demo             # or: uv run python manage.py demo all
 ```
 
-One command. It resets the database, starts the clusters, runs all 29
+One command. It resets the database, starts the clusters, runs all 32
 scenarios, stops the clusters, and prints the matrix:
 
 ```
@@ -45,12 +45,12 @@ core.backoff            PASS     24/24   87.8s
 [durability]
 dur.reaper-kill         PASS     11/11   23.9s
 ...
-29/29 scenarios passed, 250/250 checks passed
+32/32 scenarios passed, 260/260 checks passed
 ```
 
-A full run takes about twelve minutes. Most of that is retry latency:
-django-q2 runs its scheduler on a fixed 30-second cycle, so every retry a
-scenario waits on costs at least that.
+A full run takes several minutes. The long poles are deliberate: the
+durability scenarios idle through reaper grace periods, and `bench.delay`
+waits for django-q2's 30-second scheduler tick on purpose, to measure it.
 
 Useful variants:
 
@@ -73,6 +73,12 @@ the dead-letter queue with a requeue button; rate buckets; the token and cost
 rollup; and a live feed of what tasks and hooks recorded. Any scenario can be
 started from the browser and watched as it runs. Object detail links go to the
 Django admin, which `qraft.admin` already provides.
+
+Two panels drive load by hand. **Clusters** starts and stops any worker
+profile from the page. **Soak** fans out long mock API calls (default 8 tasks
+of 3–10 minutes each, 20% transient failure) onto the `soak` cluster, which it
+boots on demand — the task table then shows pickup order, heartbeat age,
+progress and the retries as they happen.
 
 The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 
@@ -109,7 +115,7 @@ The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 | --- | --- |
 | `dur.lease` | A running task stamps `date_started` and keeps `heartbeat_at` moving. |
 | `dur.reaper-kill` | A worker killed with a real SIGKILL leaves no result, and the reaper reclaims and retries the task. |
-| `dur.reaper-retry-crash` | An attempt that exists only because a retry Schedule fired is leased too, so killing its worker is also reclaimable. |
+| `dur.reaper-retry-crash` | A retry attempt (created SCHEDULED by the dispatcher, not by `async_task()`) is leased too, so killing its worker is also reclaimable. |
 | `dur.dlq` | An exhausted task lands in the DLQ; `requeue()` continues the same attempt series with history and idempotency key intact. |
 | `dur.retention` | The sweep prunes settled rows past the window and leaves live rows and members of unfinished workflows alone. |
 
@@ -131,6 +137,14 @@ The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 | `dt.defer` | `run_after` stays unrun until due, then executes. |
 | `dt.context` | `takes_context=True` receives a `TaskContext` whose `TaskResult` is its own. |
 | `dt.priority` | `supports_priority` follows the deployed broker, and Django rejects a priority enqueue when it is false. |
+
+**bench**
+
+| Key | Proves |
+| --- | --- |
+| `bench.delay` | A 2-second delay through qraft's dispatcher is served in about 2 seconds; the same ask through a django-q2 `Schedule` waits for the ~30-second scheduler tick. |
+| `bench.throughput` | Qraft's bookkeeping (task + attempt rows, lease, status updates) costs a bounded factor over raw django-q2 on the same workers; the measured numbers land in the notes. |
+| `bench.pickup` | The p95 gap between enqueue and a worker starting the task stays in low seconds. |
 
 ## How a scenario proves anything
 
@@ -156,6 +170,7 @@ selects the broker lane and the worker settings together.
 | `synchooks` | `sync_hooks=True`. |
 | `throttle-a` / `throttle-b` | Two clusters sharing one rate bucket. |
 | `lanes` | 1 worker draining high, then default, then low. |
+| `soak` | 4 workers, 30-minute timeout, for the dashboard's long fake-API tasks. |
 
 The suite starts and stops these itself. Cluster stdout goes to
 `.demo-logs/<profile>.log`.
@@ -175,11 +190,6 @@ Q_CLUSTER_NAME=threaded uv run python manage.py qraftcluster
   and the reclaim are real; only the clock is moved.
 - `core.jitter` and `dt.priority` are in-process checks against the library,
   not end-to-end runs. Each says so in its own output.
-- Retry delays are asserted on the ETA qraft writes to the retry `Schedule`,
-  not on arrival. django-q2's sentinel runs its scheduler on a fixed
-  30-second cycle, so a backoff shorter than that is rounded up on delivery
-  and the three strategies are indistinguishable by arrival time alone.
-  `core.backoff` also checks that no retry arrives *before* its ETA.
 - `wf.approval` counts `on_cancelled` dispatches globally rather than per
   run: qraft calls that hook with no arguments, so it cannot be told which
   workflow was cancelled. `cancel()` does not dispatch it at all — only
