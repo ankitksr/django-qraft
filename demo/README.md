@@ -1,290 +1,186 @@
-# Qraft Demo
+# Qraft demo and verification suite
 
-Minimal demonstration of Qraft's features: dual-phase hooks, retry policies, multithreaded workers, and workflow primitives.
+A self-verifying proof of concept for django-qraft. Every scenario declares
+what it expects, drives the real queue, and asserts the end state. The suite
+boots the worker clusters it needs, runs, tears them down, prints a PASS/FAIL
+matrix, and exits non-zero on failure.
 
-## Quick Start
+Runs on Django 6.0, which is also the first version where
+`qraft.backend.QraftTaskBackend` (django.tasks, DEP 14) can be exercised at all.
+
+## Setup
 
 ```bash
-# From the project root
 cd demo
-
-# Install dependencies
-uv sync
-
-# Run migrations
-uv run python manage.py migrate
-
-# Create an admin superuser (optional, for browsing results)
-uv run python manage.py createsuperuser
-
-# Start the cluster (in one terminal)
-uv run python manage.py qraftcluster
-
-# Run demos (in another terminal)
-uv run python manage.py demo hooks
-uv run python manage.py demo retry
-uv run python manage.py demo chain
-uv run python manage.py demo iter
-uv run python manage.py demo batch
-uv run python manage.py demo cancel
-uv run python manage.py demo approval
-uv run python manage.py demo ratelimit
-uv run python manage.py demo usage
-uv run python manage.py demo idempotent
-uv run python manage.py demo reaper
-
-# For performance comparison, see "Perf Demo" section below
+make setup            # uv sync + migrate
 ```
 
-## Admin UI
-
-The demo includes Django's admin interface for browsing Qraft models. After running `createsuperuser`, visit [http://localhost:8000/admin/](http://localhost:8000/admin/) (start the dev server with `uv run python manage.py runserver`).
-
-You can inspect:
-- **QraftTasks** — task status, arguments, retry policy, and attempt history
-- **QraftChainModels** — chain workflows with inline step details
-- **QraftIterModels** — parallel iter workflows with progress counters
-- **QraftBatchModels** — parallel batch workflows with progress counters
-- **HookDispatches** — async hook execution records
-
-## Demo Scenarios
-
-### Hooks: Dual-Phase Success/Failure
+PostgreSQL is the default and is what the suite is tuned for: a dozen worker
+processes share one database, and the throttle and parallel-workflow paths
+depend on real row locks. Create the database once:
 
 ```bash
-uv run python manage.py demo hooks -n 5
+createdb qraft_demo
 ```
 
-Queues tasks with 50% random failure rate. Watch the cluster logs for:
-- `SUCCESS HOOK: task_id=...` when tasks succeed
-- `FAILURE HOOK: task_id=...` when tasks fail
+Set `DEMO_DB=sqlite` for a quick look without PostgreSQL. SQLite works, but
+`ai.throttle` is only correct there because Django opens SQLite transactions
+in `IMMEDIATE` mode; heavier parallel runs can still contend.
 
-### Retry: Exponential Backoff
+## Run everything
 
 ```bash
-uv run python manage.py demo retry --fail-times 2 --max-attempts 4
+make demo             # or: uv run python manage.py demo all
 ```
 
-Task fails exactly N times before succeeding. With `--fail-times 2` and `--max-attempts 4`:
-- Attempt 1: fails, retry in 2s
-- Attempt 2: fails, retry in 4s
-- Attempt 3: succeeds
+One command. It resets the database, starts the clusters, runs all 29
+scenarios, stops the clusters, and prints the matrix:
 
-Try `uv run python manage.py demo retry --fail-times 5 --max-attempts 3` to see retry exhaustion.
+```
+SCENARIO                RESULT  CHECKS   TIME
+----------------------  ------  ------  -----
+[core]
+core.backoff            PASS     24/24   87.8s
+...
+[durability]
+dur.reaper-kill         PASS     11/11   23.9s
+...
+29/29 scenarios passed, 250/250 checks passed
+```
 
-### Chain: Sequential Workflow
+A full run takes about twelve minutes. Most of that is retry latency:
+django-q2 runs its scheduler on a fixed 30-second cycle, so every retry a
+scenario waits on costs at least that.
+
+Useful variants:
 
 ```bash
-uv run python manage.py demo chain -n 3
-uv run python manage.py demo chain -n 3 --wait 10000
+uv run python manage.py demo list                 # every scenario and what it proves
+uv run python manage.py demo all --group durability
+uv run python manage.py demo run core.hooks wf.chain
+uv run python manage.py demo all --keep-clusters  # leave the workers up afterwards
 ```
 
-Creates a sequential chain of N steps. Each step executes only after the previous one succeeds. Use `--wait` to block until completion and see the `WorkflowResult`.
-
-Features demonstrated: step-by-step execution, chain-level hooks, `on_cancelled` hook.
-
-### Iter: Parallel Homogeneous Workflow
+## Watch it happen
 
 ```bash
-uv run python manage.py demo iter -n 5
-uv run python manage.py demo iter -n 5 --wait 10000
+make ui               # boots the clusters, serves http://127.0.0.1:8000/
 ```
 
-Applies the same function (`noop_task`) to N different inputs in parallel. Includes a `progress_hook` that logs after each task completes. Use `--wait` to see final results.
+The dashboard polls once a second and shows tasks with their status, attempt
+count, heartbeat age and progress; workflows with their members and counters;
+the dead-letter queue with a requeue button; rate buckets; the token and cost
+rollup; and a live feed of what tasks and hooks recorded. Any scenario can be
+started from the browser and watched as it runs. Object detail links go to the
+Django admin, which `qraft.admin` already provides.
 
-Features demonstrated: parallel fan-out, progress callbacks, workflow-level hooks.
+The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 
-### Batch: Parallel Heterogeneous Workflow
+## Scenarios
+
+**core**
+
+| Key | Proves |
+| --- | --- |
+| `core.hooks` | Success fires only the success hook, failure only the failure hook, each with its configured arguments. |
+| `core.backoff` | Exponential, linear and fixed backoff each honour `max_attempts` and serve delays whose measured shape matches the strategy. |
+| `core.jitter` | Jitter spreads the delay inside the configured fraction; turning it off makes the delay constant. |
+| `core.exception-filter` | `retry_exceptions` and `skip_exceptions` each stop a retry series that an otherwise identical policy runs. |
+| `core.rate-limit-retry` | A provider `Retry-After` hint overrides the configured backoff, and `rate_limit_max_delay` caps a hint that is too large. |
+| `core.threading` | On an I/O-bound load the threaded cluster clears the same queue measurably faster than an equal process cluster. |
+| `core.hook-modes` | Async hooks run as their own queued task with a dispatch row; `sync_hooks=True` runs the hook in the monitor with neither. |
+
+**workflows**
+
+| Key | Proves |
+| --- | --- |
+| `wf.chain` | Steps run in order, a step's own retry policy applies, the chain hook fires once. |
+| `wf.chain-failure` | An exhausted step fails the chain, fires the failure hook, and later steps never run. |
+| `wf.chain-resume` | `resume()` restarts the failed step only. |
+| `wf.iter` | Every member runs, counters land on the total, the workflow hook fires once. |
+| `wf.batch` | Different functions fan out together, each with its own retry policy. |
+| `wf.progress` | The progress hook fires on every partial completion and stops before the last. |
+| `wf.approval` | A gated chain parks at `WAITING_APPROVAL` and consumes nothing; `approve()` resumes, `reject()` cancels. |
+| `wf.cancel` | Cancelling stops further work, and a cancel racing the last completion is not overwritten. |
+
+**durability**
+
+| Key | Proves |
+| --- | --- |
+| `dur.lease` | A running task stamps `date_started` and keeps `heartbeat_at` moving. |
+| `dur.reaper-kill` | A worker killed with a real SIGKILL leaves no result, and the reaper reclaims and retries the task. |
+| `dur.reaper-retry-crash` | An attempt that exists only because a retry Schedule fired is leased too, so killing its worker is also reclaimable. |
+| `dur.dlq` | An exhausted task lands in the DLQ; `requeue()` continues the same attempt series with history and idempotency key intact. |
+| `dur.retention` | The sweep prunes settled rows past the window and leaves live rows and members of unfinished workflows alone. |
+
+**ai**
+
+| Key | Proves |
+| --- | --- |
+| `ai.idempotency` | A repeat enqueue under a live key returns the original id; `idempotency_retry_dead` releases a dead key. |
+| `ai.usage` | `record_usage` accumulates per attempt; the aggregates roll up per task and per workflow. |
+| `ai.progress` | `report_progress()` moves while the task runs and settles on the final step. |
+| `ai.throttle` | Two clusters on one `RateBucket` cannot together exceed capacity plus refill over the observed window. |
+| `ai.priority` | High drains before default before low; a cluster whose broker cannot drain the lanes warns and still runs the task. |
+
+**django-tasks**
+
+| Key | Proves |
+| --- | --- |
+| `dt.enqueue` | A `@task` enqueued by Django's Tasks API runs on a qraft cluster; the backend reports status, errors and return value. |
+| `dt.defer` | `run_after` stays unrun until due, then executes. |
+| `dt.context` | `takes_context=True` receives a `TaskContext` whose `TaskResult` is its own. |
+| `dt.priority` | `supports_priority` follows the deployed broker, and Django rejects a priority enqueue when it is false. |
+
+## How a scenario proves anything
+
+Task functions and hooks run in worker processes, so they write an `Event` row
+for everything observable they do. A scenario reads those rows back, together
+with qraft's own tables, and scores each expectation through `ctx.check`. A
+scenario that records no checks is reported as an error, not a pass.
+
+Waiting is always `ctx.poll` with a deadline. `ctx.settle` appears only where
+the claim is a negative one — "nothing else happened" — which no poll can
+establish.
+
+## Clusters
+
+One environment variable, `Q_CLUSTER_NAME`, picks a profile. django-q2 and
+qraft both read it and apply their own `ALT_CLUSTERS` entry, so the name
+selects the broker lane and the worker settings together.
+
+| Profile | What it is for |
+| --- | --- |
+| `default` | 3 process workers, async hooks. Most scenarios. |
+| `baseline` / `threaded` | 2 workers each; 1 thread versus 8, for the throughput comparison. |
+| `synchooks` | `sync_hooks=True`. |
+| `throttle-a` / `throttle-b` | Two clusters sharing one rate bucket. |
+| `lanes` | 1 worker draining high, then default, then low. |
+
+The suite starts and stops these itself. Cluster stdout goes to
+`.demo-logs/<profile>.log`.
+
+To run one by hand:
 
 ```bash
-uv run python manage.py demo batch -n 3
-uv run python manage.py demo batch -n 3 --wait 30000
+Q_CLUSTER_NAME=threaded uv run python manage.py qraftcluster
 ```
 
-Runs N different tasks in parallel (fork-join). Each task can be a different function with its own retry policy. Includes a `progress_hook`. Use `--wait` to see final results with error details.
+## Known limits
 
-Features demonstrated: heterogeneous fan-out, per-task retry policies, error aggregation.
-
-### Cancel: Workflow Cancellation
-
-```bash
-uv run python manage.py demo cancel
-```
-
-Creates a chain of slow tasks, then immediately cancels it. Demonstrates:
-- `chain.cancel()` sets status to CANCELLED
-- In-flight tasks complete but no further steps are queued
-- The `on_cancelled` hook fires
-
-### Approval: Human-in-the-Loop Chain Step
-
-```bash
-uv run python manage.py demo approval
-```
-
-A two-step chain whose second step is gated with `requires_approval=True`. The chain parks in `WAITING_APPROVAL` after step 1, `result()` returns the completed step instead of blocking, then `chain.approve()` queues step 2 and the chain finishes.
-
-### Ratelimit: Token Bucket and Rate-Limit-Aware Retries
-
-```bash
-uv run python manage.py demo ratelimit
-```
-
-`throttled_task` is gated behind a `RateBucket` holding one token that refills at 0.01/s. Task 1 takes the token and succeeds. Task 2 raises `RateLimited`, and the demo prints the resulting `QraftTaskAttempt` and the `qraft_retry:<id>:<attempt>` Schedule row with its backoff `next_run`.
-
-The bucket is reset at the start of each run so the scenario repeats.
-
-### Usage: Token and Cost Accounting
-
-```bash
-uv run python manage.py demo usage
-```
-
-`llm_task` makes three mock-llm calls, each calling `record_usage()` and `report_progress()`. The demo prints the per-attempt usage, the `aggregate_usage()` rollup, and the last reported progress payload.
-
-### Idempotent: Deduplicated Enqueue
-
-```bash
-uv run python manage.py demo idempotent
-```
-
-Enqueues `charge_task` twice under one `idempotency_key`. Both calls return the same Q2 task id and only one `QraftTask` row exists — Mockco is charged once.
-
-### Reaper: Orphan Detection and Requeue
-
-```bash
-uv run python manage.py demo reaper [--stale-after 1.0]
-```
-
-Fabricates a crashed worker: a `RUNNING` QraftTask with an unresolved attempt, a bogus `q2_task_id`, and a backdated `date_created`. `reap_orphans()` marks the attempt `OrphanedTask` and schedules a retry; the demo then waits for the requeued attempt to succeed and prints the full attempt history.
-
-### Tasks-API: Official django.tasks Backend
-
-```bash
-uv run python manage.py demo tasks-api
-```
-
-Enqueues a `@task`-decorated function through Django 6.0's official `django.tasks` API (`enqueue()`, `get_result()`), executed by `qraft.backend.QraftTaskBackend` on the normal Qraft pipeline. Prints the status transitions and the return value. The demo environment requires Django >= 6.0.
-
-### Priority: High-Priority Task Passes a Backlog
-
-```bash
-uv run python manage.py demo priority
-```
-
-Queues five slow low-priority tasks, then one high-priority task. The cluster broker is `qraft.brokers.QraftOrmBroker`, which drains the high lane first; the completion order shows the high task finishing ahead of the backlog.
-
-### Progress: Live Progress Polling
-
-```bash
-uv run python manage.py demo progress [--steps 5] [--delay 0.5]
-```
-
-A slow task calls `report_progress()` on each step; the command polls `QraftTask.progress` and prints each change live.
-
-### Perf: Threading Performance Comparison
-
-This demo compares **baseline Django-Q2** (no threading) vs **Qraft's multithreaded workers** side-by-side.
-
-**Setup (requires three terminal windows):**
-
-```bash
-# Terminal 1: Start baseline cluster (standard Django-Q2)
-uv run python manage.py qraftcluster
-
-# Terminal 2: Start Qraft cluster (with threading)
-Q_CLUSTER_NAME=qraft uv run python manage.py qraftcluster
-
-# Terminal 3: Run the benchmark
-uv run python manage.py demo perf -n 20 --duration 1.0
-```
-
-**What it does:**
-- Queues 20 identical tasks to BOTH clusters
-- Each task sleeps for 1.0 second (simulates I/O-bound work)
-- Measures and compares completion times
-
-**Expected results:**
-- **Baseline** (2 workers, no threading): ~10 seconds (2 tasks at a time)
-- **Qraft** (2 workers x 4 threads): ~2.5 seconds (8 tasks at a time)
-- **Speedup**: ~4x improvement
-
-## Using PostgreSQL
-
-SQLite works for demos but has concurrency limitations. For production-like testing:
-
-```bash
-# Option 1: Environment variables
-export POSTGRES_DB=qraft_demo
-export POSTGRES_USER=postgres
-export POSTGRES_PASSWORD=postgres
-export POSTGRES_HOST=localhost
-
-# Option 2: .env file (recommended)
-cat > .env <<EOF
-DEMO_USE_POSTGRES=1
-POSTGRES_DB=qraft_demo
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=your_password
-POSTGRES_HOST=localhost
-EOF
-
-uv run python manage.py migrate
-uv run python manage.py qraftcluster
-```
-
-## Cluster Configuration
-
-The demo uses a **dual-cluster** setup for performance comparisons:
-
-```python
-# Django-Q2 cluster config
-Q_CLUSTER = {
-    "name": "baseline",
-    "workers": 2,
-    "timeout": 300,
-    "retry": 600,
-    "orm": "default",
-    "ALT_CLUSTERS": {
-        "qraft": {
-            "name": "qraft",
-            "workers": 2,
-            "timeout": 300,
-            "retry": 600,
-            "orm": "default",
-        }
-    },
-}
-
-# Qraft-specific settings
-QRAFT_CLUSTER = {
-    "threads": 1,           # Baseline: no threading
-    "max_inflight": 2,
-    "retry_defaults": {
-        "max_attempts": 3,
-        "delay": 2.0,
-        "backoff": "exponential",
-        "jitter": True,
-    },
-    "ALT_CLUSTERS": {
-        "qraft": {
-            "threads": 4,       # 4 threads per worker = 8 concurrent
-            "max_inflight": 8,
-        }
-    },
-}
-```
-
-**Running specific clusters:**
-```bash
-# Start baseline cluster
-uv run python manage.py qraftcluster
-
-# Start Qraft cluster (in separate terminal)
-Q_CLUSTER_NAME=qraft uv run python manage.py qraftcluster
-```
-
-**Tuning guidelines:**
-- **I/O-bound tasks** (API calls, DB queries, file I/O): Increase `threads` (e.g., 8-16)
-- **CPU-bound tasks** (data processing, computations): Increase `workers`, keep `threads=1`
-- **max_inflight**: Should be >= `workers * threads` for full utilization
+- The two reaper scenarios kill a real worker process, then push its last
+  heartbeat 300 seconds into the past. qraft floors the heartbeat grace period
+  at 90 seconds (`qraft.reaper.MIN_HEARTBEAT_GRACE`) and does not expose it as
+  a setting, so the alternative is 90 seconds of idling per scenario. The kill
+  and the reclaim are real; only the clock is moved.
+- `core.jitter` and `dt.priority` are in-process checks against the library,
+  not end-to-end runs. Each says so in its own output.
+- Retry delays are asserted on the ETA qraft writes to the retry `Schedule`,
+  not on arrival. django-q2's sentinel runs its scheduler on a fixed
+  30-second cycle, so a backoff shorter than that is rounded up on delivery
+  and the three strategies are indistinguishable by arrival time alone.
+  `core.backoff` also checks that no retry arrives *before* its ETA.
+- `wf.approval` counts `on_cancelled` dispatches globally rather than per
+  run: qraft calls that hook with no arguments, so it cannot be told which
+  workflow was cancelled. `cancel()` does not dispatch it at all — only
+  `QraftChain.reject()` does.

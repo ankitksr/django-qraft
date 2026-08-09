@@ -1,0 +1,404 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qraft monitor</title>
+<style>
+:root {
+  --bg: #0e1116; --panel: #161b22; --panel2: #1c2129; --line: #2a313c;
+  --ink: #e6edf3; --dim: #8b949e; --faint: #6e7681;
+  --ok: #3fb950; --bad: #f85149; --warn: #d29922; --run: #58a6ff;
+  --idle: #6e7681; --gone: #a371f7;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+:root[data-theme="light"] {
+  --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --line: #d0d7de;
+  --ink: #1f2328; --dim: #57606a; --faint: #8c959f;
+  --ok: #1a7f37; --bad: #cf222e; --warn: #9a6700; --run: #0969da; --gone: #8250df;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 13px/1.5 var(--mono);
+}
+a { color: var(--run); }
+header {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 5;
+}
+header h1 { font-size: 14px; margin: 0; letter-spacing: .04em; }
+header h1 span { color: var(--dim); font-weight: 400; }
+.spacer { flex: 1; }
+.pill {
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px;
+  color: var(--dim); font-size: 11px; white-space: nowrap;
+}
+.pill.live { color: var(--ok); border-color: var(--ok); }
+button {
+  font: inherit; font-size: 11px; cursor: pointer; color: var(--ink);
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 9px;
+}
+button:hover:not(:disabled) { border-color: var(--run); color: var(--run); }
+button:disabled { opacity: .45; cursor: default; }
+
+main { display: grid; grid-template-columns: 300px 1fr; gap: 12px; padding: 12px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+section {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 12px; overflow: hidden;
+}
+section > h2 {
+  margin: 0; padding: 8px 12px; font-size: 11px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--dim);
+  border-bottom: 1px solid var(--line); background: var(--panel2);
+  display: flex; align-items: center; gap: 8px;
+}
+section > h2 .count { color: var(--faint); font-weight: 400; }
+.body { padding: 8px 12px; }
+.scroll { max-height: 420px; overflow: auto; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 4px 12px; border-bottom: 1px solid var(--line); }
+th { color: var(--faint); font-weight: 400; font-size: 11px; position: sticky; top: 0;
+     background: var(--panel2); }
+tbody tr:hover { background: var(--panel2); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--dim); }
+.faint { color: var(--faint); }
+
+.tiles { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+.tile {
+  flex: 1 1 90px; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px;
+}
+.tile b { display: block; font-size: 20px; font-weight: 500; line-height: 1.1;
+          font-variant-numeric: tabular-nums; }
+.tile span { font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--faint); }
+
+.s { padding: 0 6px; border-radius: 4px; font-size: 11px; white-space: nowrap;
+     border: 1px solid transparent; }
+.s-succeeded, .s-passed, .s-SUCCESSFUL { color: var(--ok); border-color: var(--ok); }
+.s-failed, .s-exhausted, .s-error, .s-FAILED { color: var(--bad); border-color: var(--bad); }
+.s-running, .s-RUNNING { color: var(--run); border-color: var(--run); }
+.s-pending, .s-READY, .s-skipped { color: var(--idle); border-color: var(--idle); }
+.s-waiting_approval { color: var(--warn); border-color: var(--warn); }
+.s-cancelled { color: var(--gone); border-color: var(--gone); }
+
+.scenario { border-bottom: 1px solid var(--line); }
+.scenario:last-child { border-bottom: 0; }
+.scn-head {
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+}
+.scn-head .key { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.grp { padding: 5px 12px 3px; font-size: 10px; letter-spacing: .1em;
+       text-transform: uppercase; color: var(--faint); background: var(--panel2); }
+
+details.run { border-bottom: 1px solid var(--line); }
+details.run > summary {
+  cursor: pointer; padding: 5px 12px; display: flex; gap: 8px; align-items: center;
+  list-style: none;
+}
+details.run > summary::-webkit-details-marker { display: none; }
+details.run > summary:hover { background: var(--panel2); }
+details.run .title { flex: 1; color: var(--dim); overflow: hidden;
+                     text-overflow: ellipsis; white-space: nowrap; }
+.checks { padding: 4px 12px 10px 26px; background: var(--panel2); }
+.checks div { padding: 1px 0; }
+.checks .ok::before { content: "✓ "; color: var(--ok); }
+.checks .no::before { content: "✗ "; color: var(--bad); }
+.checks .no { color: var(--bad); }
+.checks .note::before { content: "· "; color: var(--faint); }
+.checks .note { color: var(--dim); }
+.checks .detail { color: var(--faint); }
+
+.wf { border-bottom: 1px solid var(--line); padding: 7px 12px; }
+.wf:last-child { border-bottom: 0; }
+.wf-head { display: flex; gap: 8px; align-items: center; }
+.wf-head .kind { color: var(--dim); text-transform: uppercase; font-size: 10px;
+                 letter-spacing: .08em; }
+.bar { height: 4px; background: var(--panel2); border-radius: 2px; margin: 5px 0 4px;
+       overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; }
+.bar .g { background: var(--ok); }
+.bar .r { background: var(--bad); }
+.members { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 10px; padding: 0 5px; border-radius: 3px;
+        border: 1px solid var(--line); color: var(--dim); }
+.chip.succeeded { color: var(--ok); border-color: var(--ok); }
+.chip.failed, .chip.exhausted { color: var(--bad); border-color: var(--bad); }
+.chip.running { color: var(--run); border-color: var(--run); }
+.chip.gated::after { content: " ⏸"; color: var(--warn); }
+
+.feed { max-height: 260px; overflow: auto; padding: 4px 0; }
+.feed div { padding: 1px 12px; white-space: nowrap; overflow: hidden;
+            text-overflow: ellipsis; }
+.feed .k { color: var(--faint); }
+.empty { padding: 12px; color: var(--faint); }
+.legend { padding: 8px 12px; color: var(--faint); font-size: 11px; line-height: 1.7; }
+</style>
+</head>
+<body>
+{% csrf_token %}
+<header>
+  <h1>QRAFT <span>monitor</span></h1>
+  <span class="pill" id="clusters">clusters —</span>
+  <span class="pill" id="queued">queue —</span>
+  <span class="spacer"></span>
+  <span class="pill live" id="beat">polling</span>
+  <button id="theme">light</button>
+  <a href="/admin/qraft/" target="_blank"><button>qraft admin</button></a>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>Scenarios <span class="count" id="scn-count"></span>
+        <span class="spacer"></span>
+        <button id="run-all">run all</button>
+      </h2>
+      <div class="scroll" id="scenarios">
+        {% regroup scenarios by group as groups %}
+        {% for g in groups %}
+          <div class="grp">{{ g.grouper }}</div>
+          {% for s in g.list %}
+            <div class="scenario" title="{{ s.proves }}">
+              <div class="scn-head">
+                <span class="key">{{ s.key }}</span>
+                <span class="s" data-result="{{ s.key }}"></span>
+                <button data-run="{{ s.key }}">run</button>
+              </div>
+            </div>
+          {% endfor %}
+        {% endfor %}
+      </div>
+    </section>
+
+    <section>
+      <h2>Rate buckets</h2>
+      <div id="buckets"><div class="empty">none yet</div></div>
+    </section>
+
+    <section>
+      <h2>Usage and cost</h2>
+      <div id="usage"><div class="empty">none yet</div></div>
+    </section>
+
+    <section>
+      <h2>Cluster profiles</h2>
+      <div class="legend">
+        {% for name, why in profiles.items %}<b>{{ name }}</b> — {{ why }}<br>{% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>Queue</h2>
+      <div class="tiles" id="tiles"></div>
+    </section>
+
+    <section>
+      <h2>Scenario results <span class="count" id="run-count"></span></h2>
+      <div class="scroll" id="runs"><div class="empty">nothing has run yet</div></div>
+    </section>
+
+    <section>
+      <h2>Workflows <span class="count" id="wf-count"></span></h2>
+      <div class="scroll" id="workflows"><div class="empty">none yet</div></div>
+    </section>
+
+    <section>
+      <h2>Tasks <span class="count" id="task-count"></span></h2>
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th>id</th><th>function</th><th>status</th><th>pri</th>
+            <th class="num">try</th><th class="num">age</th>
+            <th class="num">beat</th><th>progress</th><th>error</th>
+          </tr></thead>
+          <tbody id="tasks"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Dead letters <span class="count" id="dlq-count"></span></h2>
+      <div id="dlq"><div class="empty">nothing dead</div></div>
+    </section>
+
+    <section>
+      <h2>Task and hook events</h2>
+      <div class="feed" id="events"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const CSRF = document.querySelector("[name=csrfmiddlewaretoken]").value;
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value == null ? "" : value)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const chip = (status) => `<span class="s s-${esc(status)}">${esc(status)}</span>`;
+
+$("theme").onclick = () => {
+  const root = document.documentElement;
+  const next = root.dataset.theme === "dark" ? "light" : "dark";
+  root.dataset.theme = next;
+  $("theme").textContent = next === "dark" ? "light" : "dark";
+  localStorage.setItem("qraft-theme", next);
+};
+const saved = localStorage.getItem("qraft-theme");
+if (saved) { document.documentElement.dataset.theme = saved;
+             $("theme").textContent = saved === "dark" ? "light" : "dark"; }
+
+async function start(key) {
+  await fetch(`/scenarios/${key}/run/`, {
+    method: "POST", headers: {"X-CSRFToken": CSRF},
+  });
+  poll();
+}
+document.querySelectorAll("[data-run]").forEach((button) => {
+  button.onclick = () => start(button.dataset.run);
+});
+$("run-all").onclick = async () => {
+  for (const button of document.querySelectorAll("[data-run]")) {
+    await start(button.dataset.run);
+    // One at a time: the scenarios share one database and one set of clusters.
+    await new Promise((resolve) => {
+      const timer = setInterval(async () => {
+        const state = await (await fetch("/api/state/")).json();
+        if (!state.active.length) { clearInterval(timer); resolve(); }
+      }, 1000);
+    });
+  }
+};
+
+const TILES = ["pending", "running", "succeeded", "failed", "exhausted"];
+
+function render(state) {
+  $("clusters").textContent = "clusters " + (state.clusters.join(" ") || "none");
+  $("queued").textContent = `queue ${state.queued} · scheduled ${state.scheduled}`;
+
+  $("tiles").innerHTML = TILES.map((name) =>
+    `<div class="tile"><b class="s-${name}" style="color:var(--ink)">${state.counts[name] || 0}</b><span>${name}</span></div>`
+  ).join("");
+
+  $("task-count").textContent = state.tasks.length;
+  $("tasks").innerHTML = state.tasks.map((task) => `<tr>
+    <td class="faint">${esc(task.short)}</td>
+    <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}</td>
+    <td>${chip(task.status)}</td>
+    <td class="faint">${task.priority === "default" ? "" : esc(task.priority)}</td>
+    <td class="num">${task.attempts}${task.max_attempts ? `<span class="faint">/${task.max_attempts}</span>` : ""}</td>
+    <td class="num muted">${task.elapsed}s</td>
+    <td class="num faint">${task.heartbeat == null ? "" : task.heartbeat + "s"}</td>
+    <td class="muted">${esc(task.progress)} <span class="faint">${esc(task.message)}</span></td>
+    <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
+  </tr>`).join("") || `<tr><td colspan="9" class="empty">no tasks yet</td></tr>`;
+
+  $("wf-count").textContent = state.workflows.length;
+  $("workflows").innerHTML = state.workflows.map((wf) => {
+    const c = wf.counters, total = c.total || 1;
+    return `<div class="wf">
+      <div class="wf-head"><span class="kind">${esc(wf.kind)}</span>
+        <span class="faint">${esc(wf.short)}</span>${chip(wf.status)}
+        <span class="spacer"></span>
+        <span class="muted">${c.completed}/${c.total}</span></div>
+      <div class="bar">
+        <i class="g" style="width:${(c.success / total) * 100}%"></i>
+        <i class="r" style="width:${(c.failure / total) * 100}%"></i>
+      </div>
+      <div class="members">${wf.members.map((m) =>
+        `<span class="chip ${esc(m.status)}${m.gated ? " gated" : ""}">${esc(m.label)}</span>`
+      ).join("")}</div>
+    </div>`;
+  }).join("") || `<div class="empty">no workflows yet</div>`;
+
+  $("dlq-count").textContent = state.dlq.length;
+  $("dlq").innerHTML = state.dlq.length ? `<table><thead><tr>
+      <th>id</th><th>function</th><th>status</th><th class="num">tries</th>
+      <th>key</th><th></th></tr></thead><tbody>` + state.dlq.map((task) => `<tr>
+      <td class="faint">${esc(task.short)}</td><td>${esc(task.func)}</td>
+      <td>${chip(task.status)}</td><td class="num">${task.attempts}</td>
+      <td class="faint">${esc(task.key)}</td>
+      <td><button data-requeue="${esc(task.id)}">requeue</button></td>
+    </tr>`).join("") + `</tbody></table>` : `<div class="empty">nothing dead</div>`;
+  document.querySelectorAll("[data-requeue]").forEach((button) => {
+    button.onclick = async () => {
+      button.disabled = true;
+      await fetch(`/dlq/${button.dataset.requeue}/requeue/`,
+                  {method: "POST", headers: {"X-CSRFToken": CSRF}});
+      poll();
+    };
+  });
+
+  const buckets = state.buckets;
+  $("buckets").innerHTML = buckets.length
+    ? `<table><tbody>` + buckets.map((b) =>
+        `<tr><td>${esc(b.key)}</td><td class="num muted">${b.tokens}</td></tr>`
+      ).join("") + `</tbody></table>`
+    : `<div class="empty">none yet</div>`;
+
+  const usage = Object.entries(state.usage);
+  $("usage").innerHTML = usage.length
+    ? `<table><tbody>` + usage.map(([key, value]) =>
+        `<tr><td class="muted">${esc(key)}</td><td class="num">${value}</td></tr>`
+      ).join("") + `</tbody></table>`
+    : `<div class="empty">none yet</div>`;
+
+  $("events").innerHTML = state.events.map((event) =>
+    `<div><span class="k">${event.at} ${esc(event.kind)}</span> ${esc(event.name)}</div>`
+  ).join("") || `<div class="empty">nothing yet</div>`;
+
+  const latest = {};
+  for (const run of state.runs) { if (!(run.key in latest)) latest[run.key] = run; }
+  document.querySelectorAll("[data-result]").forEach((slot) => {
+    const run = latest[slot.dataset.result];
+    const active = state.active.includes(slot.dataset.result);
+    slot.className = "s s-" + (active ? "running" : run ? run.status : "");
+    slot.textContent = active ? "running" : run ? `${run.passed}/${run.total}` : "";
+  });
+  document.querySelectorAll("[data-run]").forEach((button) => {
+    button.disabled = state.active.length > 0;
+  });
+
+  $("run-count").textContent = state.runs.length;
+  $("runs").innerHTML = state.runs.map((run) => `<details class="run">
+    <summary>${chip(run.status)} <b>${esc(run.key)}</b>
+      <span class="title">${esc(run.title)}</span>
+      <span class="muted">${run.passed}/${run.total}</span>
+      <span class="faint">${run.duration}s</span></summary>
+    <div class="checks">
+      ${run.checks.map((c) => `<div class="${c.ok ? "ok" : "no"}">${esc(c.name)}
+        ${c.detail && !c.ok ? `<span class="detail">— ${esc(c.detail)}</span>` : ""}</div>`).join("")}
+      ${run.notes.map((n) => `<div class="note">${esc(n)}</div>`).join("")}
+      ${run.error ? `<div class="no">${esc(run.error)}</div>` : ""}
+    </div>
+  </details>`).join("") || `<div class="empty">nothing has run yet</div>`;
+}
+
+let failures = 0;
+async function poll() {
+  try {
+    const response = await fetch("/api/state/");
+    render(await response.json());
+    failures = 0;
+    $("beat").textContent = "polling";
+    $("beat").classList.add("live");
+  } catch (error) {
+    failures += 1;
+    $("beat").textContent = `offline (${failures})`;
+    $("beat").classList.remove("live");
+  }
+}
+$("scn-count").textContent = document.querySelectorAll("[data-run]").length;
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

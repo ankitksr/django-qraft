@@ -1,257 +1,220 @@
 """
-Demo tasks showcasing Qraft's features.
+Task functions for the demo scenarios.
 
-Each task is designed to demonstrate a specific capability:
-- noop_task: Simple no-op (tests workflows)
-- slow_task: I/O-bound work (benefits from threading)
-- flaky_task: Random failures (tests hooks)
-- countdown_task: Fails N times then succeeds (tests retries)
-- throttled_task: DB token bucket + rate-limit-aware retries
-- llm_task: Token/cost accounting and progress reporting
-- charge_task: Idempotency-key deduplication
-- review_task / publish_task: Approval-gated chain steps
-- summarize_task: django.tasks (@task) API demo target
-- progress_task: Reports incremental progress over several steps
+Everything here runs inside a worker process. The only way a scenario can see
+what happened is an `Event` row, so every task records one before it does
+anything else.
 """
 
 import logging
-import random
+import os
 import time
 
-from django.tasks import task
+from django.db.models import F
 
 from qraft.context import record_usage, report_progress
 from qraft.throttle import throttled
+from showcase.models import Control, Event
 
-_log = logging.getLogger("showcase")
+_logger = logging.getLogger("showcase")
 
-# Bucket key shared by the rate-limit demo. Tiny rate + capacity 1 means the
-# first task through takes the only token and everything after it is denied.
-RATE_BUCKET_KEY = "mock-llm-provider"
-RATE_BUCKET_RATE = 0.01
-RATE_BUCKET_CAPACITY = 1.0
+# Shared token bucket for the throttle scenario. Fixed at import time so every
+# worker process in every cluster agrees on the same limit.
+THROTTLE_KEY = "mock-provider"
+THROTTLE_RATE = 2.0
+THROTTLE_CAPACITY = 2.0
 
 
 class TransientError(Exception):
-    """A recoverable error that should trigger retries."""
-
-    pass
+    """Recoverable failure. Retried by default."""
 
 
 class PermanentError(Exception):
-    """A non-recoverable error that should NOT be retried."""
-
-    pass
+    """Unrecoverable failure. Used to prove skip_exceptions/retry_exceptions."""
 
 
-# =============================================================================
-# Tasks
-# =============================================================================
-
-
-def noop_task(value=None) -> dict:
+class RateLimitError(Exception):
     """
-    A simple no-op task that immediately returns.
+    Provider rate-limit failure.
 
-    Used for testing workflow primitives without I/O overhead.
+    The class name is in `qraft.retry.RATE_LIMIT_EXCEPTIONS`, so qraft treats
+    it as retryable even under a restrictive allow-list and looks for a
+    Retry-After hint in the message.
     """
-    return {"value": value}
 
 
-def slow_task(duration: float = 1.0) -> dict:
-    """
-    Simulates I/O-bound work (API calls, DB queries, file I/O).
-
-    This is where Qraft's threading shines - multiple slow_tasks can
-    run concurrently within a single worker process.
-    """
-    time.sleep(duration)
-    return {"slept": duration}
+def record(run: str, kind: str, name: str, **payload) -> Event:
+    """Write one observable fact to the database for a scenario to read back."""
+    return Event.objects.create(run=run, kind=kind, name=name, payload=payload)
 
 
-def flaky_task(fail_rate: float = 0.5) -> dict:
-    """
-    Randomly fails based on fail_rate (0.0 to 1.0).
-
-    Useful for testing dual-phase hooks - you'll see both success
-    and failure hooks fire depending on the outcome.
-    """
-    if random.random() < fail_rate:
-        raise TransientError(f"Random failure (rate={fail_rate})")
-    return {"status": "success", "fail_rate": fail_rate}
+def bump(key: str) -> int:
+    """Increment a cross-process counter and return its new value."""
+    Control.objects.get_or_create(key=key)
+    Control.objects.filter(key=key).update(counter=F("counter") + 1)
+    return Control.objects.values_list("counter", flat=True).get(key=key)
 
 
-def countdown_task(task_id: str, fail_times: int = 2) -> dict:
-    """
-    Fails exactly `fail_times` before succeeding.
+def flag(key: str, default=None):
+    """Read a switch a scenario set from the other process."""
+    row = Control.objects.filter(key=key).first()
+    return row.value if row else default
 
-    Perfect for testing retry policies - set max_attempts > fail_times
-    to see the task eventually succeed after retries.
 
-    Attempt tracking uses QraftTaskAttempt records in the database so it
-    works correctly across multiple worker processes. When attempt N runs,
-    attempts 1..N-1 already exist (created by the hook handler after each
-    prior attempt completed), so ``count() + 1`` gives the current number.
+# --- basic tasks ----------------------------------------------------------
 
-    Args:
-        task_id: Unique identifier to track attempts across retries
-        fail_times: Number of times to fail before succeeding
-    """
-    from qraft.models import QraftTask
 
-    qraft_task = QraftTask.objects.filter(
-        func="showcase.tasks.countdown_task", task_args__0=task_id
-    ).latest("date_created")
-    attempt = qraft_task.attempts.count() + 1
+def ping(run: str = "boot") -> dict:
+    """Readiness probe: proves a cluster is draining its lane."""
+    return {"pid": os.getpid()}
 
+
+def ok_task(run: str, label: str, value=None) -> dict:
+    """Succeed, and say so."""
+    record(run, Event.TASK, label, pid=os.getpid(), value=value)
+    return {"label": label, "value": value}
+
+
+def sleep_task(run: str, label: str, seconds: float = 0.5) -> dict:
+    """I/O-bound stand-in: holds a worker slot without burning CPU."""
+    time.sleep(seconds)
+    record(run, Event.TASK, label, pid=os.getpid(), seconds=seconds)
+    return {"label": label, "slept": seconds}
+
+
+def fail_task(run: str, label: str, error: str = "TransientError") -> None:
+    """Always fail, with a chosen exception class."""
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt, outcome="raise")
+    raise _ERRORS[error](f"{label} failed on attempt {attempt}")
+
+
+def flaky_task(run: str, label: str, fail_times: int = 2) -> dict:
+    """Fail the first `fail_times` attempts, then succeed."""
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
     if attempt <= fail_times:
-        _log.info(
-            "countdown_task %s: attempt %d/%d FAILED", task_id, attempt, fail_times
+        raise TransientError(f"{label} failed on attempt {attempt}")
+    return {"label": label, "attempt": attempt}
+
+
+def rate_limited_task(run: str, label: str, retry_after: int = 5, fail_times: int = 1):
+    """
+    Fail with a provider-style rate-limit error carrying a Retry-After hint.
+
+    qraft parses the hint out of the traceback text and uses it as the retry
+    delay instead of the configured backoff.
+    """
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
+    if attempt <= fail_times:
+        raise RateLimitError(
+            f"{label} throttled by provider, Retry-After: {retry_after}"
         )
-        raise TransientError(f"Attempt {attempt}/{fail_times}")
-
-    _log.info("countdown_task %s: attempt %d SUCCESS", task_id, attempt)
-    return {"task_id": task_id, "attempts": attempt}
+    return {"label": label, "attempt": attempt}
 
 
-def permanent_fail_task() -> None:
+def crash_task(run: str, label: str, hold: float = 120.0) -> dict:
     """
-    Always raises PermanentError.
+    Publish this worker's PID, then hold the slot.
 
-    Use with skip_exceptions=["PermanentError"] to test skipping retries.
+    The durability scenarios read the PID back and send a real SIGKILL, so the
+    orphan reaper has a genuinely dead worker to reclaim.
     """
-    raise PermanentError("This error should not be retried")
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
+    if flag(f"{run}:{label}:crash", {}).get("stop_crashing"):
+        return {"label": label, "attempt": attempt, "survived": True}
+    time.sleep(hold)
+    return {"label": label, "attempt": attempt, "survived": True}
 
 
-@throttled(key=RATE_BUCKET_KEY, rate=RATE_BUCKET_RATE, capacity=RATE_BUCKET_CAPACITY)
-def throttled_task(label: str) -> dict:
+def crash_on_attempt(
+    run: str, label: str, crash_attempt: int = 2, hold: float = 90.0
+) -> dict:
     """
-    Gated behind a shared DB token bucket.
+    Fail normally, then hang on `crash_attempt` so that attempt can be killed.
 
-    Raises `qraft.throttle.RateLimited` when the bucket is empty. RateLimited
-    is a known rate-limit exception, so Qraft reschedules it with rate-limit
-    backoff instead of counting it as an ordinary hard failure.
+    The attempt that hangs is reached through a retry Schedule, so its
+    QraftTaskAttempt row is created by the marker lease rather than by
+    async_task(). That is the path the reaper has to be able to see.
     """
-    _log.info("throttled_task %s: token acquired, calling mock-llm", label)
-    return {"label": label, "provider": "mock-llm"}
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
+    if attempt < crash_attempt:
+        raise TransientError(f"{label} failed on attempt {attempt}")
+    if attempt == crash_attempt and not flag(f"{run}:{label}:crash", {}).get(
+        "stop_crashing"
+    ):
+        time.sleep(hold)
+    return {"label": label, "attempt": attempt}
 
 
-def llm_task(prompt: str, calls: int = 2) -> dict:
-    """
-    Simulates an agent loop against a mock LLM, recording usage per call.
-
-    `record_usage()` accumulates numeric fields across calls within the same
-    attempt, so the totals below are the sum of all `calls` iterations.
-    """
-    total_in = total_out = 0
-    for step in range(calls):
-        report_progress(
-            current=step + 1, total=calls, message=f"calling mock-llm ({prompt})"
-        )
-        input_tokens = 120 + 10 * step
-        output_tokens = 40 + 5 * step
-        record_usage(
-            model="mock-llm",
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=round((input_tokens * 3e-6) + (output_tokens * 1.5e-5), 6),
-        )
-        total_in += input_tokens
-        total_out += output_tokens
-
-    _log.info(
-        "llm_task %s: %d calls, %d in / %d out tokens",
-        prompt,
-        calls,
-        total_in,
-        total_out,
+@throttled(key=THROTTLE_KEY, rate=THROTTLE_RATE, capacity=THROTTLE_CAPACITY)
+def throttled_task(run: str, label: str) -> dict:
+    """Gated behind a database token bucket shared by every cluster."""
+    record(
+        run,
+        Event.TASK,
+        label,
+        pid=os.getpid(),
+        cluster=os.environ.get("Q_CLUSTER_NAME", "default"),
     )
-    return {"prompt": prompt, "calls": calls}
+    return {"label": label}
 
 
-def charge_task(customer: str, amount: float) -> dict:
-    """
-    Stands in for a non-repeatable side effect (charging Mockco's card).
-
-    Enqueue it with an `idempotency_key` so a duplicate request never
-    produces a second charge.
-    """
-    _log.info("charge_task: charging %s %.2f", customer, amount)
-    return {"customer": customer, "amount": amount}
+# --- AI-workload tasks ----------------------------------------------------
 
 
-@task
-def summarize_task(document: str) -> dict:
-    """
-    Enqueued via the official django.tasks API (`summarize_task.enqueue(...)`),
-    engined by `qraft.backend.QraftTaskBackend` on top of the normal Qraft
-    pipeline (QraftTask/QraftTaskAttempt rows, hook handler, etc).
-    """
-    _log.info("summarize_task: summarizing %s", document)
-    return {"document": document, "summary": f"{document} (mock-llm summary)"}
+def llm_task(run: str, label: str, calls: int = 2) -> dict:
+    """Mock LLM call loop that reports token usage and cost per call."""
+    record(run, Event.TASK, label, pid=os.getpid())
+    for index in range(calls):
+        report_progress(current=index + 1, total=calls, message=f"call {index + 1}")
+        record_usage(
+            model="mock-llm-v1",
+            input_tokens=100,
+            output_tokens=25,
+            cost_usd=0.002,
+        )
+    return {"label": label, "calls": calls}
 
 
-def progress_task(steps: int = 5, delay: float = 0.5) -> dict:
-    """
-    Slow task that reports incremental progress via report_progress().
-
-    A caller can poll `QraftTask.progress` while this runs to watch the
-    current/total counters change in near real time.
-    """
+def progress_task(run: str, label: str, steps: int = 4, delay: float = 0.3) -> dict:
+    """Report progress step by step so a watcher can see it move."""
+    record(run, Event.TASK, label, pid=os.getpid())
     for step in range(1, steps + 1):
         report_progress(current=step, total=steps, message=f"step {step}/{steps}")
         time.sleep(delay)
-    return {"steps": steps}
+    return {"label": label, "steps": steps}
 
 
-def review_task(document: str) -> dict:
-    """Draft step of the approval chain: produces something a human signs off."""
-    _log.info("review_task: drafted %s", document)
-    return {"document": document, "state": "drafted"}
+# --- workflow steps -------------------------------------------------------
 
 
-def publish_task(document: str) -> dict:
-    """Approval-gated step: only runs after chain.approve()."""
-    _log.info("publish_task: published %s", document)
-    return {"document": document, "state": "published"}
+def step_task(run: str, label: str, step: int) -> dict:
+    """A chain step. The Event ordering is what proves sequential execution."""
+    record(run, Event.STEP, label, pid=os.getpid(), step=step)
+    return {"label": label, "step": step}
 
 
-# =============================================================================
-# Hooks
-# =============================================================================
+def gated_step_task(run: str, label: str, step: int) -> dict:
+    """
+    A chain step that fails until a scenario clears its gate.
+
+    Used by the resume scenario: fail, fix the cause, resume from the failed
+    step rather than from the top of the chain.
+    """
+    attempt = bump(f"{run}:{label}")
+    record(run, Event.STEP, label, pid=os.getpid(), step=step, attempt=attempt)
+    if not flag(f"{run}:gate", {}).get("open"):
+        raise TransientError(f"{label} blocked: gate closed")
+    return {"label": label, "step": step, "attempt": attempt}
 
 
-def on_success(task_id: str) -> None:
-    """Success hook - called when a task completes successfully."""
-    _log.info("SUCCESS HOOK: task_id=%s", task_id)
-
-
-def on_failure(task_id: str) -> None:
-    """Failure hook - called when a task fails (after all retries exhausted)."""
-    _log.info("FAILURE HOOK: task_id=%s", task_id)
-
-
-def on_cancelled(workflow_id: str) -> None:
-    """Cancellation hook - called when a workflow is cancelled."""
-    _log.info("CANCELLED HOOK: workflow_id=%s", workflow_id)
-
-
-def on_progress(
-    *,
-    workflow_id: str,
-    workflow_type: str,
-    completed_count: int,
-    total_count: int,
-    success_count: int,
-    failure_count: int,
-) -> None:
-    """Progress hook - called after each task in a parallel workflow completes."""
-    _log.info(
-        "PROGRESS: %s %s — %d/%d done (S:%d F:%d)",
-        workflow_type,
-        workflow_id,
-        completed_count,
-        total_count,
-        success_count,
-        failure_count,
-    )
+_ERRORS = {
+    "TransientError": TransientError,
+    "PermanentError": PermanentError,
+    "RateLimitError": RateLimitError,
+    "ValueError": ValueError,
+}

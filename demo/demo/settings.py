@@ -1,8 +1,11 @@
 """
-Django settings for the Qraft demo project.
+Settings for the django-qraft demo and verification suite.
 
-Supports both SQLite (quick testing) and PostgreSQL (recommended).
-Set DEMO_USE_POSTGRES=1 to use PostgreSQL.
+One environment variable, ``Q_CLUSTER_NAME``, selects a cluster profile. Both
+django-q2 and qraft read it and apply their own ``ALT_CLUSTERS`` entry, so a
+worker process started with ``Q_CLUSTER_NAME=threaded`` drains the ``threaded``
+broker lane *and* picks up qraft's threaded worker settings. Leaving it unset
+gives the ``default`` profile, which is what the scenario runner itself uses.
 """
 
 import os
@@ -28,13 +31,19 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
 ]
 
+ROOT_URLCONF = "demo.urls"
+WSGI_APPLICATION = "demo.wsgi.application"
+
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -46,115 +55,135 @@ TEMPLATES = [
     },
 ]
 
-ROOT_URLCONF = "demo.urls"
-WSGI_APPLICATION = "demo.wsgi.application"
-STATIC_URL = "/static/"
+STATIC_URL = "static/"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+USE_TZ = True
+TIME_ZONE = "UTC"
 
-# Database configuration
-# PostgreSQL recommended for concurrent task processing
-# SQLite works for basic testing but may have locking issues under load
-if os.environ.get("DEMO_USE_POSTGRES") or os.environ.get("POSTGRES_DB"):
+
+# --- Database -------------------------------------------------------------
+#
+# PostgreSQL is the default. The suite runs a dozen cluster processes against
+# one database and leans on real row locks (`select_for_update`) in the
+# throttle and parallel-workflow paths, which SQLite does not provide.
+# `DEMO_DB=sqlite` still works for a quick look; the scenarios that need real
+# locking say so when they run.
+
+DEMO_DB = os.environ.get("DEMO_DB", "postgres")
+
+if DEMO_DB == "sqlite":
     DATABASES = {
         "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.environ.get("POSTGRES_DB", "qraft_demo"),
-            "USER": os.environ.get("POSTGRES_USER", "postgres"),
-            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
-            "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
-            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
-            "CONN_MAX_AGE": 0,  # Must be 0 with native pooling
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
             "OPTIONS": {
-                "pool": {
-                    "min_size": 2,  # Minimum connections to keep alive
-                    "max_size": 20,  # Conservative pool size to prevent accumulation
-                    "timeout": 10,  # Wait time for available connection (seconds)
-                    "max_lifetime": 300,  # Close connections after 5 minutes (prevents accumulation)
-                    "max_idle": 60,  # Close idle connections after 1 minute (aggressive cleanup)
-                }
+                "timeout": 30,
+                "transaction_mode": "IMMEDIATE",
+                "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
             },
         }
     }
 else:
     DATABASES = {
         "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ.get("DEMO_PG_DB", "qraft_demo"),
+            # Empty host means a local unix socket with peer auth, which is
+            # what a stock Homebrew/apt PostgreSQL gives the current user.
+            "HOST": os.environ.get("DEMO_PG_HOST", ""),
+            "PORT": os.environ.get("DEMO_PG_PORT", ""),
+            "USER": os.environ.get("DEMO_PG_USER", ""),
+            "PASSWORD": os.environ.get("DEMO_PG_PASSWORD", ""),
+            "CONN_MAX_AGE": 0,
         }
     }
 
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-USE_TZ = True
-TIME_ZONE = "UTC"
 
-# Logging
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "simple": {"format": "[%(levelname)s] %(message)s"},
-    },
-    "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
-    },
-    "loggers": {
-        "qraft": {"handlers": ["console"], "level": "DEBUG"},
-        "showcase": {"handlers": ["console"], "level": "INFO"},
-    },
-}
+# --- Django-Q2 ------------------------------------------------------------
 
-# Django-Q2 configuration (ORM broker)
-# Baseline cluster: standard Django-Q2 without threading
-# broker_class is QraftOrmBroker so the "demo priority" scenario's high-lane
-# tasks are actually drained ahead of default/low (see qraft/brokers.py).
 Q_CLUSTER = {
-    "name": "baseline",
-    "workers": 2,
-    "timeout": 300,
-    "retry": 600,
+    # PREFIX. Shared by every profile so payload signing stays compatible
+    # across clusters, and so null-cluster Schedules (DLQ requeue) have one
+    # unambiguous owner.
+    "name": "default",
+    "workers": int(os.environ.get("DEMO_WORKERS", "3")),
+    "timeout": 60,
+    # Qraft owns retries. The broker must not redeliver a failed or in-flight
+    # message underneath it, so the visibility timeout is set far beyond any
+    # scenario's lifetime: the orphan reaper is what reclaims a dead worker's
+    # task, and that is the behaviour under test.
+    "retry": 3600,
+    # Keep every result row. The reaper treats "no django_q Task row" as part
+    # of its orphan test, so trimming completed rows mid-run would corrupt it.
+    "save_limit": 0,
+    "catch_up": False,
     "orm": "default",
     "broker_class": "qraft.brokers.QraftOrmBroker",
-    # Alternative cluster for performance comparison (multi-worker + threading)
+    "label": "Qraft demo",
     "ALT_CLUSTERS": {
-        "qraft": {
-            "name": "qraft",
-            "workers": 2,
-            "timeout": 300,
-            "retry": 600,
-            "orm": "default",
-            "broker_class": "qraft.brokers.QraftOrmBroker",
-        }
+        "threaded": {"workers": 2},
+        "baseline": {"workers": 2},
+        "synchooks": {"workers": 1},
+        "throttle-a": {"workers": 2},
+        "throttle-b": {"workers": 2},
+        # One worker and a one-deep hand-off queue, so completion order is a
+        # faithful reading of dequeue order rather than of worker races.
+        "lanes": {"workers": 1, "queue_limit": 1},
     },
 }
 
-# Official django.tasks (DEP 14, Django 6.0+) API, engined by Qraft. See
-# `demo tasks-api` and docs/django-tasks-backend.md.
-TASKS = {
-    "default": {"BACKEND": "qraft.backend.QraftTaskBackend"},
-}
 
-# Qraft configuration
-# Default configuration for baseline cluster (no threading)
-# Use Q_CLUSTER_NAME environment variable to select alternative configurations
+# --- Qraft ----------------------------------------------------------------
+
 QRAFT_CLUSTER = {
-    "threads": 1,  # Baseline: standard Django-Q2 workers (no threading)
+    "threads": 1,
     "max_inflight": 2,
+    "sync_hooks": False,
+    # Short lease/reap cycles keep the durability scenarios observable in
+    # seconds. Production defaults are 30s/60s.
+    "heartbeat_interval": 2.0,
+    "reap_interval": 5.0,
+    "reap_stale_after": 45.0,
+    # The retention sweep is exercised explicitly by its own scenario, never
+    # on a timer that could prune rows another scenario is still asserting on.
+    "retention_days": None,
     "retry_defaults": {
         "max_attempts": 3,
         "delay": 2.0,
         "backoff": "exponential",
         "jitter": True,
+        "jitter_max": 0.2,
     },
-    # Alternative cluster configurations (selected via Q_CLUSTER_NAME env var)
     "ALT_CLUSTERS": {
-        "qraft": {
-            "threads": 4,  # Qraft: multithreaded workers
-            "max_inflight": 8,
-            "retry_defaults": {
-                "max_attempts": 3,
-                "delay": 2.0,
-                "backoff": "exponential",
-                "jitter": True,
-            },
-        }
+        "threaded": {"threads": 8, "max_inflight": 16},
+        "baseline": {"threads": 1, "max_inflight": 2},
+        "synchooks": {"sync_hooks": True},
+        "throttle-a": {},
+        "throttle-b": {},
+        "lanes": {},
+    },
+}
+
+
+# --- django.tasks (DEP 14, Django 6.0+) -----------------------------------
+
+TASKS = {"default": {"BACKEND": "qraft.backend.QraftTaskBackend"}}
+
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "cluster": {"format": "%(asctime)s %(levelname)-7s %(name)s %(message)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "cluster"},
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+    "loggers": {
+        "qraft": {"level": os.environ.get("DEMO_LOG_LEVEL", "INFO")},
+        "qraft.dispatchers": {"level": os.environ.get("DEMO_LOG_LEVEL", "INFO")},
+        "django-q": {"level": os.environ.get("DEMO_LOG_LEVEL", "INFO")},
+        "showcase": {"level": "INFO"},
     },
 }
