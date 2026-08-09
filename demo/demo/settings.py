@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "django_q",
     "qraft",
+    "qraft.dashboard",
     "showcase",
 ]
 
@@ -167,6 +168,10 @@ QRAFT_CLUSTER = {
         "soak": {"max_inflight": 4},
     },
 }
+
+
+# The demo has no user accounts; open the bundled dashboard up.
+QRAFT_DASHBOARD = {"public": True}
 
 
 # --- django.tasks (DEP 14, Django 6.0+) -----------------------------------

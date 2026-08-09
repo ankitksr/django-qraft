@@ -14,6 +14,20 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django_q",
     "qraft",
+    # No django.contrib.admin on purpose: the dashboard must degrade its
+    # admin deep-links gracefully, and the tests assert that.
+    "qraft.dashboard",
+]
+
+ROOT_URLCONF = "tests.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {},
+    }
 ]
 
 SECRET_KEY = "test-secret-key-for-testing-only"

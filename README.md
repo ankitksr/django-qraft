@@ -241,6 +241,7 @@ task_id = async_task(
 - [Multithreaded Workers](docs/threading.md) - Concurrency for I/O-bound tasks
 - [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, and approval steps
 - [AI Workloads](docs/ai-workloads.md) - Rate limits, throttling, usage accounting, idempotency, reaper, priority lanes
+- [Monitoring Dashboard](docs/dashboard.md) - Bundled staff dashboard with live metrics and JSON endpoints
 - [django.tasks Backend](docs/django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
 
 ### Advanced Topics
