@@ -23,6 +23,9 @@ USE_TZ = True
 Q_CLUSTER = {
     "name": "test",
     "orm": "default",
+    # Priority lanes are only drained by this broker; without it
+    # priority_list_key() correctly refuses to route into them.
+    "broker_class": "qraft.brokers.QraftOrmBroker",
 }
 
 # Only interpreted by Django >= 6.0 (django.tasks / DEP 14); ignored

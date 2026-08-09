@@ -40,12 +40,13 @@ def _broker_supports_receipts(broker) -> bool:
 def _reap_loop() -> None:
     from django.db import close_old_connections
 
-    from .reaper import reap_orphans
+    from .reaper import reap_orphans, rearm_stuck_claims
 
     while True:
         try:
             sleep(get_conf().reap_interval)
             close_old_connections()
+            rearm_stuck_claims()
             reaped = reap_orphans()
             if reaped:
                 _logger.warning("Orphan reaper reclaimed %d attempt(s)", reaped)
@@ -58,16 +59,59 @@ def _reap_loop() -> None:
             close_old_connections()
 
 
+def _scheduler_loop() -> None:
+    from django.db import close_old_connections
+
+    from .scheduler import dispatch_loop
+
+    try:
+        dispatch_loop()
+    except Exception:
+        # dispatch_loop() handles its own per-pass failures, so reaching here
+        # means the loop itself is gone and this cluster no longer serves
+        # delayed attempts. Say so loudly rather than dying quietly.
+        _logger.exception("Scheduler dispatcher stopped")
+    finally:
+        close_old_connections()
+
+
+def _retention_loop() -> None:
+    from django.db import close_old_connections
+
+    from .retention import sweep_retention
+
+    while True:
+        try:
+            sleep(get_conf().retention_interval)
+            close_old_connections()
+            pruned = sweep_retention()
+            if pruned:
+                _logger.info("Retention sweep pruned %s", pruned)
+        except Exception:
+            _logger.exception("Retention sweep failed")
+            sleep(5)
+        finally:
+            close_old_connections()
+
+
 def _monitor_with_reaper(result_queue, broker=None) -> None:
     """
-    Django-Q2 monitor plus the Qraft orphan reaper.
+    Django-Q2 monitor plus Qraft's own background loops: the scheduler
+    dispatcher, the orphan reaper, and the retention sweep.
 
-    The reaper runs as a daemon thread here rather than in the sentinel:
-    the monitor process never forks, while the sentinel forks workers on
-    reincarnation, and mixing a live thread with fork() risks deadlocks
-    (the very hazard django-q2#199 flags).
+    All run as daemon threads here rather than in the sentinel: the monitor
+    process never forks, while the sentinel forks workers on reincarnation,
+    and mixing a live thread with fork() risks deadlocks (the very hazard
+    django-q2#199 flags).
+
+    Every cluster runs a dispatcher. They compete for the same due attempts
+    and the claim decides ownership (see qraft.scheduler), which is what lets
+    an attempt with no recorded cluster be picked up at all.
     """
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
     threading.Thread(target=_reap_loop, daemon=True).start()
+    if get_conf().retention_enabled():
+        threading.Thread(target=_retention_loop, daemon=True).start()
     monitor(result_queue, broker)
 
 
@@ -188,6 +232,10 @@ class QraftCluster(Cluster):
             setproctitle.setproctitle(f"qcluster {current_process().name} {self.name}")
 
         self._warn_if_broker_lacks_receipts()
+
+        from .retention import log_retention_policy
+
+        log_retention_policy()
 
         # Start QraftSentinel instead of standard Sentinel
         self.stop_event = Event()

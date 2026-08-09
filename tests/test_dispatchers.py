@@ -71,10 +71,14 @@ class TestParallelDispatcherIdempotency:
         assert iter_model.success_count == 1
 
     def test_retrying_task_does_not_count_towards_workflow(self, db, iter_model):
-        """A failed attempt whose task will still retry (not EXHAUSTED) is ignored."""
+        """A failed attempt whose task will still retry is ignored.
+
+        schedule_retry() puts the task back to PENDING, so PENDING - not
+        FAILED - is what a retry in flight actually looks like here.
+        """
         task = QraftTask.objects.create(
             func="demo.showcase.tasks.noop_task",
-            status=TaskStatus.FAILED,  # not yet EXHAUSTED - retry pending
+            status=TaskStatus.PENDING,  # retry scheduled, waiting on backoff
             qraft_iter=iter_model,
         )
         attempt = QraftTaskAttempt.objects.create(
@@ -272,11 +276,14 @@ class TestChainDispatcher:
         assert step1.qraft_task is None  # never queued
 
     def test_retry_in_progress_does_not_fail_or_advance_chain(self, db):
-        """Failure while task is still FAILED (not EXHAUSTED) means a retry is
-        pending - the chain must not be failed or advanced."""
+        """A pending retry must not fail or advance the chain.
+
+        schedule_retry() returns the task to PENDING, so that - not FAILED -
+        is what a retry in flight looks like to the dispatcher.
+        """
         chain, (step0, step1) = self._chain_with_steps(2)
         attempt = self._attempt_for_step(
-            step0, success=False, task_status=TaskStatus.FAILED
+            step0, success=False, task_status=TaskStatus.PENDING
         )
 
         with patch("qraft.tasks.q2_async_task") as mock_next_step:
@@ -347,3 +354,177 @@ class TestWorkflowHookDispatchFailureCleanup:
             workflow_id="11111111-1111-1111-1111-111111111111",
             hook_type="failure",
         ).exists()
+
+
+@pytest.mark.django_db
+class TestChainStepLinkOrdering:
+    """
+    A chain step must never be visible as queued-but-unlinked.
+
+    _create_workflow_task() enqueues to Django-Q2 as it goes. If the link to
+    QraftChainStep commits separately, a fast worker can finish the task
+    first; route_workflow_completion() then finds no chain_step, and since
+    workflow tasks carry no task-level hooks the chain stalls at RUNNING.
+    """
+
+    def _chain_with_step(self):
+        chain = QraftChainModel.objects.create(status=WorkflowStatus.RUNNING)
+        step = QraftChainStep.objects.create(
+            chain=chain, step_index=0, func="demo.showcase.tasks.noop_task"
+        )
+        return chain, step
+
+    def test_link_and_enqueue_share_one_transaction(self, db):
+        from qraft.dispatchers import _queue_chain_step
+
+        chain, step = self._chain_with_step()
+
+        with patch("qraft.tasks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-step-0"
+            with patch.object(
+                QraftChainStep, "save", side_effect=RuntimeError("link failed")
+            ):
+                with pytest.raises(RuntimeError):
+                    _queue_chain_step(chain, step)
+
+        # The QraftTask is rolled back with the failed link, rather than
+        # surviving as an enqueued task no dispatcher can route.
+        assert QraftTask.objects.count() == 0
+
+    def test_step_is_linked_once_queued(self, db):
+        from qraft.dispatchers import _queue_chain_step
+
+        chain, step = self._chain_with_step()
+
+        with patch("qraft.tasks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-step-0"
+            _queue_chain_step(chain, step)
+
+        step.refresh_from_db()
+        assert step.qraft_task is not None
+
+    def test_parallel_workflows_link_before_enqueueing(self, db, iter_model):
+        """Iter/batch set the FK inside _create_workflow_task, so they are safe."""
+        from qraft.tasks import _create_workflow_task
+
+        linked_at_enqueue = []
+
+        def _record(*args, **kwargs):
+            linked_at_enqueue.append(
+                QraftTask.objects.filter(qraft_iter=iter_model).count()
+            )
+            return "q2-iter-task"
+
+        with patch("qraft.tasks.q2_async_task", side_effect=_record):
+            _create_workflow_task(
+                func="demo.showcase.tasks.noop_task",
+                args=[],
+                kwargs={},
+                qraft_options={},
+                qraft_iter_id=iter_model.id,
+            )
+
+        assert linked_at_enqueue == [1]
+
+
+@pytest.mark.django_db
+class TestTerminalWithoutRetryPolicy:
+    """
+    A task with no retry policy settles at FAILED, never at EXHAUSTED.
+
+    handle_task_retry() returns early when there is no policy, leaving the
+    status the hook handler wrote. Counting only EXHAUSTED dropped every such
+    task and hung its workflow at RUNNING forever.
+    """
+
+    def test_failed_task_counts_towards_a_parallel_workflow(self, db, iter_model):
+        task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.FAILED,
+            retry_policy={},
+            qraft_iter=iter_model,
+        )
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=1, q2_task_id="q2-nopolicy", success=False
+        )
+
+        with patch("qraft.dispatchers.q2_async_task"):
+            ParallelDispatcher(iter_model, attempt).handle()
+
+        iter_model.refresh_from_db()
+        assert iter_model.completed_count == 1
+        assert iter_model.failure_count == 1
+
+    def test_failed_step_fails_the_chain(self, db):
+        chain = QraftChainModel.objects.create(status=WorkflowStatus.RUNNING)
+        step = QraftChainStep.objects.create(
+            chain=chain, step_index=0, func="demo.showcase.tasks.noop_task"
+        )
+        task = QraftTask.objects.create(func=step.func, status=TaskStatus.FAILED)
+        step.qraft_task = task
+        step.save(update_fields=["qraft_task"])
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="q2-step-nopolicy",
+            success=False,
+        )
+
+        with patch("qraft.dispatchers.q2_async_task"):
+            ChainDispatcher(chain, step, attempt).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.FAILED
+
+
+@pytest.mark.django_db
+class TestCompletionIsDefensive:
+    """An equality test the counter steps over wedges the workflow forever."""
+
+    def test_overshooting_the_total_still_completes(self, db, iter_model):
+        iter_model.completed_count = iter_model.total_count
+        iter_model.save(update_fields=["completed_count"])
+        attempt = _make_attempt("qraft_iter", iter_model, success=True)
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook-overshoot"
+            ParallelDispatcher(iter_model, attempt).handle()
+
+        iter_model.refresh_from_db()
+        assert iter_model.status == WorkflowStatus.SUCCEEDED
+        mock_async.assert_called_once()
+
+
+@pytest.mark.django_db
+class TestReaperRoutesWorkflowCompletion:
+    """A reaped workflow member must still reach its dispatcher."""
+
+    def test_reaped_iter_task_advances_the_workflow(self, db, iter_model, monkeypatch):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from qraft.reaper import reap_orphans
+
+        iter_model.total_count = 1
+        iter_model.save(update_fields=["total_count"])
+        task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.RUNNING,
+            qraft_iter=iter_model,
+        )
+        QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="q2-orphan-iter",
+            heartbeat_at=timezone.now() - timedelta(hours=1),
+        )
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook-reaped"
+            assert reap_orphans() == 1
+
+        iter_model.refresh_from_db()
+        assert iter_model.completed_count == 1
+        assert iter_model.status == WorkflowStatus.FAILED
+        mock_async.assert_called_once()

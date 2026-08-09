@@ -10,6 +10,7 @@ from django.db import IntegrityError, transaction
 from django_q.tasks import async_task as q2_async_task
 
 from qraft.brokers import QraftOrmBroker, priority_list_key
+from qraft.conf import executing_cluster
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.tasks import TaskPriority
 from qraft.retry import RetryPolicy
@@ -71,6 +72,10 @@ def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
             qraft_task=qraft_task,
             attempt_number=1,
             q2_task_id=q2_task_id,
+            # Recorded so later attempts can inherit it. Omitting `cluster`
+            # means django_q resolves the broker against this process's own
+            # cluster name, which is what the fallback spells out.
+            cluster=q2_kwargs.get("cluster") or executing_cluster(),
         )
     return qraft_task, q2_task_id
 
@@ -109,8 +114,11 @@ def async_task(
         hook (str, optional):
             Legacy Django-Q2 hook. Deprecated. If no Qraft hooks are provided,
             this will be treated as a `success_hook` with a warning.
-        group, timeout, ack_failure, broker:
+        group, timeout, broker:
             Same semantics as Django-Q2 async_task.
+        ack_failure:
+            Forced to True - Qraft schedules its own retries, so Django-Q2
+            must never also redeliver a failed message. `False` is rejected.
         save:
             Same as Django-Q2, except `save=False` is rejected: Qraft's hook
             handler resolves completion by reading the saved Django-Q2 Task
@@ -188,6 +196,13 @@ def async_task(
             "never persisted as a Django-Q2 Task row, so the hook handler "
             "has nothing to resolve completion against."
         )
+    if ack_failure is False:
+        raise ValueError(
+            "async_task(ack_failure=False) is not supported: Qraft owns "
+            "retries, and leaving a failed message unacknowledged makes the "
+            "broker redeliver attempt N while Qraft has already scheduled "
+            "attempt N+1. Use qraft_options={'max_attempts': ...} instead."
+        )
 
     if q_options is None:
         q_options = {}
@@ -258,10 +273,12 @@ def async_task(
     cluster = qraft_options.get("cluster")
 
     # Priority lanes: only takes effect against a cluster running
-    # qraft.brokers.QraftOrmBroker (see that module's docstring). Explicit
-    # `broker=` from the caller wins over priority routing.
+    # qraft.brokers.QraftOrmBroker (see that module's docstring). The lane is
+    # keyed off the target cluster because django_q drops `cluster=` whenever
+    # an explicit broker is supplied. Explicit `broker=` from the caller wins
+    # over priority routing.
     if broker is None:
-        list_key = priority_list_key(priority)
+        list_key = priority_list_key(priority, cluster)
         if list_key is not None:
             broker = QraftOrmBroker(list_key=list_key)
 
@@ -271,6 +288,10 @@ def async_task(
     q2_kwargs = {
         "hook": "qraft.hooks.qraft_hook_handler",
         "q_options": q_options,
+        # Qraft owns retries; without this the broker never acknowledges a
+        # failed message and redelivers attempt N while attempt N+1 is
+        # already scheduled.
+        "ack_failure": True,
         **kwargs,
     }
     if cluster is not None:
@@ -285,8 +306,6 @@ def async_task(
         q2_kwargs["save"] = save
     if timeout is not None:
         q2_kwargs["timeout"] = timeout
-    if ack_failure is not None:
-        q2_kwargs["ack_failure"] = ack_failure
     if broker is not None:
         q2_kwargs["broker"] = broker
 
@@ -370,6 +389,8 @@ def _create_workflow_task(
     q2_kwargs = {
         "hook": "qraft.hooks.qraft_hook_handler",
         "group": str(workflow_id) if workflow_id else None,
+        # See async_task(): Qraft's retries must not race Django-Q2 redelivery.
+        "ack_failure": True,
         **kwargs,
     }
     cluster = qraft_options.get("cluster")

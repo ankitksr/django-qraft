@@ -321,3 +321,33 @@ class TestHookDispatcher:
         # Verify hook was called synchronously
         mock_hook.assert_called_once_with(1, 2, key="value")
 
+
+
+@pytest.mark.django_db
+class TestHookRouting:
+    """A hook must land on the cluster whose worker ran the task."""
+
+    def _dispatch(self, qraft_task, qraft_task_attempt):
+        from qraft.hooks import HookDispatcher
+
+        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
+        with patch("qraft.hooks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook-routed"
+            dispatcher._call_hook_async("test.hooks.success", [], {}, "success")
+        return mock_async.call_args[1]
+
+    def test_hook_is_pinned_to_the_executing_cluster(
+        self, qraft_task, qraft_task_attempt
+    ):
+        from django_q.conf import Conf
+
+        # The hook handler runs in the monitor of the cluster that executed
+        # the task, so that cluster's name is the correct destination.
+        assert self._dispatch(qraft_task, qraft_task_attempt)["cluster"] == (
+            Conf.CLUSTER_NAME
+        )
+
+    def test_hook_failures_are_acknowledged(self, qraft_task, qraft_task_attempt):
+        # Nothing retries a hook, so an unacknowledged failure would be
+        # redelivered by the broker forever.
+        assert self._dispatch(qraft_task, qraft_task_attempt)["ack_failure"] is True

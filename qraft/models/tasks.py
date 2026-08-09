@@ -180,6 +180,12 @@ class QraftTaskAttempt(models.Model):
     Each attempt corresponds to a Django-Q2 task execution. This model provides
     an audit trail of all attempts, their outcomes, and exception information
     for debugging and retry decisions.
+
+    An attempt is created either at enqueue time (`async_task()`, state QUEUED)
+    or ahead of it (`qraft.scheduler.schedule_attempt()`, state SCHEDULED with
+    a `not_before` due time). The row therefore always exists before the
+    attempt runs, which is what lets every completion resolve through the one
+    `q2_task_id` lookup.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
@@ -199,7 +205,64 @@ class QraftTaskAttempt(models.Model):
         max_length=32,
         unique=True,
         db_index=True,
-        help_text="Django-Q2 task ID for this attempt",
+        null=True,
+        blank=True,
+        help_text="Django-Q2 task ID for this attempt; null until a dispatcher "
+        "enqueues a SCHEDULED attempt",
+    )
+
+    class AttemptState(models.TextChoices):
+        """Where an attempt sits relative to the broker."""
+
+        SCHEDULED = "scheduled", "Scheduled"  # due at not_before, not yet queued
+        QUEUED = "queued", "Queued"  # handed to the broker
+
+    state = models.CharField(
+        max_length=16,
+        choices=AttemptState.choices,
+        default=AttemptState.QUEUED,
+        # A real database default, not just a Python one: during a rolling
+        # upgrade the previous release is still inserting attempt rows without
+        # this column, and Django drops the temporary default it uses to add
+        # it. Without db_default those inserts fail the NOT NULL constraint.
+        # "queued" is right for them - before this field existed, an attempt
+        # row was only ever created at enqueue time.
+        db_default=AttemptState.QUEUED,
+        help_text="Whether this attempt is still waiting for the dispatcher",
+    )
+
+    not_before = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Earliest time a dispatcher may enqueue this attempt",
+    )
+    claimed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When a dispatcher claimed this attempt and enqueued it",
+    )
+
+    cluster = models.CharField(
+        max_length=150,
+        null=True,
+        blank=True,
+        help_text="Cluster this attempt is routed to; null means whichever "
+        "dispatcher claims it",
+    )
+
+    # Enqueue override for callers whose worker-side entry point is not the
+    # task's own func (currently only the django.tasks TaskContext wrapper).
+    dispatch_func = models.CharField(
+        max_length=256,
+        null=True,
+        blank=True,
+        help_text="Dotted path to enqueue instead of qraft.runner.run_task",
+    )
+    dispatch_args = models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Positional arguments for dispatch_func",
     )
 
     # Outcome
@@ -267,6 +330,10 @@ class QraftTaskAttempt(models.Model):
                 name="unique_attempt_per_task",
             )
         ]
+        indexes = [
+            # The dispatcher's only query: due SCHEDULED attempts, oldest first.
+            models.Index(fields=["state", "not_before"], name="qraft_attempt_due_idx"),
+        ]
 
 
 class RateBucket(models.Model):
@@ -294,3 +361,4 @@ class RateBucket(models.Model):
 # Module-level export for convenience
 TaskStatus = QraftTask.TaskStatus
 TaskPriority = QraftTask.TaskPriority
+AttemptState = QraftTaskAttempt.AttemptState

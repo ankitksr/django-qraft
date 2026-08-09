@@ -14,7 +14,7 @@ from django.db import transaction
 from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
-from .conf import get_conf
+from .conf import executing_cluster, get_conf
 from .retry import QRAFT_MARKER_PREFIX, handle_task_retry
 
 _logger = logging.getLogger("django-q")
@@ -110,18 +110,83 @@ def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
         return None
 
 
+def attempt_from_marker(task_name: str | None, q2_task_id: str):
+    """
+    Get or create the QraftTaskAttempt a marker-carrying task belongs to.
+
+    Compatibility path, kept for one release. Qraft's own dispatcher stamps
+    the q2 task id on the attempt row before enqueueing, so every delivery it
+    makes resolves through the fast lookup and never reaches here. What still
+    does is a pre-2.0 Django-Q2 `Schedule` row written by the previous version
+    and fired after the upgrade: that run has no attempt row of its own, and
+    the marker in its task_name is the only link back to the QraftTask.
+
+    Called both from the execution lease (worker-side, at pre_execute) and
+    from the hook handler (monitor-side, at completion) - whichever runs
+    first creates the row.
+
+    Returns:
+        QraftTaskAttempt, or None if the name carries no usable Qraft marker.
+    """
+    from .models import QraftTask, QraftTaskAttempt
+    from .models.tasks import AttemptState
+
+    if not task_name or not task_name.startswith(f"{QRAFT_MARKER_PREFIX}:"):
+        return None
+
+    parsed = _parse_qraft_marker(task_name)
+    if not parsed:
+        _logger.warning("Invalid Qraft marker '%s' for task %s", task_name, q2_task_id)
+        return None
+
+    qraft_task_id, attempt_number = parsed
+    try:
+        qraft_task = QraftTask.objects.get(id=qraft_task_id)
+    except QraftTask.DoesNotExist:
+        _logger.error("QraftTask %s not found", qraft_task_id)
+        return None
+
+    attempt, created = QraftTaskAttempt.objects.get_or_create(
+        qraft_task=qraft_task,
+        attempt_number=attempt_number,
+        defaults={"q2_task_id": q2_task_id, "cluster": executing_cluster()},
+    )
+
+    if not created:
+        # get_or_create only caches the parent on the create branch
+        attempt.qraft_task = qraft_task
+        # A row already here is normally the dispatcher's, stamped and QUEUED
+        # already, so this is a no-op. It still fires when a legacy Schedule
+        # delivery lands on an attempt the dispatcher had scheduled but not
+        # yet claimed, which is the state that has to be adopted.
+        if attempt.q2_task_id != q2_task_id:
+            attempt.q2_task_id = q2_task_id
+            attempt.state = AttemptState.QUEUED
+            attempt.save(update_fields=["q2_task_id", "state"])
+
+    _logger.debug(
+        "Resolved QraftTask %s attempt %d (q2: %s, created=%s) via task_name",
+        qraft_task.id,
+        attempt_number,
+        q2_task_id,
+        created,
+    )
+    return attempt
+
+
 def _resolve_attempt(q2_task):
     """
     Find the QraftTaskAttempt a finished Django-Q2 task belongs to.
 
     Initial attempts are pre-created by async_task() and found by q2 task id.
     Retries are queued through a Schedule instead, so they carry a Qraft
-    marker in their task_name and their attempt row is created here.
+    marker in their task_name; the lease normally creates their attempt row
+    at pre_execute, and this falls back to creating it here.
 
     Returns:
         QraftTaskAttempt, or None if the task isn't a Qraft task.
     """
-    from .models import QraftTask, QraftTaskAttempt
+    from .models import QraftTaskAttempt
 
     try:
         attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
@@ -138,47 +203,11 @@ def _resolve_attempt(q2_task):
         )
         return attempt
 
-    if not q2_task.name or not q2_task.name.startswith(f"{QRAFT_MARKER_PREFIX}:"):
+    attempt = attempt_from_marker(q2_task.name, q2_task.id)
+    if attempt is None:
         _logger.debug(
             "No Qraft marker or attempt found for task %s, skipping", q2_task.id
         )
-        return None
-
-    parsed = _parse_qraft_marker(q2_task.name)
-    if not parsed:
-        _logger.warning(
-            "Invalid Qraft marker '%s' for task %s", q2_task.name, q2_task.id
-        )
-        return None
-
-    qraft_task_id, attempt_number = parsed
-    try:
-        qraft_task = QraftTask.objects.get(id=qraft_task_id)
-    except QraftTask.DoesNotExist:
-        _logger.error("QraftTask %s not found", qraft_task_id)
-        return None
-
-    attempt, created = QraftTaskAttempt.objects.get_or_create(
-        qraft_task=qraft_task,
-        attempt_number=attempt_number,
-        defaults={"q2_task_id": q2_task.id},
-    )
-
-    if not created:
-        # get_or_create only caches the parent on the create branch
-        attempt.qraft_task = qraft_task
-        # Defensive: an existing attempt should already carry this q2 task id
-        if attempt.q2_task_id != q2_task.id:
-            attempt.q2_task_id = q2_task.id
-            attempt.save(update_fields=["q2_task_id"])
-
-    _logger.debug(
-        "Processing QraftTask %s attempt %d (q2: %s, created=%s) via task_name",
-        qraft_task.id,
-        attempt_number,
-        q2_task.id,
-        created,
-    )
     return attempt
 
 
@@ -316,6 +345,10 @@ class HookDispatcher:
                 **kwargs,
                 task_name=f"hook:{hook_type}:{self.qraft_task.id}",
                 hook=None,  # No hook on hook tasks - prevents recursion
+                cluster=executing_cluster(),
+                # A hook that keeps failing must not be redelivered forever;
+                # nothing above this layer retries it.
+                ack_failure=True,
             ),
         )
 

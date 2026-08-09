@@ -308,8 +308,10 @@ class TestRetryPolicy:
 
     @pytest.mark.django_db
     def test_schedule_retry(self):
-        """Test scheduling a retry using Django-Q2 Schedule."""
+        """A retry is a SCHEDULED attempt row, not a Django-Q2 Schedule."""
         from django_q.models import Schedule
+
+        from qraft.models.tasks import AttemptState
 
         task = QraftTask.objects.create(
             func="test.module.function",
@@ -335,20 +337,17 @@ class TestRetryPolicy:
         )
 
         policy = RetryPolicy.from_task(task)
-        schedule_id = policy.schedule_retry(task, current_attempt=1)
+        attempt_id = policy.schedule_retry(task, current_attempt=1)
 
-        # Verify schedule was created
-        schedule = Schedule.objects.get(id=schedule_id)
-        # Scheduled via the universal unwrapping runner, not the dotted path
-        # directly - see qraft.runner.run_task.
-        assert schedule.func == "qraft.runner.run_task"
-        func_path, args, kwargs = ast.literal_eval(schedule.args)
-        assert func_path == "test.module.function"
-        assert args == [1, 2]
-        assert kwargs == {"key": "value"}
-        assert schedule.schedule_type == Schedule.ONCE
-        assert "qraft_retry:" in schedule.name
-        assert str(task.id) in schedule.name
+        attempt = QraftTaskAttempt.objects.get(id=attempt_id)
+        assert attempt.qraft_task_id == task.id
+        assert attempt.attempt_number == 2
+        assert attempt.state == AttemptState.SCHEDULED
+        assert attempt.not_before is not None
+        # Nothing is queued until the dispatcher claims it.
+        assert attempt.q2_task_id is None
+        # Django-Q2's scheduler is out of the picture entirely.
+        assert not Schedule.objects.exists()
 
         # Verify task status updated to PENDING
         task.refresh_from_db()
@@ -357,8 +356,6 @@ class TestRetryPolicy:
     @pytest.mark.django_db
     def test_schedule_retry_with_backoff(self):
         """Test that retry scheduling uses correct delay."""
-        from django_q.models import Schedule
-
         task = QraftTask.objects.create(
             func="test.function",
             retry_policy={
@@ -383,16 +380,16 @@ class TestRetryPolicy:
         policy = RetryPolicy.from_task(task)
 
         before = datetime.now(timezone.utc)
-        schedule_id = policy.schedule_retry(task, current_attempt=1)
+        attempt_id = policy.schedule_retry(task, current_attempt=1)
         after = datetime.now(timezone.utc)
 
-        schedule = Schedule.objects.get(id=schedule_id)
+        attempt = QraftTaskAttempt.objects.get(id=attempt_id)
 
         # For attempt 1, exponential backoff: 60 * 2^0 = 60 seconds
         expected_min = before + timedelta(seconds=60)
         expected_max = after + timedelta(seconds=60)
 
-        assert expected_min <= schedule.next_run <= expected_max
+        assert expected_min <= attempt.not_before <= expected_max
 
 
 class TestHandleTaskRetry:
@@ -586,3 +583,36 @@ class TestRateLimitRetries:
         )
 
         assert policy.calculate_delay(3, is_rate_limit=True) == 50
+
+
+@pytest.mark.django_db
+class TestScheduledRetryRouting:
+    """The scheduled attempt has to carry where the retry belongs."""
+
+    def _attempt_for(self, qraft_task):
+        attempt_id = RetryPolicy(max_attempts=3).schedule_retry(
+            qraft_task, current_attempt=1
+        )
+        return QraftTaskAttempt.objects.get(id=attempt_id)
+
+    def test_retry_inherits_the_cluster_of_the_attempt_that_failed(self, qraft_task):
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task,
+            attempt_number=1,
+            q2_task_id="q2-1",
+            success=False,
+            cluster="io-workers",
+        )
+
+        assert self._attempt_for(qraft_task).cluster == "io-workers"
+
+    def test_retry_falls_back_to_the_executing_cluster(self, qraft_task):
+        from django_q.conf import Conf
+
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task, attempt_number=1, q2_task_id="q2-1", success=False
+        )
+
+        # A null cluster would leave the retry to whichever dispatcher got
+        # there first; the monitor running this knows better.
+        assert self._attempt_for(qraft_task).cluster == Conf.CLUSTER_NAME

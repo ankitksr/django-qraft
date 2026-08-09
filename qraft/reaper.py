@@ -15,6 +15,7 @@ import logging
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from django_q.models import Task as Q2Task
 
@@ -63,22 +64,64 @@ def _queued_q2_task_ids() -> set[str] | None:
         return None
 
 
+def rearm_stuck_claims(grace: float | None = None) -> int:
+    """
+    Return dispatcher claims that never reached the broker to SCHEDULED.
+
+    A QUEUED attempt with no `q2_task_id` was claimed by a dispatcher that
+    died before its enqueue was recorded. Nothing was executed and nothing is
+    in a queue, so re-arming it is not a duplicate - it is the only way the
+    attempt ever runs.
+
+    Against the ORM broker the claim and the enqueue commit together, so this
+    state is unreachable and this sweep is dead weight. It exists for brokers
+    that write outside the database, where the two cannot be made atomic.
+
+    Note the asymmetry with a plain SCHEDULED attempt, however overdue: that
+    one is a live task waiting for a dispatcher (every cluster may simply be
+    down), not an orphan, and reaping it would burn a retry on a run that
+    never happened. Nothing here touches SCHEDULED rows.
+
+    Returns:
+        Number of attempts re-armed.
+    """
+    conf = get_conf()
+    grace = grace if grace is not None else _heartbeat_grace(conf.heartbeat_interval)
+    cutoff = timezone.now() - timedelta(seconds=grace)
+
+    rearmed = QraftTaskAttempt.objects.filter(
+        state=QraftTaskAttempt.AttemptState.QUEUED,
+        q2_task_id__isnull=True,
+        success__isnull=True,
+        claimed_at__lt=cutoff,
+    ).update(state=QraftTaskAttempt.AttemptState.SCHEDULED, claimed_at=None)
+
+    if rearmed:
+        logger.warning("Re-armed %d attempt(s) claimed but never enqueued", rearmed)
+    return rearmed
+
+
 def reap_orphans(stale_after: float | None = None) -> int:
     """
     Find and resolve orphaned QraftTaskAttempts.
 
     An attempt is orphaned when its QraftTask is still RUNNING, the attempt
-    itself is unresolved (success is None), no Django-Q2 Task row exists for
-    it, and either:
+    itself is unresolved (success is None) and already handed to a broker, no
+    Django-Q2 Task row exists for it, and either:
 
     - its lease heartbeat is stale (the worker started the task and died), or
-    - it never heartbeat at all, is older than `stale_after`, and its pack is
-      no longer queued (it was delivered to a worker that died before it could
-      start, or was lost by a broker without delivery receipts).
+    - it never heartbeat at all, has been in a queue longer than `stale_after`,
+      and its pack is no longer queued (it was delivered to a worker that died
+      before it could start, or was lost by a broker without delivery
+      receipts).
+
+    SCHEDULED attempts are excluded throughout: they are waiting by design,
+    not stuck. See `rearm_stuck_claims()` for the one dispatcher-side failure
+    that does need recovering.
 
     Args:
-        stale_after: Seconds a never-started attempt may sit unresolved before
-            it is considered orphaned (default: conf.reap_stale_after).
+        stale_after: Seconds an attempt that never started may sit unresolved
+            before it is considered orphaned (default: conf.reap_stale_after).
 
     Returns:
         Number of attempts reaped.
@@ -89,12 +132,17 @@ def reap_orphans(stale_after: float | None = None) -> int:
 
     now = timezone.now()
     heartbeat_cutoff = now - timedelta(seconds=grace)
-    created_cutoff = now - timedelta(seconds=stale_after)
+    stale_cutoff = now - timedelta(seconds=stale_after)
 
-    unresolved = QraftTaskAttempt.objects.filter(
-        success__isnull=True,
-        qraft_task__status=TaskStatus.RUNNING,
-    ).exclude(q2_task_id__in=Q2Task.objects.values("id"))
+    unresolved = (
+        QraftTaskAttempt.objects.filter(
+            success__isnull=True,
+            qraft_task__status=TaskStatus.RUNNING,
+            state=QraftTaskAttempt.AttemptState.QUEUED,
+        )
+        .exclude(q2_task_id__isnull=True)
+        .exclude(q2_task_id__in=Q2Task.objects.values("id"))
+    )
 
     orphan_ids = list(
         unresolved.filter(heartbeat_at__lt=heartbeat_cutoff).values_list(
@@ -102,10 +150,17 @@ def reap_orphans(stale_after: float | None = None) -> int:
         )
     )
 
+    # Staleness runs from the enqueue, not from row creation: a scheduled
+    # attempt's row can be hours older than its dispatch, and measuring from
+    # creation would make every long backoff look stale the moment it is
+    # queued.
     never_started = list(
-        unresolved.filter(
-            heartbeat_at__isnull=True, date_created__lt=created_cutoff
-        ).values_list("id", "q2_task_id")
+        unresolved.filter(heartbeat_at__isnull=True)
+        .filter(
+            Q(claimed_at__lt=stale_cutoff)
+            | Q(claimed_at__isnull=True, date_created__lt=stale_cutoff)
+        )
+        .values_list("id", "q2_task_id")
     )
     if never_started:
         queued = _queued_q2_task_ids()
@@ -120,7 +175,15 @@ def reap_orphans(stale_after: float | None = None) -> int:
 
 
 def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
-    """Reap a single attempt under a row lock, re-checking conditions still hold."""
+    """
+    Reap a single attempt under a row lock, re-checking conditions still hold.
+
+    Workflow routing happens after the lock is released: a reaped member of a
+    chain/iter/batch has to reach its dispatcher or the workflow waits on a
+    completion that will never arrive, and dispatching a workflow hook is not
+    work to do while holding the task row.
+    """
+    routable = None
     with transaction.atomic():
         try:
             attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
@@ -162,5 +225,11 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
             if qraft_task.status == TaskStatus.RUNNING:
                 qraft_task.status = TaskStatus.FAILED
                 qraft_task.save(update_fields=["status", "date_updated"])
+            routable = (qraft_task, attempt)
+
+    if routable is not None:
+        from .dispatchers import route_workflow_completion
+
+        route_workflow_completion(*routable)
 
     return True

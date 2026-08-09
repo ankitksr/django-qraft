@@ -357,6 +357,7 @@ QraftCluster (extends Cluster)
 - Django 4.2+ (6.0+ for the `django.tasks` backend)
 - Django-Q2 1.8+
 - PostgreSQL — the throttle, reaper, and workflow dispatchers need real row locks
+- The ORM broker (`"orm"`, plus `"broker_class": "qraft.brokers.QraftOrmBroker"` for priority lanes) — see [broker support](docs/configuration.md#broker-support) for what other brokers give up
 
 ## Demo Application
 
@@ -449,7 +450,7 @@ ruff check qraft/
 
 Django-Qraft maintains full backward compatibility with Django-Q2:
 
-- ✅ All Django-Q2 broker types work; the ORM broker on Postgres is the supported combination (brokers without delivery receipts lose in-flight tasks on a worker crash — the cluster warns at startup)
+- ✅ All Django-Q2 broker types run Qraft tasks; the ORM broker on PostgreSQL is the only one with full guarantees — every other broker loses delivery receipts and priority lanes, halves the reaper, and makes an enqueue visible before its transaction commits ([what degrades](docs/configuration.md#broker-support))
 - ✅ Existing `Q_CLUSTER` settings work (with deprecation warning)
 - ✅ Standard `qcluster` command continues to work
 - ✅ Tasks queued via Django-Q2's `async_task` work seamlessly

@@ -9,6 +9,7 @@ This guide covers all Django-Qraft configuration options, Django integration, en
 - [Threading Settings](#threading-settings)
 - [Retry Defaults](#retry-defaults)
 - [Hook Settings](#hook-settings)
+- [Retention Settings](#retention-settings)
 - [ALT_CLUSTERS Pattern](#alt_clusters-pattern)
 - [Environment Variables](#environment-variables)
 - [Django-Q2 Compatibility](#django-q2-compatibility)
@@ -210,6 +211,77 @@ Hooks execute synchronously in the monitor process after task completion. Use fo
 
 See [Hooks Guide](hooks.md) for detailed information.
 
+## Retention Settings
+
+Django-Q2 caps its own `Task` table with `save_limit`. Qraft's tables have no
+such cap, so `QraftTask`, `QraftTaskAttempt`, `HookDispatch` and the workflow
+tables grow without bound until a retention window is set.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `retention_days` | `float \| None` | `None` | Age bound: days to keep settled rows |
+| `retention_max_tasks` | `int \| None` | `None` | Count bound: keep only the newest N settled `QraftTask` rows |
+| `retention_interval` | `float` | `3600.0` | Seconds between sweeps |
+| `retention_batch_size` | `int` | `500` | Rows deleted per transaction |
+
+```python
+QRAFT_CLUSTER = {
+    "retention_days": 30,
+}
+```
+
+Both bounds are ceilings on how much history is kept, so a row goes as soon
+as either says so. When both are set, the stricter one decides.
+
+The sweep runs as a daemon thread beside the orphan reaper, in the monitor
+process, and only starts when a bound is in force. It deletes only rows
+that have settled: a task that is still `PENDING` or `RUNNING` is kept
+however old it is, and a task belonging to a workflow that has not finished
+is kept until that workflow does. Deletions are batched so the first sweep
+over a large table cannot hold one long transaction.
+
+### Inheriting `save_limit`
+
+Django-Q2's `save_limit` is count-based; Qraft's `retention_days` is
+age-based. Rather than convert one into the other, Qraft mirrors the intent
+directly onto its own count bound, `retention_max_tasks`.
+
+The resolution rule, in order:
+
+1. `retention_days` or `retention_max_tasks` in `QRAFT_CLUSTER` — used as
+   written. Nothing is inherited.
+2. Otherwise, if `Q_CLUSTER` **contains the key** `save_limit` with a value
+   above `0`, that value becomes `retention_max_tasks`.
+3. Otherwise retention stays off and history is kept forever.
+
+Step 2 reads the raw `Q_CLUSTER` dict, not `Conf.SAVE_LIMIT`. `Conf.SAVE_LIMIT`
+is `250` even for users who never mentioned it, and mirroring that default
+would delete almost all task history without anyone asking for it. Only a key
+that is actually present counts as intent.
+
+Two `save_limit` values carry no count to mirror and so inherit nothing:
+`0`, which is Django-Q2's "keep everything", and any negative value, which
+tells Django-Q2 to save no successful results at all.
+
+`save_limit_per` (`group`/`name`/`func`) is not mirrored. Qraft rows have no
+equivalent grouping, so the inherited bound is always global.
+
+The resolved policy is logged once at cluster start, under the `qraft` logger:
+
+```
+Qraft retention: pruning settled rows beyond the newest 1000 task(s)
+[inherited from Q_CLUSTER['save_limit']], every 3600.0s
+```
+
+To sweep on demand instead — from a shell, or from your own scheduled job:
+
+```python
+from qraft.retention import sweep_retention
+
+sweep_retention(retention_days=30)   # -> {"QraftTask": 1420, ...}
+sweep_retention(max_tasks=1000)
+```
+
 ## ALT_CLUSTERS Pattern
 
 Run multiple clusters with different configurations for mixed workloads (CPU-bound + I/O-bound).
@@ -269,6 +341,26 @@ python manage.py qraftcluster
 Q_CLUSTER_NAME=io-workers python manage.py qraftcluster
 Q_CLUSTER_NAME=cpu-intensive python manage.py qraftcluster
 ```
+
+The two forms are equivalent. `--name` re-executes the process with
+`Q_CLUSTER_NAME` set, because Django-Q2 builds its own `Conf` at import time —
+before any management command runs — and a variable set later would give the
+cluster Qraft's threading config while it still drained the *default* queue.
+
+Declare each alternative cluster in **`Q_CLUSTER`** as well, even if the entry
+is empty. Django-Q2 reads `ALT_CLUSTERS` from `Q_CLUSTER` to switch queues, and
+raises `KeyError` on import when the key is absent:
+
+```python
+Q_CLUSTER = {
+    "name": "default",
+    "orm": "default",
+    "ALT_CLUSTERS": {"io-workers": {}, "cpu-intensive": {}},
+}
+```
+
+`--name` validates the name against both dicts and fails with a clear message
+before re-executing, so a typo cannot start a cluster on the wrong queue.
 
 ### Routing Tasks to Clusters
 
@@ -399,40 +491,36 @@ python manage.py qraftcluster
 
 ### Broker Support
 
-All Django-Q2 brokers are supported:
+Every Django-Q2 broker will run Qraft tasks, but only one configuration
+carries Qraft's full guarantees: **the ORM broker on PostgreSQL**. The
+durable truth is the database row — `QraftTask` and `QraftTaskAttempt` — and
+the broker is only a delivery hint. Features that need the broker and the
+task rows to be in the same database degrade on every other broker.
 
-**ORM (Django database):**
-
-```python
-QRAFT_CLUSTER = {
-    "orm": "default",  # Use Django ORM
-}
-```
-
-**Redis:**
+**Supported configuration:**
 
 ```python
 QRAFT_CLUSTER = {
-    "redis": {
-        "host": "localhost",
-        "port": 6379,
-        "db": 0,
-    }
+    "orm": "default",
+    "broker_class": "qraft.brokers.QraftOrmBroker",  # required for priority lanes
 }
 ```
 
-**AWS SQS:**
+PostgreSQL specifically, because the throttle, the reaper and the workflow
+dispatchers all coordinate through `SELECT ... FOR UPDATE`.
 
-```python
-QRAFT_CLUSTER = {
-    "sqs": {
-        "aws_region": "us-east-1",
-        "queue_name": "my-queue",
-    }
-}
-```
+**What degrades on a broker other than the ORM broker** (Redis, SQS, IronMQ,
+MongoDB):
 
-**IronMQ, MongoDB, etc.:** All Django-Q2 brokers work unchanged.
+| Feature | Behaviour |
+|---------|-----------|
+| Delivery receipts | Lost. `Broker.acknowledge`/`fail` are no-ops, so a task in flight when a worker dies is never redelivered. The cluster warns about this at startup. |
+| Priority lanes | Lost. Lanes are extra `OrmQ` keys; `priority_list_key()` declines to route and the task runs in the default lane with a warning. |
+| Reaper | Half. Attempts with a stale heartbeat are still reclaimed, but attempts that never started cannot be checked against the queue, so the reaper leaves them alone rather than risk duplicating a task that is merely waiting. |
+| Enqueue visibility | Racy. The ORM broker enqueues inside the caller's transaction, so a task and the rows describing it commit together. Any other broker makes the task visible to a worker before the transaction commits. |
+
+Retries, hooks, workflows and the DLQ work on any broker: they run off the
+task rows, not the queue.
 
 ## Settings Hierarchy
 
@@ -484,7 +572,7 @@ QRAFT_CLUSTER = {
 }
 ```
 
-### Production Setup (Redis Broker)
+### Production Setup (ORM Broker on PostgreSQL)
 
 ```python
 QRAFT_CLUSTER = {
@@ -495,14 +583,11 @@ QRAFT_CLUSTER = {
     "retry": 90,
     "save_limit": 500,
 
-    "redis": {
-        "host": "redis.example.com",
-        "port": 6379,
-        "db": 0,
-        "password": "secret",
-    },
+    "orm": "default",
+    "broker_class": "qraft.brokers.QraftOrmBroker",
 
     "threads": 1,
+    "retention_days": 30,
     "retry_defaults": {
         "max_attempts": 5,
         "delay": 60.0,

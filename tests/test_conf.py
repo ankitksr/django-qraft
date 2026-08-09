@@ -295,3 +295,89 @@ class TestRetryBackoff:
         assert "linear" in {strategy.value for strategy in RetryBackoff}
         assert "fixed" in {strategy.value for strategy in RetryBackoff}
         assert "invalid" not in {strategy.value for strategy in RetryBackoff}
+
+
+class TestRetentionInheritance:
+    """Retention resolution against an explicit Q_CLUSTER['save_limit']."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_conf(self, settings):
+        """get_conf is cached per cluster name, so each case needs a clean slate."""
+        settings.QRAFT_CLUSTER = {}
+        settings.Q_CLUSTER = {"name": "test", "orm": "default"}
+        _cached_conf.cache_clear()
+        yield
+        _cached_conf.cache_clear()
+
+    def test_silent_by_default(self, settings):
+        """Django-Q2's own default of 250 must never be mirrored."""
+        conf = get_conf()
+
+        assert conf.retention_max_tasks is None
+        assert conf.retention_days is None
+        assert conf.retention_enabled() is False
+
+    def test_explicit_save_limit_is_inherited_as_a_count_bound(self, settings):
+        settings.Q_CLUSTER = {**settings.Q_CLUSTER, "save_limit": 1000}
+
+        conf = get_conf()
+
+        assert conf.retention_max_tasks == 1000
+        assert conf.retention_inherited_from_save_limit is True
+        assert conf.retention_days is None
+        assert conf.retention_enabled() is True
+
+    @pytest.mark.parametrize("save_limit", [0, -1])
+    def test_unlimited_and_never_saved_do_not_bound_qraft(self, settings, save_limit):
+        """0 is Django-Q2's unlimited; a negative saves no results at all."""
+        settings.Q_CLUSTER = {**settings.Q_CLUSTER, "save_limit": save_limit}
+
+        conf = get_conf()
+
+        assert conf.retention_max_tasks is None
+        assert conf.retention_enabled() is False
+
+    def test_explicit_retention_days_wins(self, settings):
+        settings.Q_CLUSTER = {**settings.Q_CLUSTER, "save_limit": 1000}
+        settings.QRAFT_CLUSTER = {"retention_days": 30}
+
+        conf = get_conf()
+
+        assert conf.retention_days == 30
+        assert conf.retention_max_tasks is None
+        assert conf.retention_inherited_from_save_limit is False
+
+    def test_explicit_retention_max_tasks_wins(self, settings):
+        settings.Q_CLUSTER = {**settings.Q_CLUSTER, "save_limit": 1000}
+        settings.QRAFT_CLUSTER = {"retention_max_tasks": 25}
+
+        conf = get_conf()
+
+        assert conf.retention_max_tasks == 25
+        assert conf.retention_inherited_from_save_limit is False
+
+    def test_alt_cluster_save_limit_is_inherited(self, settings):
+        settings.Q_CLUSTER = {
+            **settings.Q_CLUSTER,
+            "save_limit": 1000,
+            "ALT_CLUSTERS": {"io-workers": {"save_limit": 50}},
+        }
+
+        with patch.dict(os.environ, {"Q_CLUSTER_NAME": "io-workers"}):
+            _cached_conf.cache_clear()
+            conf = get_conf()
+
+        assert conf.retention_max_tasks == 50
+
+    def test_alt_cluster_retention_days_still_wins(self, settings):
+        settings.Q_CLUSTER = {**settings.Q_CLUSTER, "save_limit": 1000}
+        settings.QRAFT_CLUSTER = {
+            "ALT_CLUSTERS": {"io-workers": {"retention_days": 7}},
+        }
+
+        with patch.dict(os.environ, {"Q_CLUSTER_NAME": "io-workers"}):
+            _cached_conf.cache_clear()
+            conf = get_conf()
+
+        assert conf.retention_days == 7
+        assert conf.retention_max_tasks is None

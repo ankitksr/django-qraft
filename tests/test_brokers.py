@@ -134,3 +134,100 @@ class TestAsyncTaskPriorityRouting:
 
         with pytest.raises(ValueError, match="Invalid priority"):
             async_task("test.function", qraft_options={"priority": "urgent"})
+
+
+@pytest.fixture
+def _clear_lane_cache():
+    """The lane-support check is cached per broker_class to warn only once."""
+    from qraft.brokers import _lanes_drained_by
+
+    _lanes_drained_by.cache_clear()
+    yield
+    _lanes_drained_by.cache_clear()
+
+
+class TestPriorityLaneTargeting:
+    """The lane key must name the target cluster, not the enqueuing process."""
+
+    def test_lane_is_keyed_off_the_target_cluster(self):
+        # django_q resolves `broker or get_broker(cluster)`, so an explicit
+        # broker drops `cluster=` entirely - the lane has to carry it.
+        assert priority_list_key("high", cluster="io-workers") == "io-workers--high"
+        assert priority_list_key("low", cluster="io-workers") == "io-workers--low"
+
+    def test_falls_back_to_the_local_cluster(self):
+        assert priority_list_key("high") == f"{Conf.CLUSTER_NAME}--high"
+
+    def test_default_priority_never_routes(self):
+        assert priority_list_key("default", cluster="io-workers") is None
+
+
+@pytest.mark.usefixtures("_clear_lane_cache")
+class TestPriorityLaneAvailability:
+    """Nothing drains the suffixed lanes unless broker_class says so."""
+
+    def test_declines_to_route_without_the_qraft_broker(self, monkeypatch, caplog):
+        from qraft.brokers import priority_lanes_available
+
+        monkeypatch.setattr(Conf, "BROKER_CLASS", None)
+
+        assert priority_lanes_available() is False
+        assert priority_list_key("high") is None
+        assert "does not drain Qraft priority lanes" in caplog.text
+
+    def test_declines_for_an_unrelated_broker_class(self, monkeypatch):
+        from qraft.brokers import priority_lanes_available
+
+        monkeypatch.setattr(Conf, "BROKER_CLASS", "django_q.brokers.orm.ORM")
+
+        assert priority_lanes_available() is False
+
+    def test_accepts_a_subclass_of_the_qraft_broker(self, monkeypatch):
+        from qraft.brokers import priority_lanes_available
+
+        monkeypatch.setattr(Conf, "BROKER_CLASS", "qraft.brokers.QraftOrmBroker")
+
+        assert priority_lanes_available() is True
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("_clear_lane_cache")
+class TestAsyncTaskClusterAwarePriority:
+    """Regression: priority routing used to discard `cluster=` silently."""
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_priority_lane_follows_the_target_cluster(self, mock_q2_async):
+        from qraft.tasks import async_task
+
+        mock_q2_async.return_value = "q2-routed"
+
+        async_task(
+            "test.function",
+            qraft_options={"priority": "high", "cluster": "io-workers"},
+        )
+
+        call_kwargs = mock_q2_async.call_args[1]
+        assert call_kwargs["broker"].list_key == "io-workers--high"
+        assert call_kwargs["cluster"] == "io-workers"
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_unroutable_priority_falls_back_to_the_default_lane(
+        self, mock_q2_async, monkeypatch
+    ):
+        from qraft.tasks import async_task
+
+        monkeypatch.setattr(Conf, "BROKER_CLASS", None)
+        mock_q2_async.return_value = "q2-fallback"
+
+        async_task(
+            "test.function",
+            qraft_options={"priority": "high", "cluster": "io-workers"},
+        )
+
+        call_kwargs = mock_q2_async.call_args[1]
+        # No broker override, so django_q resolves the cluster normally and
+        # the task runs at default priority instead of stranding.
+        assert "broker" not in call_kwargs
+        assert call_kwargs["cluster"] == "io-workers"
+        # The requested priority is still recorded for observability.
+        assert QraftTask.objects.get().priority == "high"

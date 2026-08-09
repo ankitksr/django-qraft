@@ -148,14 +148,12 @@ class TestEndToEndWorkflows:
         qraft_task.refresh_from_db()
         assert qraft_task.status == TaskStatus.PENDING
 
-        # Verify Schedule was created
-        from django_q.models import Schedule
+        # Verify the next attempt was scheduled on Qraft's own table
+        from qraft.models.tasks import AttemptState
 
-        schedule = Schedule.objects.get()
-        # Scheduled via the universal unwrapping runner, not the dotted path
-        # directly - see qraft.runner.run_task.
-        assert schedule.func == "qraft.runner.run_task"
-        assert str(qraft_task.id) in schedule.name
+        scheduled = qraft_task.attempts.get(attempt_number=2)
+        assert scheduled.state == AttemptState.SCHEDULED
+        assert scheduled.not_before is not None
 
     def test_retry_exhaustion_workflow(self, qraft_task, qraft_task_attempt):
         """Test workflow when retries are exhausted."""
@@ -265,18 +263,28 @@ class TestEndToEndWorkflows:
 
         qraft_hook_handler(q2_task_fail)
 
-        # Verify retry was scheduled
+        # Verify retry was scheduled. The attempt row now exists up front,
+        # holding the delay, rather than being created after the retry runs.
+        from django.utils import timezone
+
+        from qraft.models.tasks import AttemptState
+        from qraft.scheduler import dispatch_due
+
         qraft_task.refresh_from_db()
         assert qraft_task.status == TaskStatus.PENDING
-        assert qraft_task.attempt_count == 1
+        assert qraft_task.attempt_count == 2
+        attempt2 = qraft_task.attempts.get(attempt_number=2)
+        assert attempt2.state == AttemptState.SCHEDULED
+        assert attempt2.q2_task_id is None
 
-        # Step 3: Simulate retry execution (would be scheduled by Django-Q2)
-        # Create second attempt (normally created by hook handler on retry)
-        attempt2 = QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=2,
-            q2_task_id="q2-task-retry-2",
+        # Step 3: the delay elapses and Qraft's dispatcher enqueues it
+        QraftTaskAttempt.objects.filter(pk=attempt2.pk).update(
+            not_before=timezone.now()
         )
+        assert dispatch_due() == 1
+        attempt2.refresh_from_db()
+        assert attempt2.state == AttemptState.QUEUED
+        assert attempt2.q2_task_id is not None
 
         # Step 4: Simulate second attempt success
         q2_task_success = Mock()

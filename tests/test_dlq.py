@@ -1,6 +1,5 @@
 """Tests for qraft.dlq module."""
 
-import ast
 from unittest.mock import Mock
 
 import pytest
@@ -9,6 +8,7 @@ from django_q.models import Schedule
 from qraft.dlq import dead_letters, requeue
 from qraft.hooks import qraft_hook_handler
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+from qraft.models.tasks import AttemptState
 
 
 @pytest.mark.django_db
@@ -46,7 +46,7 @@ class TestRequeue:
         with pytest.raises(ValueError, match="not dead"):
             requeue(task)
 
-    def test_creates_schedule_with_next_attempt_and_resets_status(self):
+    def test_creates_next_attempt_and_resets_status(self):
         task = QraftTask.objects.create(
             func="test.module.function",
             task_args=[1, 2],
@@ -57,22 +57,22 @@ class TestRequeue:
             qraft_task=task, attempt_number=1, q2_task_id="t-1", success=False
         )
         QraftTaskAttempt.objects.create(
-            qraft_task=task, attempt_number=2, q2_task_id="t-2", success=False
+            qraft_task=task,
+            attempt_number=2,
+            q2_task_id="t-2",
+            success=False,
+            cluster="io-workers",
         )
 
-        schedule_id = requeue(task)
+        attempt_id = requeue(task)
 
-        schedule = Schedule.objects.get(id=schedule_id)
-        # Scheduled via the universal unwrapping runner, not the dotted path
-        # directly - see qraft.runner.run_task.
-        assert schedule.func == "qraft.runner.run_task"
-        func_path, args, kwargs = ast.literal_eval(schedule.args)
-        assert func_path == "test.module.function"
-        assert args == [1, 2]
-        assert kwargs == {"key": "value"}
-        assert f"qraft:{task.id}:3" in schedule.kwargs
-        assert "qraft_retry:" in schedule.name
-        assert str(task.id) in schedule.name
+        attempt = QraftTaskAttempt.objects.get(id=attempt_id)
+        assert attempt.attempt_number == 3
+        assert attempt.state == AttemptState.SCHEDULED
+        assert attempt.not_before is not None
+        # The operator's shell cannot know where this ran; the last attempt can.
+        assert attempt.cluster == "io-workers"
+        assert not Schedule.objects.exists()
 
         task.refresh_from_db()
         assert task.status == TaskStatus.PENDING
@@ -82,10 +82,11 @@ class TestRequeue:
             func="test.module.function", status=TaskStatus.FAILED
         )
 
-        schedule_id = requeue(task)
+        attempt = QraftTaskAttempt.objects.get(id=requeue(task))
 
-        schedule = Schedule.objects.get(id=schedule_id)
-        assert f"qraft:{task.id}:1" in schedule.kwargs
+        assert attempt.attempt_number == 1
+        # Nothing recorded a cluster, so any dispatcher may claim it.
+        assert attempt.cluster is None
 
     def test_requeue_with_idempotency_key_does_not_violate_unique_constraint(self):
         """Requeue reuses the same row, so its idempotency_key is untouched."""
@@ -135,3 +136,24 @@ class TestRequeue:
         task.refresh_from_db()
         assert task.status == TaskStatus.SUCCEEDED
         assert task.attempts.count() == 2
+
+
+@pytest.mark.django_db
+def test_requeue_acknowledges_failures(qraft_task):
+    """The requeued run must not be redelivered by the broker on failure."""
+
+    from django_q.models import OrmQ
+    from django_q.signing import SignedPackage
+
+    from qraft.dlq import requeue
+    from qraft.models import TaskStatus
+    from qraft.scheduler import dispatch_due
+
+    qraft_task.status = TaskStatus.EXHAUSTED
+    qraft_task.save(update_fields=["status"])
+
+    requeue(qraft_task)
+    assert dispatch_due() == 1
+
+    pack = SignedPackage.loads(OrmQ.objects.get().payload)
+    assert pack["ack_failure"] is True

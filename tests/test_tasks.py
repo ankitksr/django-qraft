@@ -346,3 +346,52 @@ class TestAsyncTaskIdempotency:
 
         assert second == first
         assert QraftTask.objects.count() == 1
+
+
+@pytest.mark.django_db
+class TestAckFailure:
+    """
+    Qraft schedules its own retries, so Django-Q2 must never also redeliver.
+
+    Django-Q2 acknowledges a broker message only on success or when
+    ack_failure is set, so leaving it unset means a failed task's message is
+    redelivered while Qraft has already queued the next attempt.
+    """
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_defaults_to_true(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-ack"
+
+        async_task("test.function")
+
+        assert mock_q2_async.call_args[1]["ack_failure"] is True
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_explicit_true_is_accepted(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-ack"
+
+        async_task("test.function", ack_failure=True)
+
+        assert mock_q2_async.call_args[1]["ack_failure"] is True
+
+    def test_explicit_false_is_rejected(self, db):
+        with pytest.raises(ValueError, match="ack_failure=False"):
+            async_task("test.function", ack_failure=False)
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_workflow_tasks_also_acknowledge_failures(self, mock_q2_async, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        mock_q2_async.return_value = "q2-workflow-ack"
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+
+        _create_workflow_task(
+            func="test.function",
+            args=[],
+            kwargs={},
+            qraft_options={},
+            qraft_iter_id=iter_model.id,
+        )
+
+        assert mock_q2_async.call_args[1]["ack_failure"] is True

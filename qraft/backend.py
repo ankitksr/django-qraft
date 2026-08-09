@@ -26,7 +26,6 @@ import logging
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import transaction
 from django.utils.module_loading import import_string
-from django_q.models import Schedule
 from django_q.tasks import async_task as q2_async_task
 
 try:
@@ -46,10 +45,10 @@ except ImportError as exc:
         "DEP 14). Upgrade Django or use qraft.tasks.async_task() directly."
     ) from exc
 
-from qraft.brokers import QraftOrmBroker, priority_list_key
+from qraft.brokers import QraftOrmBroker, priority_lanes_available, priority_list_key
+from qraft.conf import executing_cluster
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.tasks import TaskPriority
-from qraft.retry import QRAFT_MARKER_FMT, QRAFT_MARKER_PREFIX
 from qraft.runner import _resolve_target
 from qraft.runner import run_task as run_task  # re-exported: resolved by dotted path
 from qraft.tasks import async_task as qraft_async_task
@@ -102,8 +101,21 @@ class QraftTaskBackend(BaseTaskBackend):
     """
 
     supports_get_result = True
-    supports_priority = True
     supports_defer = True
+
+    @property
+    def supports_priority(self) -> bool:
+        """
+        Whether priority lanes actually reach a worker in this deployment.
+
+        Qraft's own async_task() downgrades an unroutable priority to the
+        default lane with a warning, because a task that runs at the wrong
+        priority still runs. django.tasks asks a yes/no capability question
+        instead, so answering honestly here lets Django reject the enqueue
+        with a clear message rather than have the backend quietly ignore
+        what the caller asked for.
+        """
+        return priority_lanes_available()
 
     def enqueue(self, task, args, kwargs):
         self.validate_task(task)
@@ -165,7 +177,12 @@ class QraftTaskBackend(BaseTaskBackend):
                 status=TaskStatus.RUNNING,
                 priority=lane,
             )
-            q2_kwargs = {"hook": "qraft.hooks.qraft_hook_handler"}
+            # ack_failure: Qraft owns retries, so Django-Q2 must not also
+            # redeliver a failed message (see qraft.tasks.async_task).
+            q2_kwargs = {
+                "hook": "qraft.hooks.qraft_hook_handler",
+                "ack_failure": True,
+            }
             if broker is not None:
                 q2_kwargs["broker"] = broker
             q2_task_id = q2_async_task(
@@ -178,7 +195,10 @@ class QraftTaskBackend(BaseTaskBackend):
                 **q2_kwargs,
             )
             QraftTaskAttempt.objects.create(
-                qraft_task=qraft_task, attempt_number=1, q2_task_id=q2_task_id
+                qraft_task=qraft_task,
+                attempt_number=1,
+                q2_task_id=q2_task_id,
+                cluster=executing_cluster(),
             )
         return self._build_result(task, qraft_task)
 
@@ -186,15 +206,21 @@ class QraftTaskBackend(BaseTaskBackend):
         """
         Enqueue a ``run_after``-deferred task.
 
-        Mirrors ``RetryPolicy.schedule_retry()``: a Django-Q2 ``Schedule``
-        (``ONCE``, firing at ``task.run_after``) carries a Qraft marker
-        (``qraft:{task_id}:1``) in ``q_options``, so the existing hook-handler
-        fallback (``qraft.hooks._resolve_attempt``) creates attempt 1 the
-        first time it actually runs. The ``QraftTask`` itself is created
-        ``PENDING`` right away, with no attempt yet - ``get_result()``
-        reports ``READY`` for it unchanged (a zero-attempt task already maps
-        there).
+        Mirrors ``RetryPolicy.schedule_retry()``: attempt 1 is created up
+        front as a SCHEDULED row due at ``task.run_after``, and Qraft's
+        dispatcher enqueues it then. The ``QraftTask`` stays ``PENDING``
+        until that happens, so ``get_result()`` keeps reporting ``READY``.
+
+        ``dispatch_func`` only has to be set for ``takes_context``: every
+        other deferred task runs through the same ``run_task`` unwrapping
+        that the immediate path uses, which the dispatcher applies by default.
         """
+        # Imported here, not at module scope: a worker resolves this module by
+        # dotted path mid-run, and a fresh module-level edge into the model
+        # layer can race a concurrent import in another thread of the same
+        # process (seen as a partially-initialised qraft.models.tasks).
+        from qraft.scheduler import schedule_attempt
+
         qraft_task = QraftTask.objects.create(
             func=func_path,
             task_args=args,
@@ -203,29 +229,21 @@ class QraftTaskBackend(BaseTaskBackend):
             priority=lane,
         )
 
-        marker = QRAFT_MARKER_FMT.format(
-            prefix=QRAFT_MARKER_PREFIX, task_id=qraft_task.id, attempt=1
-        )
-
+        dispatch_func = dispatch_args = None
         if task.takes_context:
-            schedule_func = _CONTEXT_WRAPPER_PATH
-            schedule_args = (func_path, str(qraft_task.id), self.alias, args, kwargs)
-            schedule_kwargs = {"q_options": {"task_name": marker}}
-        else:
-            # Same wrapper indirection as the immediate path: the dotted
-            # path resolves to the @task wrapper when the schedule fires.
-            schedule_func = _PLAIN_WRAPPER_PATH
-            schedule_args = (func_path, list(args), kwargs)
-            schedule_kwargs = {"q_options": {"task_name": marker}}
+            dispatch_func = _CONTEXT_WRAPPER_PATH
+            dispatch_args = [func_path, str(qraft_task.id), self.alias, args, kwargs]
 
-        Schedule.objects.create(
-            name=f"qraft_defer:{qraft_task.id}",
-            func=schedule_func,
-            args=repr(schedule_args),
-            kwargs=repr(schedule_kwargs),
-            hook="qraft.hooks.qraft_hook_handler",
-            schedule_type=Schedule.ONCE,
-            next_run=task.run_after,
+        schedule_attempt(
+            qraft_task,
+            1,
+            task.run_after,
+            # The web process's own cluster, matching where the immediate
+            # path would have sent it. A null here would have made the task
+            # runnable only by a cluster named after the default prefix.
+            cluster=executing_cluster(),
+            dispatch_func=dispatch_func,
+            dispatch_args=dispatch_args,
         )
 
         return self._build_result(task, qraft_task)
@@ -292,7 +310,9 @@ class QraftTaskBackend(BaseTaskBackend):
             kwargs=qraft_task.task_kwargs,
             backend=self.alias,
             errors=errors,
-            worker_ids=[a.q2_task_id for a in attempts],
+            # A deferred task's attempt exists before it is enqueued, so its
+            # q2 id is still null at this point and there is no worker to name.
+            worker_ids=[a.q2_task_id for a in attempts if a.q2_task_id],
         )
         if return_value is not None:
             object.__setattr__(result, "_return_value", return_value)
@@ -313,13 +333,9 @@ def run_task_with_context(func_path, qraft_task_id, backend_alias, args, kwargs)
     here, at the point the worker actually calls it.
 
     ``qraft_task_id`` is resolved through ``get_result()`` rather than
-    ``qraft.context.current_attempt()`` so this also works for deferred
-    (``run_after``) tasks, whose ``QraftTaskAttempt`` row doesn't exist yet
-    at call time (it's only created once the hook handler runs, after
-    completion - see ``qraft.hooks._resolve_attempt``). One consequence:
-    for a deferred task, ``TaskContext.attempt`` reads ``0`` during the
-    currently-running attempt rather than ``1``, since that attempt's row
-    isn't there yet at the time this reads it back.
+    ``qraft.context.current_attempt()`` because the id is what the enqueue
+    side has to hand: it is baked into the queued arguments at enqueue time,
+    which is the only point that knows it for a deferred task.
     """
     from django.tasks import task_backends
 

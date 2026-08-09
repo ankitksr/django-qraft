@@ -9,18 +9,18 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from django.db import transaction
-
-from .conf import RetryBackoff, get_conf
+from .conf import RetryBackoff, executing_cluster, get_conf
 
 logger = logging.getLogger("qraft")
 
 # Minimum delay in seconds when jitter is applied (prevents zero/negative)
 MIN_JITTER_DELAY = 1
 
-# Qraft marker constants for task_name-based linkage
+# Task-name marker. Linkage runs off the attempt's q2_task_id now; the marker
+# survives as the name a dispatched attempt is queued under, and as the only
+# way to resolve a pre-2.0 Schedule delivery still in flight across an upgrade
+# (see qraft.hooks.attempt_from_marker).
 QRAFT_MARKER_PREFIX = "qraft"
-QRAFT_RETRY_NAME_FMT = "qraft_retry:{task_id}:{attempt}"
 QRAFT_MARKER_FMT = "{prefix}:{task_id}:{attempt}"
 
 # Exception class names commonly raised by provider SDKs for rate limiting /
@@ -341,15 +341,13 @@ class RetryPolicy:
         current_attempt: int,
         retry_after: float | None = None,
         is_rate_limit: bool = False,
-    ) -> int:
+    ) -> str:
         """
-        Schedule a retry for a failed task using Django-Q2's Schedule model.
+        Schedule a retry for a failed task as a SCHEDULED attempt row.
 
-        Schedules ``qraft.runner.run_task``, which resolves and calls the
-        original task function (unwrapping a django.tasks ``@task`` wrapper
-        when present). Uses q_options to pass task_name for Qraft linkage -
-        the scheduler extracts q_options from kwargs and passes it to
-        async_task.
+        The row carries the exact ETA, so the delay this policy computed is
+        the delay served - Django-Q2's scheduler is not involved and its
+        hardcoded 30-second cycle no longer rounds sub-30-second backoff up.
 
         Args:
             qraft_task: QraftTask model instance
@@ -359,11 +357,9 @@ class RetryPolicy:
             is_rate_limit: Whether this retry follows a rate-limit error
 
         Returns:
-            Schedule ID
+            str: id of the scheduled QraftTaskAttempt
         """
-        from django_q.models import Schedule
-
-        from .models import TaskStatus
+        from .scheduler import _inherited_cluster, schedule_attempt
 
         next_attempt = current_attempt + 1
         delay_seconds = self.calculate_delay(
@@ -371,52 +367,27 @@ class RetryPolicy:
         )
         eta = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
 
-        # q_options carries the task_name for Qraft linkage - the scheduler
-        # pops it and passes it to async_task, so it never reaches the
-        # scheduled function itself.
-        marker = QRAFT_MARKER_FMT.format(
-            prefix=QRAFT_MARKER_PREFIX,
-            task_id=qraft_task.id,
-            attempt=next_attempt,
+        # The failed attempt's own cluster, not this process's: the monitor
+        # that runs this happens to be the right cluster today, but the
+        # attempt records where the work actually belongs.
+        attempt = schedule_attempt(
+            qraft_task,
+            next_attempt,
+            eta,
+            cluster=_inherited_cluster(qraft_task) or executing_cluster(),
         )
-        schedule_kwargs = {"q_options": {"task_name": marker}}
-
-        with transaction.atomic():
-            # Scheduled via qraft.runner.run_task rather than qraft_task.func
-            # directly: a @task-decorated function's dotted path resolves to
-            # the non-callable django.tasks wrapper, not the function itself.
-            schedule = Schedule.objects.create(
-                name=QRAFT_RETRY_NAME_FMT.format(
-                    task_id=qraft_task.id, attempt=next_attempt
-                ),
-                func="qraft.runner.run_task",
-                args=repr(
-                    (
-                        qraft_task.func,
-                        list(qraft_task.task_args),
-                        qraft_task.task_kwargs,
-                    )
-                ),
-                kwargs=repr(schedule_kwargs),
-                hook="qraft.hooks.qraft_hook_handler",
-                schedule_type=Schedule.ONCE,
-                next_run=eta,
-            )
-
-            qraft_task.status = TaskStatus.PENDING
-            qraft_task.save(update_fields=["status", "date_updated"])
 
         logger.info(
-            "Scheduled retry %d/%d for QraftTask %s at %s (schedule_id=%s, delay=%ds)",
+            "Scheduled retry %d/%d for QraftTask %s at %s (attempt_id=%s, delay=%ds)",
             next_attempt,
             self.max_attempts,
             qraft_task.id,
             eta,
-            schedule.id,
+            attempt.id,
             delay_seconds,
         )
 
-        return schedule.id
+        return str(attempt.id)
 
 
 def handle_task_retry(qraft_task, attempt, result_text: str | None = None) -> bool:

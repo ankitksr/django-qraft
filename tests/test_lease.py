@@ -169,3 +169,103 @@ class TestLeaseDeadline:
 
         monkeypatch.setattr(Conf, "TIMEOUT", 120)
         assert lease._lease_deadline_seconds() == 120 + lease.LEASE_DEADLINE_MARGIN
+
+
+@pytest.mark.django_db
+class TestMarkerLease:
+    """
+    Retries, DLQ requeues and deferred tasks arrive with no attempt row.
+
+    Until the lease creates one and marks the task RUNNING, a worker that dies
+    mid-attempt leaves nothing for the reaper to find.
+    """
+
+    def _pending_task(self):
+        from qraft.models import QraftTask, TaskStatus
+
+        return QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.PENDING,
+            retry_policy={"max_attempts": 3},
+        )
+
+    def test_creates_the_attempt_and_marks_the_task_running(self, db):
+        from qraft.models import QraftTaskAttempt, TaskStatus
+
+        qraft_task = self._pending_task()
+
+        assert lease.open_marker_lease(f"qraft:{qraft_task.id}:2", "q2-retry-2") is True
+
+        attempt = QraftTaskAttempt.objects.get(q2_task_id="q2-retry-2")
+        assert attempt.qraft_task_id == qraft_task.id
+        assert attempt.attempt_number == 2
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.RUNNING
+
+    def test_pre_execute_opens_the_lease_for_a_retry(self, db, monkeypatch):
+        from qraft.models import QraftTaskAttempt, TaskStatus
+
+        started = []
+        monkeypatch.setattr(lease, "start_heartbeat", started.append)
+        qraft_task = self._pending_task()
+
+        pre_execute.send(
+            sender="django_q",
+            func=lambda: None,
+            task={"id": "q2-retry-3", "name": f"qraft:{qraft_task.id}:3"},
+        )
+
+        assert started == ["q2-retry-3"]
+        attempt = QraftTaskAttempt.objects.get(q2_task_id="q2-retry-3")
+        # Heartbeat stamped, so a dead worker is visible to the reaper.
+        assert attempt.heartbeat_at is not None
+        assert attempt.date_started is not None
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.RUNNING
+
+    def test_reaper_reclaims_a_retry_whose_worker_died(self, db, monkeypatch):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from qraft.models import QraftTaskAttempt
+        from qraft.reaper import reap_orphans
+
+        monkeypatch.setattr(lease, "start_heartbeat", lambda _id: None)
+        qraft_task = self._pending_task()
+
+        pre_execute.send(
+            sender="django_q",
+            func=lambda: None,
+            task={"id": "q2-retry-dead", "name": f"qraft:{qraft_task.id}:2"},
+        )
+
+        # Worker dies: the heartbeat goes stale and no result is ever recorded.
+        QraftTaskAttempt.objects.filter(q2_task_id="q2-retry-dead").update(
+            heartbeat_at=timezone.now() - timedelta(hours=1)
+        )
+
+        assert reap_orphans() == 1
+        attempt = QraftTaskAttempt.objects.get(q2_task_id="q2-retry-dead")
+        assert attempt.success is False
+        assert attempt.exception_class == "OrphanedTask"
+
+    def test_does_not_resurrect_a_settled_task(self, db):
+        from qraft.models import QraftTask, TaskStatus
+
+        qraft_task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.SUCCEEDED,
+        )
+
+        assert lease.open_marker_lease(f"qraft:{qraft_task.id}:2", "q2-dupe") is True
+
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.SUCCEEDED
+
+    def test_ignores_a_task_without_a_marker(self, db):
+        from qraft.models import QraftTaskAttempt
+
+        assert lease.open_marker_lease("some-user-task-name", "q2-plain") is False
+        assert lease.open_marker_lease(None, "q2-plain") is False
+        assert not QraftTaskAttempt.objects.filter(q2_task_id="q2-plain").exists()

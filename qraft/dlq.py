@@ -2,19 +2,17 @@
 Dead-letter queue: inspect and requeue tasks that failed permanently.
 
 No dedicated table - "dead" is just QraftTask.status in (FAILED, EXHAUSTED).
-Requeueing reuses the retry machinery's Schedule+marker pattern so the
-requeued run lands as the next attempt on the same QraftTask, preserving
-history instead of starting a new lineage.
+Requeueing reuses the retry machinery's scheduled-attempt path so the requeued
+run lands as the next attempt on the same QraftTask, preserving history
+instead of starting a new lineage.
 """
 
 import logging
-from datetime import datetime, timezone
 
-from django.db import transaction
 from django.db.models import QuerySet
+from django.utils import timezone
 
 from .models import QraftTask, TaskStatus
-from .retry import QRAFT_MARKER_FMT, QRAFT_MARKER_PREFIX, QRAFT_RETRY_NAME_FMT
 
 logger = logging.getLogger("qraft")
 
@@ -34,17 +32,22 @@ def requeue(qraft_task: QraftTask) -> str:
     """
     Re-enqueue a dead task's stored func/args/kwargs.
 
-    Schedules the run for immediate execution (next_run=now) using the same
-    Schedule+marker mechanism as RetryPolicy.schedule_retry, so it continues
-    the attempt series on the same QraftTask and status returns to PENDING.
+    Creates an immediately-due SCHEDULED attempt, so the run continues the
+    attempt series on the same QraftTask and status returns to PENDING.
+
+    The target cluster comes from the task's last attempt, not from the
+    process calling this: an operator's shell has a `Conf.CLUSTER_NAME` that
+    says nothing about where the task ran. A task whose attempts predate that
+    record leaves it null, which now means "the first dispatcher to claim it"
+    rather than the old "only a cluster named after the default prefix".
 
     Raises:
         ValueError: if the task isn't currently FAILED or EXHAUSTED.
 
     Returns:
-        str: the created Django-Q2 Schedule ID.
+        str: id of the scheduled QraftTaskAttempt.
     """
-    from django_q.models import Schedule
+    from .scheduler import _inherited_cluster, schedule_attempt
 
     if qraft_task.status not in DEAD_STATUSES:
         raise ValueError(
@@ -55,37 +58,18 @@ def requeue(qraft_task: QraftTask) -> str:
     latest = qraft_task.latest_attempt
     next_attempt = (latest.attempt_number if latest else 0) + 1
 
-    marker = QRAFT_MARKER_FMT.format(
-        prefix=QRAFT_MARKER_PREFIX, task_id=qraft_task.id, attempt=next_attempt
+    attempt = schedule_attempt(
+        qraft_task,
+        next_attempt,
+        timezone.now(),
+        cluster=_inherited_cluster(qraft_task),
     )
-    schedule_kwargs = {"q_options": {"task_name": marker}}
-
-    with transaction.atomic():
-        # Scheduled via qraft.runner.run_task rather than qraft_task.func
-        # directly: a @task-decorated function's dotted path resolves to the
-        # non-callable django.tasks wrapper, not the function itself.
-        schedule = Schedule.objects.create(
-            name=QRAFT_RETRY_NAME_FMT.format(
-                task_id=qraft_task.id, attempt=next_attempt
-            ),
-            func="qraft.runner.run_task",
-            args=repr(
-                (qraft_task.func, list(qraft_task.task_args), qraft_task.task_kwargs)
-            ),
-            kwargs=repr(schedule_kwargs),
-            hook="qraft.hooks.qraft_hook_handler",
-            schedule_type=Schedule.ONCE,
-            next_run=datetime.now(timezone.utc),
-        )
-
-        qraft_task.status = TaskStatus.PENDING
-        qraft_task.save(update_fields=["status", "date_updated"])
 
     logger.info(
-        "Requeued QraftTask %s as attempt %d (schedule_id=%s)",
+        "Requeued QraftTask %s as attempt %d (attempt_id=%s)",
         qraft_task.id,
         next_attempt,
-        schedule.id,
+        attempt.id,
     )
 
-    return str(schedule.id)
+    return str(attempt.id)

@@ -5,6 +5,7 @@ import logging
 from django.db import transaction
 from django_q.tasks import async_task as q2_async_task
 
+from qraft.conf import executing_cluster
 from qraft.hooks import dispatch_hook_once
 from qraft.models import (
     QraftBatchModel,
@@ -18,6 +19,12 @@ from qraft.models import (
 )
 
 _logger = logging.getLogger("qraft.dispatchers")
+
+# A failed task settles at EXHAUSTED once a retry policy runs out, but at
+# FAILED when it has no policy at all - handle_task_retry() leaves the status
+# the hook handler wrote. Treating only EXHAUSTED as terminal silently drops
+# every policy-less workflow task, hanging the workflow forever.
+TERMINAL_FAILURE_STATUSES = (TaskStatus.EXHAUSTED, TaskStatus.FAILED)
 
 
 class ChainDispatcher:
@@ -163,8 +170,9 @@ class ChainDispatcher:
             )
 
     def _is_task_exhausted(self) -> bool:
-        """Check if the task has exhausted all retries."""
-        return self.attempt.qraft_task.status == TaskStatus.EXHAUSTED
+        """Check whether the task is done failing (no further retry pending)."""
+        self.attempt.qraft_task.refresh_from_db(fields=["status"])
+        return self.attempt.qraft_task.status in TERMINAL_FAILURE_STATUSES
 
 
 class ParallelDispatcher:
@@ -223,16 +231,19 @@ class ParallelDispatcher:
         """
         if self.attempt.success:
             return True
-        # Check if task status is EXHAUSTED (all retries done)
         self.attempt.qraft_task.refresh_from_db()
-        return self.attempt.qraft_task.status == TaskStatus.EXHAUSTED
+        return self.attempt.qraft_task.status in TERMINAL_FAILURE_STATUSES
 
     def _atomic_increment(self) -> bool:
         """
-        Atomically update counters using F() expressions.
+        Update the workflow counters under a row lock.
 
-        Uses the `counted` flag on QraftTaskAttempt for idempotency -
-        if this attempt was already counted, skip the increment.
+        `select_for_update()` on the workflow serialises concurrent
+        completions, and the `counted` flag on QraftTaskAttempt makes a
+        redelivered completion a no-op. F() expressions were considered and
+        rejected: they would make the increment atomic but could not dedupe,
+        and the completion test needs to read the resulting value back, so
+        the lock is doing work an F() update cannot replace.
 
         The outer cancellation check in `handle()` reads the workflow
         outside any lock, so a cancel can land between that check and this
@@ -279,7 +290,19 @@ class ParallelDispatcher:
             else:
                 workflow.failure_count += 1
 
-            is_complete = workflow.completed_count == workflow.total_count
+            # `>=`, not `==`: an equality test that the counter steps over
+            # once leaves the workflow wedged at RUNNING with its hook never
+            # firing, which is a far worse failure than completing twice
+            # (WorkflowHookDispatch already makes the hook idempotent).
+            is_complete = workflow.completed_count >= workflow.total_count
+            if workflow.completed_count > workflow.total_count:
+                _logger.warning(
+                    "%s %s: completed_count %d exceeds total_count %d",
+                    self.workflow_type.capitalize(),
+                    workflow.id,
+                    workflow.completed_count,
+                    workflow.total_count,
+                )
             update_fields = [
                 "completed_count",
                 "success_count",
@@ -332,6 +355,8 @@ class ParallelDispatcher:
                 success_count=self.workflow.success_count,
                 failure_count=self.workflow.failure_count,
                 hook=None,
+                cluster=executing_cluster(),
+                ack_failure=True,
             )
         except Exception as e:
             _logger.warning(
@@ -369,21 +394,26 @@ def _queue_chain_step(chain: QraftChainModel, step: QraftChainStep):
     """
     Internal helper to queue a chain step as a QraftTask.
 
-    Creates a QraftTask and links it to the step.
+    Creates a QraftTask, queues it, and links it to the step.
+
+    All three share one transaction because `_create_workflow_task` enqueues
+    to Django-Q2 as it goes. A worker that picks the task up before the link
+    commits finds no `chain_step` in `route_workflow_completion`, and since
+    workflow tasks carry no task-level hooks the chain then stalls at RUNNING
+    forever. With the ORM broker the queue row is in the same database, so
+    the commit makes the enqueue and the link visible together.
     """
     from qraft.tasks import _create_workflow_task
 
-    # Create QraftTask for this step (doesn't queue to Q2 yet)
-    qraft_task = _create_workflow_task(
-        func=step.func,
-        args=step.task_args,
-        kwargs=step.task_kwargs,
-        qraft_options=step.qraft_options,
-    )
-
-    # Link step to task
-    step.qraft_task = qraft_task
-    step.save(update_fields=["qraft_task"])
+    with transaction.atomic():
+        qraft_task = _create_workflow_task(
+            func=step.func,
+            args=step.task_args,
+            kwargs=step.task_kwargs,
+            qraft_options=step.qraft_options,
+        )
+        step.qraft_task = qraft_task
+        step.save(update_fields=["qraft_task"])
 
     _logger.debug(
         "Queued chain step %d (chain=%s, task=%s)",
@@ -424,6 +454,10 @@ def _dispatch_workflow_hook(
             hook_path,
             *hook_args,
             hook=None,  # Prevent recursion
+            cluster=executing_cluster(),
+            # Nothing above this layer retries a workflow hook, so an
+            # unacknowledged failure would be redelivered indefinitely.
+            ack_failure=True,
             **hook_kwargs,
         ),
     )

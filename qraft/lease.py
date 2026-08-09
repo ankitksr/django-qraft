@@ -142,6 +142,33 @@ def stop_heartbeat(q2_task_id: str | None) -> None:
         stop_event.set()
 
 
+def open_marker_lease(task_name: str | None, q2_task_id: str) -> bool:
+    """
+    Create the attempt row for a marker-carrying task and mark it RUNNING.
+
+    Retries, DLQ requeues and deferred tasks are queued through a Schedule,
+    which leaves the QraftTask PENDING with no row for the attempt about to
+    run. Until both exist, a worker that dies mid-attempt is invisible to the
+    reaper, which only looks at unresolved attempts of RUNNING tasks.
+
+    Returns False when the task carries no Qraft marker.
+    """
+    from .hooks import attempt_from_marker
+    from .models import QraftTask, TaskStatus
+
+    attempt = attempt_from_marker(task_name, q2_task_id)
+    if attempt is None:
+        return False
+
+    # Scoped to PENDING: that is the state schedule_retry(), dlq.requeue()
+    # and the deferred-task path leave behind, and anything else is a
+    # duplicate delivery that must not resurrect a settled task.
+    QraftTask.objects.filter(
+        id=attempt.qraft_task_id, status=TaskStatus.PENDING
+    ).update(status=TaskStatus.RUNNING, date_updated=timezone.now())
+    return True
+
+
 def _on_pre_execute_lease(sender, func, task, **kwargs):
     """django_q `pre_execute` receiver: open the lease and start heartbeating."""
     q2_task_id = task.get("id")
@@ -149,7 +176,9 @@ def _on_pre_execute_lease(sender, func, task, **kwargs):
         return
     try:
         if not stamp_start(q2_task_id):
-            return
+            if not open_marker_lease(task.get("name"), q2_task_id):
+                return
+            stamp_start(q2_task_id)
     except Exception:
         _logger.exception("Could not open execution lease for %s", q2_task_id)
         return
