@@ -141,28 +141,42 @@ class QraftBatch(ParallelWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError(f"Batch already run (status: {self._model.status})")
 
-        with transaction.atomic():
-            self._model.total_count = len(self._tasks)
-            self._model.transition_to(WorkflowStatus.RUNNING)
-            self._model.save(update_fields=["total_count", "status", "date_updated"])
-
         from qraft.tasks import _create_workflow_task
 
-        for idx, task_data in enumerate(self._tasks):
-            _create_workflow_task(
-                func=task_data["func"],
-                args=task_data["args"],
-                kwargs=task_data["kwargs"],
-                qraft_options=task_data["qraft_options"],
-                qraft_batch_id=self._model.id,
-            )
-            _logger.debug(
-                "Queued batch task %d/%d (batch=%s, func=%s)",
-                idx + 1,
-                len(self._tasks),
-                self._model.id,
-                task_data["func"],
-            )
+        # One transaction for the publish and the whole fan-out: a failure
+        # creating any member rolls back total_count/RUNNING too, instead of
+        # leaving an unfinishable workflow with a partial member set. The
+        # publish must stay first - committing members before a final
+        # total_count would let the >= completion test finish the workflow
+        # on the first early completion.
+        try:
+            with transaction.atomic():
+                self._model.total_count = len(self._tasks)
+                self._model.transition_to(WorkflowStatus.RUNNING)
+                self._model.save(
+                    update_fields=["total_count", "status", "date_updated"]
+                )
+
+                for idx, task_data in enumerate(self._tasks):
+                    _create_workflow_task(
+                        func=task_data["func"],
+                        args=task_data["args"],
+                        kwargs=task_data["kwargs"],
+                        qraft_options=task_data["qraft_options"],
+                        qraft_batch_id=self._model.id,
+                    )
+                    _logger.debug(
+                        "Queued batch task %d/%d (batch=%s, func=%s)",
+                        idx + 1,
+                        len(self._tasks),
+                        self._model.id,
+                        task_data["func"],
+                    )
+        except Exception:
+            # The rollback reverted the DB but not this instance; refresh so
+            # a retry of run() isn't refused as "already run".
+            self._model.refresh_from_db()
+            raise
 
         _logger.info(
             "Started QraftBatch %s with %d tasks",

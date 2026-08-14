@@ -8,6 +8,9 @@ import pytest
 pytestmark = pytest.mark.usefixtures("_disable_hook_validation")
 
 from qraft.dispatchers import (  # noqa: E402
+    INCREMENT_COMPLETE,
+    INCREMENT_NOOP,
+    INCREMENT_PARTIAL,
     ChainDispatcher,
     ParallelDispatcher,
     _dispatch_workflow_hook,
@@ -43,6 +46,35 @@ def _make_attempt(workflow_fk_field, workflow, success):
         status=TaskStatus.SUCCEEDED if success else TaskStatus.EXHAUSTED,
         **{workflow_fk_field: workflow},
     )
+    return QraftTaskAttempt.objects.create(
+        qraft_task=task,
+        attempt_number=1,
+        q2_task_id=f"q2-{task.id}",
+        success=success,
+    )
+
+
+def _chain_with_steps(n=2, **chain_fields):
+    """Create a RUNNING chain with n steps."""
+    chain = QraftChainModel.objects.create(
+        status=WorkflowStatus.RUNNING, **chain_fields
+    )
+    steps = [
+        QraftChainStep.objects.create(
+            chain=chain,
+            step_index=i,
+            func="demo.showcase.tasks.noop_task",
+        )
+        for i in range(n)
+    ]
+    return chain, steps
+
+
+def _chain_attempt(step, success, task_status):
+    """Create and link a QraftTask + QraftTaskAttempt for a chain step."""
+    task = QraftTask.objects.create(func=step.func, status=task_status)
+    step.qraft_task = task
+    step.save(update_fields=["qraft_task"])
     return QraftTaskAttempt.objects.create(
         qraft_task=task,
         attempt_number=1,
@@ -194,9 +226,7 @@ class TestParallelDispatcherCompletion:
         iter_model.status = WorkflowStatus.CANCELLED
         iter_model.save(update_fields=["status"])
 
-        is_complete = dispatcher._atomic_increment()
-
-        assert is_complete is False
+        assert dispatcher._atomic_increment() is INCREMENT_NOOP
         iter_model.refresh_from_db()
         assert iter_model.status == WorkflowStatus.CANCELLED
         assert iter_model.completed_count == 0
@@ -330,6 +360,182 @@ class TestChainDispatcher:
 
         chain.refresh_from_db()
         assert chain.status == WorkflowStatus.CANCELLED
+
+
+class TestChainAdvanceEnqueueAtomicity:
+    """Regression: a broker failure while queueing step N+1 must roll back the
+    index advance, or the chain wedges at RUNNING with no task for N+1 and the
+    duplicate-completion guard turns every redelivery into a no-op."""
+
+    def test_enqueue_failure_rolls_back_advance_and_redelivery_retries(self, db):
+        chain, (step0, step1) = _chain_with_steps(2)
+        attempt = _chain_attempt(step0, success=True, task_status=TaskStatus.SUCCEEDED)
+
+        with patch(
+            "qraft.tasks.q2_async_task", side_effect=RuntimeError("broker down")
+        ):
+            with pytest.raises(RuntimeError):
+                ChainDispatcher(chain, step0, attempt).handle()
+
+        chain.refresh_from_db()
+        step1.refresh_from_db()
+        assert chain.status == WorkflowStatus.RUNNING
+        assert chain.current_step_index == 0
+        assert step1.qraft_task is None
+        # step0's task survives; the rolled-back step1 task does not
+        assert QraftTask.objects.count() == 1
+
+        # Redelivery of the same completion retries and succeeds.
+        with patch("qraft.tasks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-next"
+            ChainDispatcher(chain, step0, attempt).handle()
+
+        chain.refresh_from_db()
+        step1.refresh_from_db()
+        assert chain.current_step_index == 1
+        assert step1.qraft_task is not None
+
+
+class TestChainCancelNotClobbered:
+    """Mirror of the parallel cancel-race guard: a cancel committing between
+    handle()'s unlocked check and the locked write must survive, not be
+    overwritten to SUCCEEDED/FAILED or advanced over."""
+
+    def test_cancel_racing_final_completion_is_not_overwritten(self, db):
+        chain, (step0,) = _chain_with_steps(1, success_hook="showcase.tasks.on_success")
+        attempt = _chain_attempt(step0, success=True, task_status=TaskStatus.SUCCEEDED)
+        dispatcher = ChainDispatcher(chain, step0, attempt)
+
+        # handle()'s outer check saw RUNNING; the cancel commits before the
+        # lock is taken (update() keeps the dispatcher's instance stale).
+        QraftChainModel.objects.filter(id=chain.id).update(
+            status=WorkflowStatus.CANCELLED
+        )
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            dispatcher._handle_step_success()
+            mock_async.assert_not_called()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.CANCELLED
+
+    def test_cancel_racing_step_failure_is_not_overwritten(self, db):
+        chain, (step0, step1) = _chain_with_steps(
+            2, failure_hook="showcase.tasks.on_failure"
+        )
+        attempt = _chain_attempt(step0, success=False, task_status=TaskStatus.EXHAUSTED)
+        dispatcher = ChainDispatcher(chain, step0, attempt)
+
+        QraftChainModel.objects.filter(id=chain.id).update(
+            status=WorkflowStatus.CANCELLED
+        )
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            dispatcher._handle_step_failure()
+            mock_async.assert_not_called()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.CANCELLED
+
+    def test_cancel_racing_intermediate_success_queues_nothing(self, db):
+        chain, (step0, step1) = _chain_with_steps(2)
+        attempt = _chain_attempt(step0, success=True, task_status=TaskStatus.SUCCEEDED)
+        dispatcher = ChainDispatcher(chain, step0, attempt)
+
+        QraftChainModel.objects.filter(id=chain.id).update(
+            status=WorkflowStatus.CANCELLED
+        )
+
+        with patch("qraft.tasks.q2_async_task") as mock_async:
+            dispatcher._handle_step_success()
+            mock_async.assert_not_called()
+
+        chain.refresh_from_db()
+        step1.refresh_from_db()
+        assert chain.status == WorkflowStatus.CANCELLED
+        assert chain.current_step_index == 0
+        assert step1.qraft_task is None
+
+
+class TestProgressHookDispatch:
+    """Progress hooks fire only on genuine partial completions - not for
+    duplicate deliveries (counters already final) or cancelled workflows."""
+
+    @pytest.fixture
+    def progress_iter(self, db):
+        return QraftIterModel.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            total_count=2,
+            status=WorkflowStatus.RUNNING,
+            success_hook="showcase.tasks.on_success",
+            progress_hook="showcase.tasks.on_progress",
+        )
+
+    def test_partial_completion_fires_progress_hook(self, db, progress_iter):
+        attempt = _make_attempt("qraft_iter", progress_iter, success=True)
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            ParallelDispatcher(progress_iter, attempt).handle()
+
+        mock_async.assert_called_once()
+        assert mock_async.call_args[0][0] == "showcase.tasks.on_progress"
+
+    def test_duplicate_delivery_fires_no_progress_hook(self, db, progress_iter):
+        attempt = _make_attempt("qraft_iter", progress_iter, success=True)
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            ParallelDispatcher(progress_iter, attempt).handle()
+            ParallelDispatcher(progress_iter, attempt).handle()
+
+        # First delivery counted and fired the progress hook; the duplicate
+        # is a no-op and must not fire it again.
+        assert mock_async.call_count == 1
+
+    def test_cancelled_workflow_fires_no_progress_hook(self, db, progress_iter):
+        attempt = _make_attempt("qraft_iter", progress_iter, success=True)
+        dispatcher = ParallelDispatcher(progress_iter, attempt)
+
+        QraftIterModel.objects.filter(id=progress_iter.id).update(
+            status=WorkflowStatus.CANCELLED
+        )
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            dispatcher.handle()
+
+        mock_async.assert_not_called()
+
+    def test_completion_fires_workflow_hook_not_progress(self, db, progress_iter):
+        attempt1 = _make_attempt("qraft_iter", progress_iter, success=True)
+        attempt2 = _make_attempt("qraft_iter", progress_iter, success=True)
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook"
+            ParallelDispatcher(progress_iter, attempt1).handle()
+            ParallelDispatcher(progress_iter, attempt2).handle()
+
+        hooks_fired = [c[0][0] for c in mock_async.call_args_list]
+        assert hooks_fired == [
+            "showcase.tasks.on_progress",
+            "showcase.tasks.on_success",
+        ]
+
+    def test_increment_outcomes_are_distinguished(self, db, progress_iter):
+        attempt1 = _make_attempt("qraft_iter", progress_iter, success=True)
+        attempt2 = _make_attempt("qraft_iter", progress_iter, success=True)
+
+        assert (
+            ParallelDispatcher(progress_iter, attempt1)._atomic_increment()
+            is INCREMENT_PARTIAL
+        )
+        # Redelivery of an already-counted attempt
+        assert (
+            ParallelDispatcher(progress_iter, attempt1)._atomic_increment()
+            is INCREMENT_NOOP
+        )
+        assert (
+            ParallelDispatcher(progress_iter, attempt2)._atomic_increment()
+            is INCREMENT_COMPLETE
+        )
 
 
 class TestWorkflowHookDispatchFailureCleanup:

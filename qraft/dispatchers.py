@@ -26,6 +26,13 @@ _logger = logging.getLogger("qraft.dispatchers")
 # every policy-less workflow task, hanging the workflow forever.
 TERMINAL_FAILURE_STATUSES = (TaskStatus.EXHAUSTED, TaskStatus.FAILED)
 
+# _atomic_increment outcomes. A duplicate delivery and a cancel-under-lock
+# both leave the counters untouched, but they must stay distinguishable from
+# a genuine partial completion, or handle() fires progress hooks for no-ops.
+INCREMENT_NOOP = "noop"
+INCREMENT_PARTIAL = "partial"
+INCREMENT_COMPLETE = "complete"
+
 
 class ChainDispatcher:
     """Handles chain step completion and sequential continuation."""
@@ -78,11 +85,30 @@ class ChainDispatcher:
         below is the guard: once this step's completion has advanced the
         chain, current_step_index no longer matches the step index, so a
         second delivery bails before touching anything.
+
+        The advance and the next step's creation/enqueue share the locked
+        transaction: if the enqueue fails, the advance rolls back with it,
+        so a redelivery can retry instead of finding the chain stranded at
+        an index whose task was never queued. With the ORM broker the queue
+        row is in the same database, so the commit publishes the advance and
+        the enqueue together (the argument _queue_chain_step makes for the
+        task/link pairing).
         """
         next_step = self.chain.steps.filter(step_index=self.step.step_index + 1).first()
+        completed = False
 
         with transaction.atomic():
             chain = QraftChainModel.objects.select_for_update().get(id=self.chain.id)
+            # A cancel can land between handle()'s unlocked check and this
+            # lock; re-checking here keeps it from being advanced over or
+            # overwritten to SUCCEEDED (mirrors _atomic_increment).
+            if chain.status == WorkflowStatus.CANCELLED:
+                self.chain = chain
+                _logger.debug(
+                    "Chain %s: cancelled under lock, skipping step processing",
+                    chain.id,
+                )
+                return
             if chain.current_step_index != self.step.step_index:
                 _logger.debug(
                     "Chain %s: step %d already advanced past (current=%d), "
@@ -95,7 +121,9 @@ class ChainDispatcher:
             self.chain = chain
 
             if not next_step:
-                queue_next = False
+                chain.status = WorkflowStatus.SUCCEEDED
+                chain.save(update_fields=["status", "date_updated"])
+                completed = True
             elif next_step.requires_approval:
                 chain.current_step_index = next_step.step_index
                 chain.transition_to(WorkflowStatus.WAITING_APPROVAL)
@@ -112,10 +140,10 @@ class ChainDispatcher:
             else:
                 chain.current_step_index = next_step.step_index
                 chain.save(update_fields=["current_step_index", "date_updated"])
-                queue_next = True
+                _queue_chain_step(chain, next_step)
 
-        if not queue_next:
-            self._complete_chain(success=True)
+        if completed:
+            self._dispatch_chain_hook(success=True)
             _logger.info(
                 "Chain %s: final step %d succeeded, chain complete",
                 self.chain.id,
@@ -123,7 +151,6 @@ class ChainDispatcher:
             )
             return
 
-        _queue_chain_step(self.chain, next_step)
         _logger.info(
             "Chain %s: step %d succeeded, queued step %d",
             self.chain.id,
@@ -144,16 +171,31 @@ class ChainDispatcher:
         """
         Mark chain as complete and dispatch workflow hook.
 
+        Re-checks cancellation under the row lock: a cancel that committed
+        after handle()'s unlocked check must be left alone, not overwritten
+        to SUCCEEDED/FAILED (mirrors _atomic_increment).
+
         Args:
             success: True if chain succeeded, False if failed
         """
         with transaction.atomic():
-            self.chain.status = (
+            chain = QraftChainModel.objects.select_for_update().get(id=self.chain.id)
+            if chain.status == WorkflowStatus.CANCELLED:
+                self.chain = chain
+                _logger.debug(
+                    "Chain %s: cancelled under lock, skipping completion", chain.id
+                )
+                return
+            chain.status = (
                 WorkflowStatus.SUCCEEDED if success else WorkflowStatus.FAILED
             )
-            self.chain.save(update_fields=["status", "date_updated"])
+            chain.save(update_fields=["status", "date_updated"])
+            self.chain = chain
 
-        # Dispatch chain-level hook
+        self._dispatch_chain_hook(success)
+
+    def _dispatch_chain_hook(self, success: bool):
+        """Dispatch the chain-level success/failure hook, if configured."""
         hook = self.chain.success_hook if success else self.chain.failure_hook
         if hook:
             _dispatch_workflow_hook(
@@ -200,26 +242,18 @@ class ParallelDispatcher:
 
         Only processes terminal states (success or exhausted).
         Uses atomic counter updates to prevent race conditions.
+        Cancellation is checked inside _atomic_increment, under the row
+        lock - an unlocked pre-check here could never be authoritative.
         """
-        # Skip processing if workflow was cancelled
-        self.workflow.refresh_from_db()
-        if self.workflow.status == WorkflowStatus.CANCELLED:
-            _logger.debug(
-                "%s %s cancelled, skipping task processing",
-                self.workflow_type,
-                self.workflow.id,
-            )
-            return
-
         # Only process if task is truly done (not being retried)
         if not self._is_task_terminal():
             return
 
-        is_complete = self._atomic_increment()
+        outcome = self._atomic_increment()
 
-        if is_complete:
+        if outcome is INCREMENT_COMPLETE:
             self._dispatch_workflow_hook()
-        elif self.workflow.progress_hook:
+        elif outcome is INCREMENT_PARTIAL and self.workflow.progress_hook:
             self._dispatch_progress_hook()
 
     def _is_task_terminal(self) -> bool:
@@ -234,7 +268,7 @@ class ParallelDispatcher:
         self.attempt.qraft_task.refresh_from_db()
         return self.attempt.qraft_task.status in TERMINAL_FAILURE_STATUSES
 
-    def _atomic_increment(self) -> bool:
+    def _atomic_increment(self) -> str:
         """
         Update the workflow counters under a row lock.
 
@@ -245,15 +279,15 @@ class ParallelDispatcher:
         and the completion test needs to read the resulting value back, so
         the lock is doing work an F() update cannot replace.
 
-        The outer cancellation check in `handle()` reads the workflow
-        outside any lock, so a cancel can land between that check and this
-        method. Re-checking status here under `select_for_update()` closes
-        that window: a workflow cancelled in the meantime is left alone,
-        uncounted and uncompleted, instead of being flipped back to
-        SUCCEEDED/FAILED.
+        Cancellation is checked here, under `select_for_update()`: a cancel
+        can commit at any point before the lock is taken, so a workflow
+        found cancelled is left alone, uncounted and uncompleted, instead
+        of being flipped back to SUCCEEDED/FAILED.
 
         Returns:
-            bool: True if workflow is now complete
+            One of INCREMENT_NOOP (duplicate delivery or cancelled - nothing
+            counted), INCREMENT_PARTIAL (counted, workflow still running),
+            INCREMENT_COMPLETE (counted, workflow now complete).
         """
         with transaction.atomic():
             workflow = (
@@ -266,7 +300,7 @@ class ParallelDispatcher:
                     workflow.id,
                 )
                 self.workflow = workflow
-                return False
+                return INCREMENT_NOOP
 
             # Lock the attempt to check/set counted flag atomically
             attempt = QraftTaskAttempt.objects.select_for_update().get(
@@ -279,7 +313,7 @@ class ParallelDispatcher:
                     self.workflow.id,
                     attempt.id,
                 )
-                return False
+                return INCREMENT_NOOP
 
             attempt.counted = True
             attempt.save(update_fields=["counted"])
@@ -339,9 +373,8 @@ class ParallelDispatcher:
                     workflow.id,
                     workflow.status,
                 )
-                return True
 
-        return False
+        return INCREMENT_COMPLETE if is_complete else INCREMENT_PARTIAL
 
     def _dispatch_progress_hook(self):
         """Dispatch progress hook after each task completion (non-terminal)."""

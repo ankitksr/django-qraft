@@ -7,10 +7,10 @@ import pytest
 # Disable hook path validation for tests with fake module paths
 pytestmark = pytest.mark.usefixtures("_disable_hook_validation")
 
-from qraft.batch import QraftBatch
-from qraft.dispatchers import ParallelDispatcher
-from qraft.hooks import qraft_hook_handler
-from qraft.models import (
+from qraft.batch import QraftBatch  # noqa: E402
+from qraft.dispatchers import ParallelDispatcher  # noqa: E402
+from qraft.hooks import qraft_hook_handler  # noqa: E402
+from qraft.models import (  # noqa: E402
     QraftBatchModel,
     QraftTask,
     QraftTaskAttempt,
@@ -169,6 +169,42 @@ class TestBatchExecution:
             assert task.failure_hook is None
 
 
+class TestBatchRunAtomicity:
+    """run() publishes total_count/RUNNING and creates all members in one
+    transaction - a failure mid-fan-out must not leave a durably RUNNING
+    workflow with a partial member set."""
+
+    def test_member_failure_rolls_back_publish(self, db, simple_batch):
+        with patch(
+            "qraft.tasks.q2_async_task",
+            side_effect=["q2-1", RuntimeError("broker down")],
+        ):
+            with pytest.raises(RuntimeError):
+                simple_batch.run()
+
+        model = QraftBatchModel.objects.get(id=simple_batch.id)
+        assert model.status == WorkflowStatus.PENDING
+        assert model.total_count == 0
+        assert QraftTask.objects.filter(qraft_batch=model).count() == 0
+
+    def test_run_can_retry_after_failure(self, db, simple_batch):
+        with patch(
+            "qraft.tasks.q2_async_task", side_effect=RuntimeError("broker down")
+        ):
+            with pytest.raises(RuntimeError):
+                simple_batch.run()
+
+        with patch(
+            "qraft.tasks.q2_async_task",
+            side_effect=[f"q2-{i}" for i in range(3)],
+        ):
+            simple_batch.run()
+
+        assert simple_batch.status == WorkflowStatus.RUNNING
+        assert simple_batch.total_count == 3
+        assert QraftTask.objects.filter(qraft_batch=simple_batch._model).count() == 3
+
+
 class TestBatchCounters:
     """Test batch counter properties."""
 
@@ -248,7 +284,9 @@ class TestBatchIntegration:
 
         batch.run()
 
-        tasks = list(QraftTask.objects.filter(qraft_batch=batch._model).order_by("date_created"))
+        tasks = list(
+            QraftTask.objects.filter(qraft_batch=batch._model).order_by("date_created")
+        )
         assert tasks[0].retry_policy["max_attempts"] == 1
         assert tasks[1].retry_policy["max_attempts"] == 5
         assert tasks[2].retry_policy["max_attempts"] == 3
@@ -265,7 +303,9 @@ class TestBatchIntegration:
 
         batch.run()
 
-        tasks = list(QraftTask.objects.filter(qraft_batch=batch._model).order_by("date_created"))
+        tasks = list(
+            QraftTask.objects.filter(qraft_batch=batch._model).order_by("date_created")
+        )
 
         # Verify heterogeneous nature
         assert tasks[0].func == "myapp.tasks.fetch_sales"
@@ -305,7 +345,9 @@ class TestBatchIntegration:
 
         batch = QraftBatch()
         batch.append("myapp.tasks.fetch_sales", qraft_options={"cluster": "io-workers"})
-        batch.append("myapp.tasks.compute_stats", qraft_options={"cluster": "cpu-workers"})
+        batch.append(
+            "myapp.tasks.compute_stats", qraft_options={"cluster": "cpu-workers"}
+        )
         batch.append("myapp.tasks.send_email", qraft_options={"cluster": "default"})
 
         batch.run()
@@ -338,7 +380,8 @@ class TestBatchHookDispatch:
 
         qraft_task = QraftTask.objects.get(qraft_batch=batch._model)
         attempt = QraftTaskAttempt.objects.get(
-            qraft_task=qraft_task, attempt_number=1,
+            qraft_task=qraft_task,
+            attempt_number=1,
         )
 
         # Mark task as EXHAUSTED (all retries done)
@@ -383,7 +426,8 @@ class TestBatchHookDispatch:
 
         for qraft_task in tasks:
             attempt = QraftTaskAttempt.objects.get(
-                qraft_task=qraft_task, attempt_number=1,
+                qraft_task=qraft_task,
+                attempt_number=1,
             )
             mock_q2_task = Mock()
             mock_q2_task.id = attempt.q2_task_id

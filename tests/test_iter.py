@@ -7,8 +7,13 @@ import pytest
 # Disable hook path validation for tests with fake module paths
 pytestmark = pytest.mark.usefixtures("_disable_hook_validation")
 
-from qraft.iter import QraftIter
-from qraft.models import QraftIterModel, QraftTask, TaskStatus, WorkflowStatus
+from qraft.iter import QraftIter  # noqa: E402
+from qraft.models import (  # noqa: E402
+    QraftIterModel,
+    QraftTask,
+    TaskStatus,
+    WorkflowStatus,
+)
 
 
 @pytest.fixture
@@ -151,6 +156,42 @@ class TestIterExecution:
         assert task.failure_hook is None
 
 
+class TestIterRunAtomicity:
+    """run() publishes total_count/RUNNING and creates all members in one
+    transaction - a failure mid-fan-out must not leave a durably RUNNING
+    workflow with a partial member set."""
+
+    def test_member_failure_rolls_back_publish(self, db, simple_iter):
+        with patch(
+            "qraft.tasks.q2_async_task",
+            side_effect=["q2-1", "q2-2", RuntimeError("broker down")],
+        ):
+            with pytest.raises(RuntimeError):
+                simple_iter.run()
+
+        model = QraftIterModel.objects.get(id=simple_iter.id)
+        assert model.status == WorkflowStatus.PENDING
+        assert model.total_count == 0
+        assert QraftTask.objects.filter(qraft_iter=model).count() == 0
+
+    def test_run_can_retry_after_failure(self, db, simple_iter):
+        with patch(
+            "qraft.tasks.q2_async_task", side_effect=RuntimeError("broker down")
+        ):
+            with pytest.raises(RuntimeError):
+                simple_iter.run()
+
+        with patch(
+            "qraft.tasks.q2_async_task",
+            side_effect=[f"q2-{i}" for i in range(5)],
+        ):
+            simple_iter.run()
+
+        assert simple_iter.status == WorkflowStatus.RUNNING
+        assert simple_iter.total_count == 5
+        assert QraftTask.objects.filter(qraft_iter=simple_iter._model).count() == 5
+
+
 class TestIterCounters:
     """Test iter counter properties."""
 
@@ -243,7 +284,11 @@ class TestIterIntegration:
 
         iter_task.run()
 
-        tasks = list(QraftTask.objects.filter(qraft_iter=iter_task._model).order_by("date_created"))
+        tasks = list(
+            QraftTask.objects.filter(qraft_iter=iter_task._model).order_by(
+                "date_created"
+            )
+        )
         assert tasks[0].task_args == [1]
         assert tasks[0].task_kwargs == {}
 
