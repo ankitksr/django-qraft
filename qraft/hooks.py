@@ -57,8 +57,11 @@ def dispatch_hook_once(dispatch_model, lookup: dict, hook_path: str, enqueue) ->
 
     A placeholder q2_task_id is written inside the same get_or_create that
     claims the (unique) lookup, so two racing dispatchers can't both enqueue.
-    The row is removed again if enqueueing fails, leaving a later retry free
-    to dispatch.
+    Claim and enqueue share one transaction: with the ORM broker the queue row
+    lives in the same database, so both commit or neither does (the reasoning
+    of qraft.scheduler._claim_and_enqueue). With a broker that writes outside
+    the database an enqueue failure removes the claim again and the hook is
+    lost - nothing above this layer retries it.
 
     Args:
         dispatch_model: HookDispatch or WorkflowHookDispatch
@@ -73,17 +76,18 @@ def dispatch_hook_once(dispatch_model, lookup: dict, hook_path: str, enqueue) ->
                 **lookup,
                 defaults={"hook_path": hook_path, "q2_task_id": placeholder_id},
             )
+            if not created:
+                _logger.debug("%s already dispatched, skipping", dispatch)
+                return
 
-        if not created:
-            _logger.debug("%s already dispatched, skipping", dispatch)
-            return
-
-        dispatch.q2_task_id = enqueue()
-        dispatch.save(update_fields=["q2_task_id"])
+            dispatch.q2_task_id = enqueue()
+            dispatch.save(update_fields=["q2_task_id"])
 
         _logger.debug("Queued %s as task %s", dispatch, dispatch.q2_task_id)
 
     except Exception:
+        # The atomic block already rolled the claim back; this only fires for
+        # a claim that escaped it (an enqueue that committed independently).
         dispatch_model.objects.filter(**lookup, q2_task_id=placeholder_id).delete()
         _logger.exception(
             "Failed to dispatch hook '%s' for %s", hook_path, dispatch_model.__name__
@@ -228,7 +232,7 @@ def qraft_hook_handler(q2_task):
         q2_task: Django-Q2 Task object passed by the monitor process
     """
     from .dispatchers import route_workflow_completion
-    from .models import QraftTask, TaskStatus
+    from .models import QraftTask, QraftTaskAttempt, TaskStatus
 
     attempt = _resolve_attempt(q2_task)
     if attempt is None:
@@ -236,15 +240,37 @@ def qraft_hook_handler(q2_task):
     qraft_task = attempt.qraft_task
 
     # Update attempt outcome and task status atomically
+    retry_scheduled = False
     with transaction.atomic():
         # Re-fetch with lock to prevent concurrent status updates
         qraft_task = QraftTask.objects.select_for_update().get(id=qraft_task.id)
 
+        exception_class = (
+            None if q2_task.success else _extract_exception_class(q2_task.result)
+        )
+        # Compare-and-set: only an unresolved attempt may be resolved. A late
+        # result for an attempt already settled (a slow worker finishing after
+        # the reaper resolved its attempt as orphaned) is dropped - flipping
+        # the outcome here would double-count the member in parallel workflows.
+        resolved = QraftTaskAttempt.objects.filter(
+            id=attempt.id, success__isnull=True
+        ).update(
+            success=q2_task.success,
+            date_completed=q2_task.stopped,
+            exception_class=exception_class,
+        )
+        if not resolved:
+            _logger.warning(
+                "Attempt %d of QraftTask %s already resolved; dropping late "
+                "result from q2 task %s",
+                attempt.attempt_number,
+                qraft_task.id,
+                q2_task.id,
+            )
+            return
         attempt.success = q2_task.success
         attempt.date_completed = q2_task.stopped
-        if not q2_task.success:
-            attempt.exception_class = _extract_exception_class(q2_task.result)
-        attempt.save(update_fields=["success", "date_completed", "exception_class"])
+        attempt.exception_class = exception_class
 
         # Update task status (may be updated to EXHAUSTED or PENDING by retry handler)
         qraft_task.status = (
@@ -252,10 +278,16 @@ def qraft_hook_handler(q2_task):
         )
         qraft_task.save(update_fields=["status", "date_updated"])
 
+        # The retry (schedule_attempt - DB-only, no broker I/O) commits with
+        # the failed completion: a crash leaves either both or neither, never
+        # a task durably FAILED with its retry lost.
+        if not q2_task.success:
+            retry_scheduled = handle_task_retry(
+                qraft_task, attempt, result_text=q2_task.result
+            )
+
     # A scheduled retry means the task is not terminal yet
-    if not q2_task.success and handle_task_retry(
-        qraft_task, attempt, result_text=q2_task.result
-    ):
+    if retry_scheduled:
         return
 
     # Workflow tasks get workflow-level hooks only, never task-level ones.
@@ -298,7 +330,6 @@ class HookDispatcher:
             hook_path=self.qraft_task.success_hook,
             args=self.qraft_task.success_args or [],
             kwargs=self.qraft_task.success_kwargs or {},
-            task=q2_task,
             hook_type="success",
         )
 
@@ -311,11 +342,10 @@ class HookDispatcher:
             hook_path=self.qraft_task.failure_hook,
             args=self.qraft_task.failure_args or [],
             kwargs=self.qraft_task.failure_kwargs or {},
-            task=q2_task,
             hook_type="failure",
         )
 
-    def _call_hook(self, hook_path, args, kwargs, task, hook_type):
+    def _call_hook(self, hook_path, args, kwargs, hook_type):
         """
         Dispatch a hook function as an async task or call it synchronously.
 
@@ -327,7 +357,6 @@ class HookDispatcher:
             hook_path: Dotted import path to hook function
             args: Positional arguments for hook
             kwargs: Keyword arguments for hook
-            task: Django-Q2 Task instance
             hook_type: 'success' or 'failure' for logging
         """
         if get_conf().sync_hooks:

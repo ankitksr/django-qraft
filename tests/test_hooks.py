@@ -8,6 +8,7 @@ from qraft.hooks import (
     HookDispatcher,
     _extract_exception_class,
     _parse_qraft_marker,
+    dispatch_hook_once,
     qraft_hook_handler,
 )
 from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt, TaskStatus
@@ -205,7 +206,6 @@ class TestHookDispatcher:
                 hook_path="test.hooks.on_success",
                 args=[],
                 kwargs={},
-                task=mock_q2_task_success,
                 hook_type="success",
             )
 
@@ -226,7 +226,6 @@ class TestHookDispatcher:
                 hook_path="test.hooks.on_failure",
                 args=[],
                 kwargs={},
-                task=mock_q2_task_failure,
                 hook_type="failure",
             )
 
@@ -252,7 +251,6 @@ class TestHookDispatcher:
                 hook_path="test.hooks.on_failure",
                 args=[],
                 kwargs={},
-                task=mock_q2_task_failure,
                 hook_type="failure",
             )
 
@@ -288,7 +286,6 @@ class TestHookDispatcher:
                 hook_path="test.hooks.success",
                 args=[1, 2],
                 kwargs={"key": "value"},
-                task=mock_q2_task_success,
                 hook_type="success",
             )
 
@@ -330,7 +327,6 @@ class TestHookDispatcher:
                 hook_path="test.hooks.success",
                 args=[],
                 kwargs={},
-                task=mock_q2_task_success,
                 hook_type="success",
             )
 
@@ -354,12 +350,141 @@ class TestHookDispatcher:
                 hook_path="test.hooks.success",
                 args=[1, 2],
                 kwargs={"key": "value"},
-                task=mock_q2_task_success,
                 hook_type="success",
             )
 
         # Verify hook was called synchronously
         mock_hook.assert_called_once_with(1, 2, key="value")
+
+
+@pytest.mark.django_db
+class TestCompletionRetryAtomicity:
+    """The failed completion and its retry commit in one transaction (B1)."""
+
+    def test_failed_completion_rolls_back_with_its_retry(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
+        """
+        A crash between recording the failure and scheduling the retry must
+        not commit the failure alone - a durably FAILED task with no retry
+        row is indistinguishable from a legitimate terminal failure.
+        """
+        qraft_task.status = TaskStatus.RUNNING
+        qraft_task.save(update_fields=["status"])
+        mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
+
+        with patch("qraft.hooks.handle_task_retry", side_effect=RuntimeError("crash")):
+            with pytest.raises(RuntimeError):
+                qraft_hook_handler(mock_q2_task_failure)
+
+        # Nothing committed: the attempt is still unresolved, the task still
+        # RUNNING, and a redelivery can process the completion cleanly.
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.success is None
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.RUNNING
+
+    def test_retry_is_scheduled_when_the_completion_commits(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
+        """After the handler returns, the SCHEDULED retry already exists."""
+        from qraft.models.tasks import AttemptState
+
+        mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
+
+        with patch("qraft.hooks.HookDispatcher") as mock_dispatcher:
+            qraft_hook_handler(mock_q2_task_failure)
+
+        # Retry scheduled, so no task-level hook fires
+        mock_dispatcher.assert_not_called()
+
+        retry = qraft_task.attempts.get(attempt_number=2)
+        assert retry.state == AttemptState.SCHEDULED
+        assert retry.not_before is not None
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.PENDING
+
+
+@pytest.mark.django_db
+class TestLateResultDropped:
+    """A completion for an already-resolved attempt is dropped (B2)."""
+
+    def test_late_result_leaves_attempt_task_and_workflows_untouched(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
+        # The attempt was already settled (e.g. reaped as an orphan) and the
+        # slow original worker's result arrives late.
+        qraft_task_attempt.success = True
+        qraft_task_attempt.save(update_fields=["success"])
+        qraft_task.status = TaskStatus.SUCCEEDED
+        qraft_task.save(update_fields=["status"])
+        mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
+
+        with (
+            patch("qraft.dispatchers.route_workflow_completion") as mock_route,
+            patch("qraft.hooks.HookDispatcher") as mock_dispatcher,
+            patch("qraft.hooks._logger.warning") as mock_warn,
+        ):
+            qraft_hook_handler(mock_q2_task_failure)
+
+        mock_route.assert_not_called()
+        mock_dispatcher.assert_not_called()
+        mock_warn.assert_called_once()
+        assert "already resolved" in mock_warn.call_args[0][0]
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.success is True
+        assert qraft_task_attempt.exception_class is None
+        qraft_task.refresh_from_db()
+        assert qraft_task.status == TaskStatus.SUCCEEDED
+        # No retry was scheduled off the dropped failure
+        assert qraft_task.attempts.count() == 1
+
+
+@pytest.mark.django_db
+class TestDispatchHookOnce:
+    """Claim and enqueue share one transaction (B3)."""
+
+    def test_enqueue_failure_removes_placeholder_and_logs(self, qraft_task):
+        """The hook is lost on enqueue failure; nothing retries it."""
+
+        def boom():
+            raise ConnectionError("broker down")
+
+        with patch("qraft.hooks._logger.exception") as mock_log:
+            dispatch_hook_once(
+                HookDispatch,
+                {"qraft_task": qraft_task, "hook_type": "success"},
+                "test.hooks.success",
+                boom,
+            )
+
+        assert not HookDispatch.objects.exists()
+        mock_log.assert_called_once()
+        assert "Failed to dispatch hook" in mock_log.call_args[0][0]
+
+    def test_claim_and_enqueue_roll_back_together(self, qraft_task):
+        """
+        With the ORM broker the queue write lands in the same database, so a
+        failure after it must take the queue row down with the placeholder -
+        neither a claimed-but-unqueued hook nor a queued-but-unclaimed one.
+        """
+
+        def enqueue_then_crash():
+            # Stands in for the OrmQ row the ORM broker writes
+            QraftTask.objects.create(func="test.module.queue_row")
+            raise RuntimeError("crash after broker write")
+
+        dispatch_hook_once(
+            HookDispatch,
+            {"qraft_task": qraft_task, "hook_type": "success"},
+            "test.hooks.success",
+            enqueue_then_crash,
+        )
+
+        assert not HookDispatch.objects.exists()
+        # Only the fixture task survives; the in-transaction write rolled back
+        assert QraftTask.objects.count() == 1
 
 
 @pytest.mark.django_db
