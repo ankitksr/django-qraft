@@ -14,7 +14,7 @@ import uuid
 from datetime import timedelta
 
 from django.db import connection
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -25,6 +25,7 @@ from qraft.dlq import dead_letters, requeue
 from qraft.models import (
     QraftBatchModel,
     QraftChainModel,
+    QraftChainStep,
     QraftIterModel,
     QraftTask,
     QraftTaskAttempt,
@@ -105,6 +106,15 @@ def _workers_panel(now):
         for profile in profile_summaries()
     }
 
+    # One aggregate query for every cluster's throughput, rather than one
+    # count() per cluster observed below.
+    throughput_by_cluster = dict(
+        QraftTaskAttempt.objects.filter(date_completed__gte=throughput_start)
+        .values("cluster")
+        .annotate(n=Count("id"))
+        .values_list("cluster", "n")
+    )
+
     clusters: dict[str, dict[int, dict]] = {}
     for attempt in attempts:
         cluster_name = attempt.cluster or "?"
@@ -146,9 +156,7 @@ def _workers_panel(now):
 
     panel = []
     for cluster_name, workers_by_pid in clusters.items():
-        throughput = QraftTaskAttempt.objects.filter(
-            cluster=cluster_name, date_completed__gte=throughput_start
-        ).count()
+        throughput = throughput_by_cluster.get(cluster_name, 0)
         worker_rows = []
         inflight_total = 0
         for pid, w in sorted(workers_by_pid.items()):
@@ -278,17 +286,33 @@ def state(request):
             }
         )
 
+    # Prefetch keeps each workflow kind to one extra query total instead of
+    # one per row: chain steps come back sorted with their task already
+    # joined, and iter/batch members are pre-sliced to the [:12] the panel
+    # renders (a sliced Prefetch queryset requires to_attr - see the Django
+    # docs on Prefetch objects).
+    chain_prefetch = Prefetch(
+        "steps",
+        queryset=QraftChainStep.objects.select_related("qraft_task").order_by(
+            "step_index"
+        ),
+    )
+    member_prefetch = Prefetch(
+        "tasks",
+        queryset=QraftTask.objects.order_by("-date_created")[:12],
+        to_attr="members",
+    )
+
     workflows = []
-    for model, kind in (
-        (QraftChainModel, "chain"),
-        (QraftIterModel, "iter"),
-        (QraftBatchModel, "batch"),
+    for model, kind, prefetch in (
+        (QraftChainModel, "chain", chain_prefetch),
+        (QraftIterModel, "iter", member_prefetch),
+        (QraftBatchModel, "batch", member_prefetch),
     ):
-        for row in model.objects.order_by("-date_created")[:12]:
+        rows = model.objects.order_by("-date_created")[:12].prefetch_related(prefetch)
+        for row in rows:
             if kind == "chain":
-                steps = list(
-                    row.steps.select_related("qraft_task").order_by("step_index")
-                )
+                steps = list(row.steps.all())
                 members = [
                     {
                         "label": f"{step.step_index}. {_func(step.func)}",
@@ -316,7 +340,7 @@ def state(request):
             else:
                 members = [
                     {"label": _func(task.func), "status": task.status, "gated": False}
-                    for task in row.tasks.all()[:12]
+                    for task in row.members
                 ]
                 counters = {
                     "completed": row.completed_count,
@@ -502,8 +526,8 @@ def start_soak(request):
             f"api-{index:02d}",
             seconds=round(random.uniform(low, high), 1),
             fail_pct=fail_pct,
-            cluster="soak",
             qraft_options={
+                "cluster": "soak",
                 "max_attempts": 3,
                 "base_delay": 10.0,
                 "backoff_strategy": "exponential",
@@ -530,8 +554,18 @@ def reset(request):
 
     Clusters are stopped first, not left running: a worker mid-task would
     otherwise keep writing attempt/heartbeat updates against rows this just
-    deleted underneath it.
+    deleted underneath it. Rejected while a scenario thread is still running:
+    that thread owns tasks/events it is mid-write on, and a durability
+    scenario may even spawn clusters of its own partway through - reset would
+    race both. No cancellation machinery here, just an honest "try again".
     """
+    with _LOCK:
+        active = sorted(_ACTIVE)
+    if active:
+        return JsonResponse(
+            {"reset": False, "error": f"scenarios still running: {', '.join(active)}"},
+            status=409,
+        )
     _clusters().stop_all()
     reset_state()
     return JsonResponse({"reset": True})

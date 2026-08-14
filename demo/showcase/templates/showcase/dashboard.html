@@ -361,9 +361,14 @@ $("reset").onclick = async () => {
   if (!sure) return;
   $("reset").disabled = true;
   $("reset").textContent = "…";
-  await fetch("/reset/", {method: "POST", headers: {"X-CSRFToken": CSRF}});
+  const response = await fetch("/reset/", {method: "POST", headers: {"X-CSRFToken": CSRF}});
   $("reset").disabled = false;
   $("reset").textContent = "reset";
+  if (!response.ok) {
+    const body = await response.json();
+    alert(body.error || "Reset failed.");
+    return;
+  }
   poll();
 };
 
