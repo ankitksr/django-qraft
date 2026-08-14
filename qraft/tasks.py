@@ -7,6 +7,7 @@ import warnings
 from typing import Any, Callable
 
 from django.db import IntegrityError, transaction
+from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
 from qraft.brokers import QraftOrmBroker, priority_list_key
@@ -17,19 +18,41 @@ from qraft.retry import RetryPolicy
 
 _logger = logging.getLogger("qraft")
 
+# Keys django_q's own async_task() treats specially (django_q/tasks.py
+# opt_keys), and that Qraft either forces to a fixed value or validates at
+# the top of async_task(). django_q checks q_options for each of these
+# *before* falling back to the plain keyword argument, so a caller who
+# cannot pass one of these directly (rejected above) could still smuggle it
+# in via q_options and silently override the invariant. Not every opt_key is
+# here - only the ones Qraft itself sets or validates; e.g. `timeout` and
+# `group` are plain passthroughs with nothing to protect.
+_RESERVED_Q_OPTIONS = frozenset(
+    {"hook", "save", "sync", "cached", "ack_failure", "broker", "cluster"}
+)
+
 
 def _existing_task_for_key(idempotency_key: str) -> str | None:
     """
     Return the q2_task_id of the task already enqueued under this key.
 
-    Returns None if no QraftTask holds this key yet.
+    Returns None if no QraftTask holds this key yet. A QraftTask that does
+    hold the key still counts as existing even while its latest attempt is a
+    SCHEDULED backoff retry sitting on a null q2_task_id (the scheduler only
+    stamps that column once a dispatcher claims the attempt) - so this walks
+    attempts newest-first for the last one that actually reached the broker,
+    rather than trusting `latest_attempt` alone.
     """
     existing = QraftTask.objects.filter(idempotency_key=idempotency_key).first()
     if existing is None:
         return None
 
-    attempt = existing.latest_attempt
-    if attempt is None:
+    q2_task_id = (
+        existing.attempts.filter(q2_task_id__isnull=False)
+        .order_by("-attempt_number")
+        .values_list("q2_task_id", flat=True)
+        .first()
+    )
+    if q2_task_id is None:
         return None
 
     _logger.info(
@@ -37,7 +60,7 @@ def _existing_task_for_key(idempotency_key: str) -> str | None:
         idempotency_key,
         existing.id,
     )
-    return attempt.q2_task_id
+    return q2_task_id
 
 
 def _reclaim_dead_task_key(idempotency_key: str) -> None:
@@ -53,6 +76,51 @@ def _reclaim_dead_task_key(idempotency_key: str) -> None:
         idempotency_key=idempotency_key,
         status__in=(TaskStatus.FAILED, TaskStatus.EXHAUSTED),
     ).update(idempotency_key=None)
+
+
+def _importable_func_path(func: Callable) -> str:
+    """
+    Derive `module.name` for `func` and verify it round-trips back to `func`.
+
+    A retry re-queues the task by dotted path, not by the live object, so
+    the path has to actually resolve back to the callable that was passed
+    in. `func.__module__.func.__name__` looks right for a plain module-level
+    function but is wrong for a bound method (the module is the class's, and
+    `__name__` is unqualified - it imports a different object or nothing at
+    all) and crashes outright for a functools.partial (no `__name__`).
+    Lambdas and locals already fail loudly at enqueue via pickling, so this
+    only needs to catch the importability gap.
+    """
+    name = getattr(func, "__name__", None)
+    module = getattr(func, "__module__", None)
+    if not name or not module:
+        raise ValueError(
+            f"async_task() cannot derive an import path for {func!r}: it has "
+            "no __module__/__name__ (e.g. a functools.partial). Pass the "
+            "dotted-path string form of func instead."
+        )
+
+    func_path = f"{module}.{name}"
+    try:
+        resolved = import_string(func_path)
+    except ImportError as exc:
+        raise ValueError(
+            f"async_task() cannot import {func_path!r} to re-run {func!r} on "
+            "retry: it is not reachable at module level (e.g. a bound "
+            "method). Pass a plain module-level function, or the "
+            "dotted-path string form of func, instead."
+        ) from exc
+
+    if resolved is not func:
+        raise ValueError(
+            f"async_task() cannot safely re-run {func!r}: importing "
+            f"{func_path!r} resolves to a different object ({resolved!r}), "
+            "which happens for bound methods sharing a name with a "
+            "module-level function. Pass a plain module-level function, or "
+            "the dotted-path string form of func, instead."
+        )
+
+    return func_path
 
 
 def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
@@ -120,9 +188,12 @@ def async_task(
             Forced to True - Qraft schedules its own retries, so Django-Q2
             must never also redeliver a failed message. `False` is rejected.
         save:
-            Same as Django-Q2, except `save=False` is rejected: Qraft's hook
-            handler resolves completion by reading the saved Django-Q2 Task
-            row, which `save=False` never writes.
+            Forced to True regardless of what is passed (only `False` is
+            rejected outright). Qraft's hook handler resolves completion by
+            reading the saved Django-Q2 Task row; with `Conf.SAVE_LIMIT < 0`
+            Django-Q2 only writes that row for a successful task when
+            `save=True` was requested, so leaving it unset would silently
+            drop the row a successful task needs.
         sync:
             Not supported - must be left `False`. Qraft's hook handler
             expects the QraftTaskAttempt row to already exist when the task
@@ -136,7 +207,10 @@ def async_task(
             Optional human-readable name for the task (appears in Django-Q2 admin).
             Fully preserved - Qraft uses database linkage instead of encoding metadata.
         q_options (dict, optional):
-            Legacy Django-Q2 options.
+            Legacy Django-Q2 options. May not set `hook`, `save`, `sync`,
+            `cached`, `ack_failure`, `broker`, or `cluster` - those raise a
+            ValueError, since django_q would otherwise let them silently
+            override the invariants enforced above.
         qraft_options (dict, optional):
             New configuration namespace for Qraft.
             Supported keys:
@@ -207,6 +281,18 @@ def async_task(
     if q_options is None:
         q_options = {}
 
+    reserved_in_q_options = _RESERVED_Q_OPTIONS.intersection(q_options)
+    if reserved_in_q_options:
+        raise ValueError(
+            f"async_task(q_options={{...}}) must not set "
+            f"{sorted(reserved_in_q_options)}: django_q checks q_options for "
+            "each of these before the plain keyword argument, so passing "
+            "them here would silently override Qraft's own invariants "
+            "(hook routing, retry ownership, save/sync/cached rejection, "
+            "priority-lane targeting). Pass them as direct async_task() "
+            "keyword arguments instead."
+        )
+
     if qraft_options is None:
         qraft_options = {}
 
@@ -252,7 +338,7 @@ def async_task(
     retry_policy = RetryPolicy.from_options(qraft_options)
 
     # Prepare Qraft metadata
-    func_path = func if isinstance(func, str) else f"{func.__module__}.{func.__name__}"
+    func_path = func if isinstance(func, str) else _importable_func_path(func)
     qraft_metadata = {
         "func": func_path,
         "task_args": list(args),  # Store for retry re-queueing
@@ -282,9 +368,9 @@ def async_task(
         if list_key is not None:
             broker = QraftOrmBroker(list_key=list_key)
 
-    # Build Q2 task options, only including non-None values
-    # This is important because passing save=None is different from not passing save
-    # (Django-Q2 checks if "save" key exists in task dict)
+    # Build Q2 task options. The remaining ones below are only added when the
+    # caller gave a value, since passing e.g. timeout=None differs from
+    # omitting it (Django-Q2 checks if the key exists in the task dict).
     q2_kwargs = {
         "hook": "qraft.hooks.qraft_hook_handler",
         "q_options": q_options,
@@ -292,6 +378,13 @@ def async_task(
         # failed message and redelivers attempt N while attempt N+1 is
         # already scheduled.
         "ack_failure": True,
+        # Forced True unconditionally (save=False is already rejected
+        # above): when Conf.SAVE_LIMIT < 0, Django-Q2's monitor skips saving
+        # a successful Task row unless the task itself asks for save=True.
+        # Hook delivery is a post_save receiver on that row, so no row means
+        # no hook fires - and the lease reaper later mistakes the (already
+        # succeeded, but unrecorded) task for an orphan and re-executes it.
+        "save": True,
         **kwargs,
     }
     if cluster is not None:
@@ -302,8 +395,6 @@ def async_task(
         q2_kwargs["task_name"] = task_name
     if group is not None:
         q2_kwargs["group"] = group
-    if save is not None:
-        q2_kwargs["save"] = save
     if timeout is not None:
         q2_kwargs["timeout"] = timeout
     if broker is not None:

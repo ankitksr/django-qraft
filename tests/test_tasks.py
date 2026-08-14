@@ -1,11 +1,25 @@
 """Tests for qraft.tasks module."""
 
-from unittest.mock import MagicMock, patch
+import functools
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
+from django.utils import timezone
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.tasks import async_task
+
+
+def _module_level_task():
+    """Importable at `tests.test_tasks._module_level_task` - a valid func."""
+
+
+class _CallableHolder:
+    """Only used to produce a bound method that is not importable."""
+
+    def bound_method(self):
+        pass
 
 
 @pytest.mark.django_db
@@ -105,17 +119,15 @@ class TestAsyncTask:
 
     @patch("qraft.tasks.q2_async_task")
     def test_task_with_callable_func(self, mock_q2_async):
-        """Test creating a task with a callable function."""
+        """Test creating a task with a module-level callable function."""
         mock_q2_async.return_value = "q2-task-callable"
 
-        def test_function():
-            pass
-
-        async_task(test_function)
+        async_task(_module_level_task)
 
         qraft_task = QraftTask.objects.get()
-        # Should extract module.name from callable
-        assert "test_function" in qraft_task.func
+        # Should extract module.name from callable, and it must actually
+        # import back to the same function (see TestCallableValidation).
+        assert qraft_task.func == f"{__name__}._module_level_task"
 
     @patch("qraft.tasks.q2_async_task")
     def test_legacy_hook_deprecation_warning(self, mock_q2_async):
@@ -395,3 +407,134 @@ class TestAckFailure:
         )
 
         assert mock_q2_async.call_args[1]["ack_failure"] is True
+
+
+@pytest.mark.django_db
+class TestReservedQOptions:
+    """
+    A1: q_options is merged by django_q ahead of the plain keyword
+    arguments, so a reserved key slipped in there would silently override
+    an invariant the top-level guards above exist to protect.
+    """
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("hook", "some.other.hook"),
+            ("save", False),
+            ("sync", True),
+            ("cached", 60),
+            ("ack_failure", False),
+            ("broker", object()),
+            ("cluster", "other-cluster"),
+        ],
+    )
+    def test_reserved_key_is_rejected(self, key, value):
+        with pytest.raises(ValueError, match=key):
+            async_task("test.function", q_options={key: value})
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_harmless_key_passes_through(self, mock_q2_async):
+        """`timeout` is not Qraft-managed, so q_options is free to carry it."""
+        mock_q2_async.return_value = "q2-task-qopt"
+
+        async_task("test.function", q_options={"timeout": 120})
+
+        call_kwargs = mock_q2_async.call_args[1]
+        assert call_kwargs["q_options"] == {"timeout": 120}
+
+
+@pytest.mark.django_db
+class TestForcedSavePersistence:
+    """
+    A3: save=True must always reach django_q. With Conf.SAVE_LIMIT < 0,
+    Django-Q2's monitor only saves a successful Task row when the task asks
+    for save=True - without a row, the hook (a post_save receiver) never
+    fires, and the lease reaper later re-executes the task as a false
+    orphan.
+    """
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_save_true_when_caller_passes_nothing(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-save-default"
+
+        async_task("test.function")
+
+        assert mock_q2_async.call_args[1]["save"] is True
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_save_true_alongside_other_kwargs(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-save-other"
+
+        async_task("test.function", group="g", timeout=5)
+
+        assert mock_q2_async.call_args[1]["save"] is True
+
+    def test_save_false_still_rejected(self):
+        with pytest.raises(ValueError, match="save=False"):
+            async_task("test.function", save=False)
+
+
+@pytest.mark.django_db
+class TestIdempotencyBackoffDedupe:
+    """
+    A4: a SCHEDULED backoff attempt has a null q2_task_id until a dispatcher
+    claims it, so the dedupe lookup must not mistake that for "no task holds
+    this key" - it has to walk attempts for the last one that actually
+    reached the broker.
+    """
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_second_call_during_backoff_returns_original_id_no_integrity_error(
+        self, mock_q2_async
+    ):
+        from qraft.scheduler import schedule_attempt
+
+        mock_q2_async.return_value = "q2-original"
+        first = async_task(
+            "test.function", qraft_options={"idempotency_key": "backoff-key"}
+        )
+        qraft_task = QraftTask.objects.get()
+
+        # Simulate a retry sitting in backoff: attempt 2 is SCHEDULED with
+        # q2_task_id still null until a dispatcher claims and enqueues it.
+        schedule_attempt(qraft_task, 2, timezone.now() + timedelta(seconds=30))
+
+        mock_q2_async.reset_mock()
+        second = async_task(
+            "test.function", qraft_options={"idempotency_key": "backoff-key"}
+        )
+
+        assert first == "q2-original"
+        assert second == "q2-original"
+        assert mock_q2_async.call_count == 0
+        assert QraftTask.objects.count() == 1
+        assert QraftTaskAttempt.objects.filter(qraft_task=qraft_task).count() == 2
+
+
+@pytest.mark.django_db
+class TestCallableValidation:
+    """
+    A5: async_task() re-runs a retry by importing the stored dotted path,
+    not the live object, so a callable's derived path has to round-trip
+    back to that exact object at enqueue time - not fail later, mid-retry.
+    """
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_module_level_function_is_accepted(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-callable-ok"
+
+        result = async_task(_module_level_task)
+
+        assert result == "q2-callable-ok"
+        assert QraftTask.objects.get().func == f"{__name__}._module_level_task"
+
+    def test_bound_method_is_rejected(self):
+        holder = _CallableHolder()
+        with pytest.raises(ValueError, match="cannot import"):
+            async_task(holder.bound_method)
+
+    def test_functools_partial_is_rejected(self):
+        partial_func = functools.partial(_module_level_task)
+        with pytest.raises(ValueError, match="__module__/__name__"):
+            async_task(partial_func)

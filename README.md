@@ -2,7 +2,7 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/ankitksr/django-qraft/actions/workflows/test.yml/badge.svg)](https://github.com/ankitksr/django-qraft/actions/workflows/test.yml)
-[![Django Version](https://img.shields.io/badge/django-4.2+-green.svg)](https://www.djangoproject.com/)
+[![Django Version](https://img.shields.io/badge/django-5.0+-green.svg)](https://www.djangoproject.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Durable background jobs and workflows for Django — Postgres only, no extra infra, with primitives for jobs that call metered AI providers.
@@ -355,7 +355,7 @@ QraftCluster (extends Cluster)
 ## Requirements
 
 - Python 3.10+
-- Django 4.2+ (6.0+ for the `django.tasks` backend)
+- Django 5.0+ (6.0+ for the `django.tasks` backend)
 - Django-Q2 1.8+
 - PostgreSQL — the throttle, reaper, and workflow dispatchers need real row locks
 - The ORM broker (`"orm"`, plus `"broker_class": "qraft.brokers.QraftOrmBroker"` for priority lanes) — see [broker support](docs/configuration.md#broker-support) for what other brokers give up

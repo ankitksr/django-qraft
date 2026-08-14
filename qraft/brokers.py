@@ -25,18 +25,27 @@ that setting nothing drains the suffixed lanes, so `priority_list_key()`
 declines to route and the task falls back to the default lane with a
 warning - running at the wrong priority beats never running at all.
 
-v1 limitation: scheduled retries go through `schedule_retry()`'s default
-path and are not re-routed by priority.
+Because the lane is keyed off the target cluster, whether it can even be
+drained also has to be checked against the *target* cluster's config, not
+the enqueuing process's own `Conf.BROKER_CLASS` - a process whose own
+broker is `QraftOrmBroker` can still route into a lane that nothing drains,
+if the cluster it names runs a plain broker. `priority_lanes_available()`
+resolves this via `qraft.conf._merge_alt_cluster` against
+`settings.Q_CLUSTER`, the same way `qraft.conf` resolves `QRAFT_CLUSTER`'s
+own `ALT_CLUSTERS`.
 """
 
 import logging
 from functools import lru_cache
 from time import sleep
 
+from django.conf import settings as django_settings
 from django.utils import timezone
 from django.utils.module_loading import import_string
 from django_q.brokers.orm import ORM
 from django_q.conf import Conf
+
+from qraft.conf import _merge_alt_cluster
 
 _logger = logging.getLogger("qraft")
 
@@ -96,9 +105,38 @@ def _lanes_drained_by(broker_class: str | None) -> bool:
     return False
 
 
-def priority_lanes_available() -> bool:
-    """Whether the configured broker class drains the suffixed priority lanes."""
-    return _lanes_drained_by(Conf.BROKER_CLASS)
+def _broker_class_for_cluster(cluster: str | None) -> str | None:
+    """
+    Resolve `broker_class` for the cluster a task is routed to.
+
+    `cluster=None` means "the enqueuing process's own cluster" -
+    `Conf.BROKER_CLASS` already reflects that correctly, since django_q
+    resolves its own `ALT_CLUSTERS` against this process's `Q_CLUSTER_NAME`
+    at import time. A *named* target cluster is somebody else's process
+    though, so its `broker_class` has to be resolved the same way
+    `qraft.conf` resolves `QRAFT_CLUSTER`'s own `ALT_CLUSTERS`: merge that
+    cluster's entry onto the base `Q_CLUSTER` dict rather than trusting this
+    process's already-resolved `Conf`.
+    """
+    if cluster is None:
+        return Conf.BROKER_CLASS
+
+    q_cluster = getattr(django_settings, "Q_CLUSTER", {})
+    if not isinstance(q_cluster, dict):
+        return None
+    return _merge_alt_cluster(q_cluster, cluster).get("broker_class")
+
+
+def priority_lanes_available(cluster: str | None = None) -> bool:
+    """
+    Whether the target cluster's configured broker class drains the
+    suffixed priority lanes.
+
+    Args:
+        cluster: Target cluster name. None checks the enqueuing process's
+            own cluster.
+    """
+    return _lanes_drained_by(_broker_class_for_cluster(cluster))
 
 
 def priority_list_key(priority: str, cluster: str | None = None) -> str | None:
@@ -106,7 +144,8 @@ def priority_list_key(priority: str, cluster: str | None = None) -> str | None:
     Return the suffixed list_key for a priority, or None for "default".
 
     None signals "don't override the broker" to the caller - returned both
-    for default priority and when no configured broker drains the lanes.
+    for default priority and when the target cluster's broker doesn't drain
+    the lanes.
 
     Args:
         priority: "high", "low", or "default".
@@ -115,6 +154,6 @@ def priority_list_key(priority: str, cluster: str | None = None) -> str | None:
     """
     if priority not in ("high", "low"):
         return None
-    if not priority_lanes_available():
+    if not priority_lanes_available(cluster):
         return None
     return f"{cluster or Conf.CLUSTER_NAME}--{priority}"
