@@ -39,6 +39,31 @@ READY_TIMEOUT = 90.0
 STOP_TIMEOUT = 25.0
 
 
+def profile_summaries() -> list[dict]:
+    """
+    Worker process count and threads-per-worker for each profile.
+
+    Reuses qraft's own ALT_CLUSTERS merge (the same one a `qraftcluster`
+    process applies to itself) rather than re-deriving the precedence rules,
+    so the dashboard cannot drift from what a cluster actually runs with.
+    """
+    from django.conf import settings
+
+    from qraft.conf import _merge_alt_cluster
+
+    return [
+        {
+            "name": name,
+            "why": why,
+            "workers": _merge_alt_cluster(settings.Q_CLUSTER, name).get("workers", 1),
+            "threads": _merge_alt_cluster(settings.QRAFT_CLUSTER, name).get(
+                "threads", 1
+            ),
+        }
+        for name, why in PROFILES.items()
+    ]
+
+
 class ClusterManager:
     """Starts, probes and stops `manage.py qraftcluster` child processes."""
 

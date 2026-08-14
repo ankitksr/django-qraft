@@ -390,7 +390,12 @@ def rate_limit_retry(ctx):
     clusters=("baseline", "threaded"),
 )
 def threading(ctx):
-    run, count, hold = ctx.run, 24, 0.5
+    # 24 tasks x 3s of I/O-bound sleep: baseline (capacity 2) takes 12 rounds
+    # (~36s), threaded (capacity 16 = 2 workers x 8 threads) takes 2 rounds
+    # (~6s) - slow enough per task to watch the Workers panel hold baseline
+    # at 2/2 in flight for half a minute while threaded briefly shows up to
+    # 16 in flight, fast enough that the whole scenario stays well under 90s.
+    run, count, hold = ctx.run, 24, 3.0
 
     def drain(cluster: str) -> float:
         started = time.monotonic()
@@ -432,7 +437,7 @@ def threading(ctx):
         )
         ctx.check(
             "threading is faster on I/O-bound work",
-            speedup > 1.5,
+            speedup > 3.0,
             f"speedup {speedup:.2f}x",
         )
 

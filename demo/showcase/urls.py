@@ -10,4 +10,5 @@ urlpatterns = [
     path("clusters/<str:name>/start/", views.start_cluster, name="start-cluster"),
     path("clusters/<str:name>/stop/", views.stop_cluster, name="stop-cluster"),
     path("soak/start/", views.start_soak, name="start-soak"),
+    path("reset/", views.reset, name="reset"),
 ]

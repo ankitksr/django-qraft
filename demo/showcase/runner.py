@@ -68,8 +68,9 @@ def required_clusters(scenarios: list[Scenario]) -> list[str]:
 
 def run_one(item: Scenario, clusters: ClusterManager, log=print) -> ScenarioRun:
     """Execute one scenario and persist its result."""
+    run_id = uuid.uuid4().hex[:12]
     record = ScenarioRun.objects.create(
-        id=uuid.uuid4(), key=item.key, group=item.group, title=item.title
+        id=uuid.uuid4(), key=item.key, group=item.group, title=item.title, run=run_id
     )
 
     def flush(ctx: Ctx) -> None:
@@ -77,7 +78,7 @@ def run_one(item: Scenario, clusters: ClusterManager, log=print) -> ScenarioRun:
         record.notes = list(ctx.notes)
         record.save(update_fields=["checks", "notes"])
 
-    ctx = Ctx(run=uuid.uuid4().hex[:12], clusters=clusters, on_event=flush)
+    ctx = Ctx(run=run_id, clusters=clusters, on_event=flush)
     log(f"\n▶ {item.key} — {item.title}")
     started = time.monotonic()
     status, error = ScenarioRun.PASSED, ""

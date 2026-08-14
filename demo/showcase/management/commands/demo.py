@@ -14,6 +14,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 from showcase import runner
 from showcase.clusters import PROFILES, ClusterManager
+from showcase.reset import reset_state
 
 
 class Command(BaseCommand):
@@ -92,8 +93,8 @@ class Command(BaseCommand):
             raise CommandError("Nothing selected.")
 
         if not options.get("keep_data"):
-            self.stdout.write("Resetting the database...")
-            call_command("flush", interactive=False, verbosity=0)
+            self.stdout.write("Resetting demo data...")
+            reset_state()
 
         self.stdout.write(
             self.style.HTTP_INFO(f"Running {len(scenarios)} scenario(s)\n")
@@ -114,7 +115,7 @@ class Command(BaseCommand):
 
     def _serve(self, options):
         if not options.get("no_reset"):
-            call_command("flush", interactive=False, verbosity=0)
+            reset_state()
 
         runner.load()
         manager = ClusterManager(log=lambda message: self.stdout.write(f"  {message}"))

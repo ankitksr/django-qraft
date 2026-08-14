@@ -43,6 +43,7 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--run); color: var(--run); }
 button:disabled { opacity: .45; cursor: default; }
+#reset:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 
 main { display: grid; grid-template-columns: 300px 1fr; gap: 12px; padding: 12px; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
@@ -137,7 +138,8 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
 .cluster { display: flex; gap: 8px; align-items: center; padding: 4px 12px;
            border-bottom: 1px solid var(--line); }
 .cluster:last-child { border-bottom: 0; }
-.cluster .key { flex: 1; }
+.cluster .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.cluster .cfg { color: var(--faint); font-size: 10px; white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle);
        display: inline-block; }
 .dot.on { background: var(--ok); }
@@ -153,6 +155,16 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
 .feed .k { color: var(--faint); }
 .empty { padding: 12px; color: var(--faint); }
 .legend { padding: 8px 12px; color: var(--faint); font-size: 11px; line-height: 1.7; }
+
+.wgroup { border-bottom: 1px solid var(--line); }
+.wgroup:last-child { border-bottom: 0; }
+.wgroup-head { display: flex; gap: 8px; align-items: center; padding: 5px 12px;
+               background: var(--panel2); }
+.wgroup-head .key { font-weight: 500; }
+.wgroup-head .util { font-variant-numeric: tabular-nums; }
+.wrow { display: flex; gap: 10px; align-items: baseline; padding: 3px 12px 3px 24px; }
+.wrow .pid { color: var(--dim); min-width: 96px; }
+.wrow .m { font-variant-numeric: tabular-nums; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -165,6 +177,7 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
   <span class="pill live" id="beat">polling</span>
   <button id="theme">light</button>
   <a href="/admin/qraft/" target="_blank"><button>qraft admin</button></a>
+  <button id="reset" title="Wipe all demo data and stop clusters">reset</button>
 </header>
 
 <main>
@@ -208,11 +221,15 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
     <section>
       <h2>Clusters</h2>
       <div id="clusterlist">
-        {% for name, why in profiles.items %}
-        <div class="cluster" title="{{ why }}">
-          <span class="dot" data-cluster-dot="{{ name }}"></span>
-          <span class="key">{{ name }}</span>
-          <button data-cluster="{{ name }}" data-op="start">start</button>
+        {% for p in cluster_profiles %}
+        <div class="cluster" title="{{ p.why }}">
+          <span class="dot" data-cluster-dot="{{ p.name }}"></span>
+          <div class="meta">
+            <span class="key">{{ p.name }}</span>
+            <span class="cfg">{{ p.workers }} worker{{ p.workers|pluralize }}
+              &times; {{ p.threads }} thread{{ p.threads|pluralize }}</span>
+          </div>
+          <button data-cluster="{{ p.name }}" data-op="start">start</button>
         </div>
         {% endfor %}
       </div>
@@ -237,6 +254,14 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
     </section>
 
     <section>
+      <h2>Workers <span class="count" id="worker-count"></span></h2>
+      <div class="scroll" id="workers"><div class="empty">no worker activity yet</div></div>
+      <div class="legend">Workers observed from task attempts in the last
+      10 minutes — an idle worker only appears here after its first task;
+      process liveness is the dot on the Clusters panel.</div>
+    </section>
+
+    <section>
       <h2>Scenario results <span class="count" id="run-count"></span></h2>
       <div class="scroll" id="runs"><div class="empty">nothing has run yet</div></div>
     </section>
@@ -251,9 +276,9 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
       <div class="scroll">
         <table>
           <thead><tr>
-            <th>id</th><th>function</th><th>status</th><th>pri</th>
+            <th>id</th><th>scenario</th><th>function</th><th>status</th><th>pri</th>
             <th class="num">try</th><th class="num">age</th>
-            <th class="num">beat</th><th>progress</th><th>error</th>
+            <th class="num">beat</th><th>worker</th><th>progress</th><th>error</th>
           </tr></thead>
           <tbody id="tasks"></tbody>
         </table>
@@ -278,6 +303,11 @@ const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value == null ? "" : value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const chip = (status) => `<span class="s s-${esc(status)}">${esc(status)}</span>`;
+
+// $("runs") is rebuilt wholesale every poll, which would otherwise reset
+// every <details> back to closed. Track which run ids are open here and
+// reapply it after each rebuild, instead of trusting the DOM to remember.
+const expandedRuns = new Set();
 
 $("theme").onclick = () => {
   const root = document.documentElement;
@@ -322,6 +352,21 @@ document.querySelectorAll("[data-cluster]").forEach((button) => {
   };
 });
 
+$("reset").onclick = async () => {
+  const sure = confirm(
+    "Reset all demo data?\n\nThis stops every running cluster and deletes " +
+    "all tasks, attempts, workflows, hook dispatches, dead letters, rate " +
+    "buckets, usage, events and scenario results. Cannot be undone."
+  );
+  if (!sure) return;
+  $("reset").disabled = true;
+  $("reset").textContent = "…";
+  await fetch("/reset/", {method: "POST", headers: {"X-CSRFToken": CSRF}});
+  $("reset").disabled = false;
+  $("reset").textContent = "reset";
+  poll();
+};
+
 $("soak-start").onclick = async () => {
   const button = $("soak-start");
   button.disabled = true;
@@ -354,15 +399,37 @@ function render(state) {
   $("task-count").textContent = state.tasks.length;
   $("tasks").innerHTML = state.tasks.map((task) => `<tr>
     <td class="faint">${esc(task.short)}</td>
+    <td class="faint">${esc(task.scenario)}</td>
     <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}</td>
     <td>${chip(task.status)}</td>
     <td class="faint">${task.priority === "default" ? "" : esc(task.priority)}</td>
     <td class="num">${task.attempts}${task.max_attempts ? `<span class="faint">/${task.max_attempts}</span>` : ""}</td>
     <td class="num muted">${task.elapsed}s</td>
     <td class="num faint">${task.heartbeat == null ? "" : task.heartbeat + "s"}</td>
+    <td class="faint">${esc(task.worker)}</td>
     <td class="muted">${esc(task.progress)} <span class="faint">${esc(task.message)}</span></td>
     <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
-  </tr>`).join("") || `<tr><td colspan="9" class="empty">no tasks yet</td></tr>`;
+  </tr>`).join("") || `<tr><td colspan="11" class="empty">no tasks yet</td></tr>`;
+
+  $("worker-count").textContent = state.workers.reduce((n, c) => n + c.workers.length, 0);
+  $("workers").innerHTML = state.workers.length ? state.workers.map((c) => `
+    <div class="wgroup">
+      <div class="wgroup-head">
+        <span class="key">${esc(c.name)}</span>
+        <span class="util muted">${c.inflight}/${c.capacity == null ? "?" : c.capacity} in flight</span>
+        <span class="spacer"></span>
+        <span class="faint">${c.throughput} done/60s</span>
+      </div>
+      ${c.workers.map((w) => `<div class="wrow">
+        <span class="pid">pid ${w.pid}</span>
+        <span class="m ${w.inflight ? "s-running" : "faint"}">${w.inflight} running</span>
+        <span class="m muted">${w.done} done</span>
+        <span class="m ${w.failed ? "s-failed" : "faint"}">${w.failed} failed</span>
+        <span class="m faint">${w.avg_duration == null ? "" : "avg " + w.avg_duration + "s"}</span>
+        <span class="m faint">${w.last_seen == null ? "" : "seen " + w.last_seen + "s ago"}</span>
+      </div>`).join("")}
+    </div>
+  `).join("") : `<div class="empty">no worker activity yet</div>`;
 
   $("wf-count").textContent = state.workflows.length;
   $("workflows").innerHTML = state.workflows.map((wf) => {
@@ -441,7 +508,7 @@ function render(state) {
   });
 
   $("run-count").textContent = state.runs.length;
-  $("runs").innerHTML = state.runs.map((run) => `<details class="run">
+  $("runs").innerHTML = state.runs.map((run) => `<details class="run" data-id="${esc(run.id)}">
     <summary>${chip(run.status)} <b>${esc(run.key)}</b>
       <span class="title">${esc(run.title)}</span>
       <span class="muted">${run.passed}/${run.total}</span>
@@ -453,6 +520,13 @@ function render(state) {
       ${run.error ? `<div class="no">${esc(run.error)}</div>` : ""}
     </div>
   </details>`).join("") || `<div class="empty">nothing has run yet</div>`;
+  document.querySelectorAll("#runs details.run").forEach((node) => {
+    const id = node.dataset.id;
+    node.open = expandedRuns.has(id);
+    node.addEventListener("toggle", () => {
+      if (node.open) expandedRuns.add(id); else expandedRuns.delete(id);
+    });
+  });
 }
 
 let failures = 0;

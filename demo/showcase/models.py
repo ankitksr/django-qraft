@@ -65,6 +65,10 @@ class ScenarioRun(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
     key = models.CharField(max_length=60, db_index=True)
+    # Same id as this run's Ctx.run, which every task/event it creates carries
+    # as task_args[0]. That's what lets the dashboard trace a task back to the
+    # scenario run that queued it.
+    run = models.CharField(max_length=40, blank=True, default="", db_index=True)
     group = models.CharField(max_length=40)
     title = models.CharField(max_length=200, blank=True)
     status = models.CharField(max_length=12, default=RUNNING, db_index=True)
