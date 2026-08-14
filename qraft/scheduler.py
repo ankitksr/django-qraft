@@ -20,7 +20,7 @@ rests on the UPDATE matching a row, which is also true on SQLite.
 """
 
 import logging
-import threading
+import time
 
 from django.db import close_old_connections, connection, models, transaction
 from django.utils import timezone
@@ -40,25 +40,6 @@ ERROR_BACKOFF = 5.0
 # Resolves the task's own dotted path, unwrapping a django.tasks @task
 # wrapper - see qraft.runner.
 DEFAULT_DISPATCH_FUNC = "qraft.runner.run_task"
-
-_wakeup = threading.Event()
-
-
-def notify() -> None:
-    """
-    Wake the dispatcher before its next poll.
-
-    The seam Phase 4 replaces: a `LISTEN`/`NOTIFY` listener calls this from
-    the notification thread and the poll interval becomes a ceiling rather
-    than the latency. Nothing calls it yet.
-    """
-    _wakeup.set()
-
-
-def _wait(seconds: float) -> None:
-    """Sleep until the next poll, or until `notify()` cuts it short."""
-    _wakeup.wait(seconds)
-    _wakeup.clear()
 
 
 def _inherited_cluster(qraft_task) -> str | None:
@@ -291,4 +272,4 @@ def dispatch_loop(stop_event=None) -> None:
             delay = ERROR_BACKOFF
         finally:
             close_old_connections()
-        _wait(delay)
+        time.sleep(delay)

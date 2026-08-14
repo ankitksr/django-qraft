@@ -204,7 +204,6 @@ class QraftTaskAttempt(models.Model):
     q2_task_id = models.CharField(
         max_length=32,
         unique=True,
-        db_index=True,
         null=True,
         blank=True,
         help_text="Django-Q2 task ID for this attempt; null until a dispatcher "

@@ -396,12 +396,3 @@ class TestLoopTiming:
         scheduler.schedule_attempt(_task(), 1, timezone.now() - timedelta(hours=1))
 
         assert scheduler._seconds_until_due(30.0) == scheduler.MIN_SLEEP
-
-    def test_notify_cuts_the_wait_short(self):
-        # The seam a LISTEN/NOTIFY listener replaces the poll through.
-        started = timezone.now()
-        scheduler.notify()
-        scheduler._wait(30.0)
-
-        assert (timezone.now() - started).total_seconds() < 1.0
-        assert not scheduler._wakeup.is_set()
