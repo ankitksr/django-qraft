@@ -8,7 +8,7 @@ from django.utils import timezone
 from django_q.models import Task as Q2Task
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
-from qraft.reaper import reap_orphans
+from qraft.reaper import reap_orphans, reconcile_finished
 
 STALE_AFTER = 60
 
@@ -37,6 +37,19 @@ def _running_task(**kwargs):
 def _attempt(task, q2_task_id):
     return QraftTaskAttempt.objects.create(
         qraft_task=task, attempt_number=1, q2_task_id=q2_task_id, success=None
+    )
+
+
+def _q2_task(q2_task_id, success, stopped_age, result=None):
+    stopped = timezone.now() - timedelta(seconds=stopped_age)
+    return Q2Task.objects.create(
+        id=q2_task_id,
+        name="test_task",
+        func="test.module.test_function",
+        started=stopped - timedelta(seconds=1),
+        stopped=stopped,
+        success=success,
+        result=result,
     )
 
 
@@ -139,18 +152,13 @@ class TestReapOrphans:
         task.refresh_from_db()
         assert task.status == TaskStatus.RUNNING
 
-    def test_attempt_with_existing_q2_task_untouched(self):
+    def test_attempt_with_fresh_q2_task_untouched(self):
+        """A saved completion inside the grace window belongs to the
+        monitor's own hook delivery - not reaped, not yet replayed."""
         task = _running_task()
         attempt = _attempt(task, "q2-task-that-finished")
         _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
-        Q2Task.objects.create(
-            id="q2-task-that-finished",
-            name="test_task",
-            func="test.module.test_function",
-            started=timezone.now(),
-            stopped=timezone.now(),
-            success=True,
-        )
+        _q2_task("q2-task-that-finished", success=True, stopped_age=0)
 
         assert reap_orphans(stale_after=STALE_AFTER) == 0
 
@@ -158,6 +166,77 @@ class TestReapOrphans:
         assert attempt.success is None
         task.refresh_from_db()
         assert task.status == TaskStatus.RUNNING
+
+    def test_attempt_with_stale_q2_task_replayed_not_reaped(self):
+        """The hook handler died after the monitor saved the Task row: the
+        Q2-row exclusion must not park the attempt forever - the sweep
+        replays the saved completion instead."""
+        task = _running_task()
+        attempt = _attempt(task, "q2-saved-hook-died")
+        _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
+        _q2_task("q2-saved-hook-died", success=True, stopped_age=DEAD_HEARTBEAT_AGE)
+
+        assert reap_orphans(stale_after=STALE_AFTER) == 0  # replayed, not reaped
+
+        attempt.refresh_from_db()
+        assert attempt.success is True
+        assert attempt.exception_class is None
+        task.refresh_from_db()
+        assert task.status == TaskStatus.SUCCEEDED
+
+
+@pytest.mark.django_db
+class TestReconcileFinished:
+    def test_stale_failed_completion_replayed_schedules_retry(self):
+        """A replayed failure goes through the normal retry routing."""
+        task = _running_task(retry_policy=RETRY_POLICY)
+        attempt = _attempt(task, "q2-failed-hook-died")
+        _q2_task(
+            "q2-failed-hook-died",
+            success=False,
+            stopped_age=DEAD_HEARTBEAT_AGE,
+            result="boom : Traceback\ndemo.tasks.TransientError: boom",
+        )
+
+        assert reconcile_finished() == 1
+
+        attempt.refresh_from_db()
+        assert attempt.success is False
+        assert attempt.exception_class == "TransientError"
+        task.refresh_from_db()
+        assert task.status == TaskStatus.PENDING  # retry scheduled
+
+    def test_fresh_completion_not_replayed(self):
+        task = _running_task()
+        _attempt(task, "q2-just-stopped")
+        _q2_task("q2-just-stopped", success=True, stopped_age=0)
+
+        assert reconcile_finished() == 0
+
+    def test_replay_racing_genuine_resolution_is_noop(self):
+        """The compare-and-set in the hook handler: an attempt resolved
+        between the sweep's snapshot and the replay keeps its outcome."""
+        from qraft import reaper
+        from qraft.hooks import qraft_hook_handler
+
+        task = _running_task()
+        attempt = _attempt(task, "q2-raced-completion")
+        _q2_task("q2-raced-completion", success=True, stopped_age=DEAD_HEARTBEAT_AGE)
+
+        def race_then_replay(q2_task):
+            QraftTaskAttempt.objects.filter(id=attempt.id).update(
+                success=False,
+                exception_class="OrphanedTask",
+                date_completed=timezone.now(),
+            )
+            qraft_hook_handler(q2_task)
+
+        with patch.object(reaper, "qraft_hook_handler", race_then_replay):
+            reaper.reconcile_finished()
+
+        attempt.refresh_from_db()
+        assert attempt.success is False  # replay did not flip the outcome
+        assert attempt.exception_class == "OrphanedTask"
 
 
 @pytest.mark.django_db

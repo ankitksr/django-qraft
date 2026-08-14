@@ -482,6 +482,10 @@ def _create_workflow_task(
         "group": str(workflow_id) if workflow_id else None,
         # See async_task(): Qraft's retries must not race Django-Q2 redelivery.
         "ack_failure": True,
+        # See async_task(): under SAVE_LIMIT < 0 a successful task saves no
+        # Task row unless it asks, and no row means the hook never fires -
+        # here that leaves the member uncounted and the workflow hung.
+        "save": True,
         **kwargs,
     }
     cluster = qraft_options.get("cluster")

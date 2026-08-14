@@ -20,6 +20,7 @@ from django.utils import timezone
 from django_q.models import Task as Q2Task
 
 from .conf import get_conf
+from .hooks import qraft_hook_handler
 from .models import QraftTask, QraftTaskAttempt, TaskStatus
 from .retry import handle_task_retry
 
@@ -101,6 +102,54 @@ def rearm_stuck_claims(grace: float | None = None) -> int:
     return rearmed
 
 
+def reconcile_finished(grace: float | None = None) -> int:
+    """
+    Replay saved completions whose hook handler never resolved the attempt.
+
+    The monitor saved the Django-Q2 Task row, but the post_save hook handler
+    died before resolving the attempt (django_q swallows the exception): the
+    attempt sits at success=None with its task RUNNING, and the orphan sweep
+    excludes it forever because a Q2 row exists. Once the completion is older
+    than `grace`, the saved row is replayed through the normal hook handler,
+    which resolves the attempt, routes retries and workflow completions, and
+    dispatches hooks exactly as the monitor would have. Resolution is
+    compare-and-set, so a replay racing a genuine resolution updates no rows
+    and drops out.
+
+    Staleness runs from the Q2 row's `stopped`: that is the moment the hook
+    handler had its chance, so a completion still inside `grace` is left for
+    the monitor's own delivery to resolve.
+
+    Args:
+        grace: Seconds a saved completion may sit unresolved before it is
+            replayed (default: the heartbeat grace).
+
+    Returns:
+        Number of completions replayed.
+    """
+    conf = get_conf()
+    grace = grace if grace is not None else _heartbeat_grace(conf.heartbeat_interval)
+    cutoff = timezone.now() - timedelta(seconds=grace)
+
+    unresolved_q2_ids = QraftTaskAttempt.objects.filter(
+        success__isnull=True,
+        qraft_task__status=TaskStatus.RUNNING,
+        state=QraftTaskAttempt.AttemptState.QUEUED,
+        q2_task_id__isnull=False,
+    ).values("q2_task_id")
+
+    replayed = 0
+    for q2_task in Q2Task.objects.filter(id__in=unresolved_q2_ids, stopped__lt=cutoff):
+        logger.warning(
+            "Replaying saved completion of q2 task %s; its hook handler "
+            "never resolved the attempt",
+            q2_task.id,
+        )
+        qraft_hook_handler(q2_task)
+        replayed += 1
+    return replayed
+
+
 def reap_orphans(stale_after: float | None = None) -> int:
     """
     Find and resolve orphaned QraftTaskAttempts.
@@ -129,6 +178,11 @@ def reap_orphans(stale_after: float | None = None) -> int:
     conf = get_conf()
     stale_after = stale_after if stale_after is not None else conf.reap_stale_after
     grace = _heartbeat_grace(conf.heartbeat_interval)
+
+    # Attempts with a saved Q2 row are not orphans - their completion exists
+    # and only needs replaying. Handled first so this sweep's Q2-row exclusion
+    # below never turns "hook handler died after save" into a permanent stall.
+    reconcile_finished(grace)
 
     now = timezone.now()
     heartbeat_cutoff = now - timedelta(seconds=grace)

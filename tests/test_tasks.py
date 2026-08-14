@@ -474,6 +474,26 @@ class TestForcedSavePersistence:
         with pytest.raises(ValueError, match="save=False"):
             async_task("test.function", save=False)
 
+    @patch("qraft.tasks.q2_async_task")
+    def test_workflow_tasks_also_force_save(self, mock_q2_async):
+        """_create_workflow_task builds its own q2_kwargs; an unsaved
+        successful member never counts and hangs the workflow."""
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        mock_q2_async.return_value = "q2-workflow-save"
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+
+        _create_workflow_task(
+            func="test.function",
+            args=[],
+            kwargs={},
+            qraft_options={},
+            qraft_iter_id=iter_model.id,
+        )
+
+        assert mock_q2_async.call_args[1]["save"] is True
+
 
 @pytest.mark.django_db
 class TestIdempotencyBackoffDedupe:
