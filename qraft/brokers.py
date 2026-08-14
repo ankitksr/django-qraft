@@ -25,6 +25,12 @@ that setting nothing drains the suffixed lanes, so `priority_list_key()`
 declines to route and the task falls back to the default lane with a
 warning - running at the wrong priority beats never running at all.
 
+Draining is strictly high -> default -> low, by design: a lane is only
+touched once every lane ahead of it is empty, so sustained high-lane load
+can starve low indefinitely. That is accepted for the metered-AI use case
+this module targets - weighted fairness across lanes is deliberately out
+of scope.
+
 Because the lane is keyed off the target cluster, whether it can even be
 drained also has to be checked against the *target* cluster's config, not
 the enqueuing process's own `Conf.BROKER_CLASS` - a process whose own

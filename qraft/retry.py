@@ -99,7 +99,8 @@ class RetryPolicy:
         Initialize retry policy with defaults from global retry settings.
 
         Args:
-            max_attempts: Maximum retry attempts
+            max_attempts: Total executions, including the first - not retry
+                count. max_attempts=4 means 1 initial attempt + 3 retries.
                 (default: conf.retry_defaults.max_attempts)
             base_delay: Base delay in seconds (default: conf.retry_defaults.delay)
             backoff_strategy: Backoff strategy (default: conf.retry_defaults.backoff)

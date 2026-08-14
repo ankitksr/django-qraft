@@ -122,6 +122,9 @@ def _enqueue(attempt, qraft_task) -> str:
     if args is None:
         args = [qraft_task.func, list(qraft_task.task_args), qraft_task.task_kwargs]
 
+    # No cluster stamped: whichever cluster's dispatcher wins the claim race
+    # on this row runs it under its own cluster - cross-cluster placement is
+    # unspecified here, not guaranteed.
     target = attempt.cluster or executing_cluster()
 
     q2_kwargs = {

@@ -72,8 +72,10 @@ class BaseWorkflow:
         """
         Cancel the workflow.
 
-        Sets status to CANCELLED. In-flight tasks will complete but
-        dispatchers will ignore them (no further steps queued, no hooks fired).
+        Sets status to CANCELLED. This stops future orchestration only - no
+        new steps queued, no hooks fired, no counters updated - but does not
+        revoke member tasks already queued or running; they complete and
+        their outcome is ignored.
 
         Raises:
             InvalidStatusTransition: If workflow can't be cancelled from current state

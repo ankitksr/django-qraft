@@ -393,7 +393,9 @@ class HookDispatcher:
         """
         Call hook synchronously (legacy behavior).
 
-        Used when sync_hooks=True in settings.
+        Used when sync_hooks=True in settings. Runs inline in the monitor
+        with no HookDispatch record, so the idempotency/duplicate-delivery
+        protection _call_hook_async gets from that record does not apply here.
         """
         try:
             hook_func = import_string(hook_path)

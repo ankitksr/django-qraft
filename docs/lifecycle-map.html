@@ -281,8 +281,8 @@
       <text class="t-sub" x="1116" y="110">No Schedule rows; the marker is a pre-2.0 compatibility path only.</text>
       <text class="t-sub" x="1116" y="132">Phase 3: workers claim attempts via SELECT … FOR UPDATE SKIP LOCKED.</text>
       <text class="t-sub" x="1116" y="146">Pusher, monitor, and broker disappear.</text>
-      <text class="t-sub" x="1116" y="168">LISTEN/NOTIFY: scheduler.notify() is the seam; an enqueue commit will</text>
-      <text class="t-sub" x="1116" y="182">wake idle workers and the dispatcher instead of polling.</text>
+      <text class="t-sub" x="1116" y="168">Today: dispatch_loop() polls, sleeping via _seconds_until_due() until the</text>
+      <text class="t-sub" x="1116" y="182">earliest SCHEDULED row is due, instead of a fixed interval.</text>
     </g>
   </svg>
   </div>

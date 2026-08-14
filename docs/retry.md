@@ -42,7 +42,7 @@ Django-Qraft's retry system provides:
 ```python
 from qraft.tasks import async_task
 
-# Retry up to 3 times with exponential backoff
+# 3 total attempts (1 initial + 2 retries) with exponential backoff
 task_id = async_task(
     'myapp.tasks.flaky_api_call',
     url='https://api.example.com/data',

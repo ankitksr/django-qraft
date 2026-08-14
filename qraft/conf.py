@@ -26,7 +26,9 @@ class RetryBackoff(str, Enum):
 class RetryDefaultsSettings(BaseModel):
     """Default retry configuration settings (can be overridden per-task)."""
 
-    max_attempts: int = Field(3, ge=1, le=10, description="Maximum retry attempts")
+    max_attempts: int = Field(
+        3, ge=1, le=10, description="Total executions including the first, not retries"
+    )
     delay: float = Field(30.0, ge=0, description="Initial retry delay in seconds")
     backoff: RetryBackoff = Field(
         RetryBackoff.EXPONENTIAL, description="Retry backoff strategy"

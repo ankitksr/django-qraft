@@ -245,8 +245,9 @@ class QraftTaskAttempt(models.Model):
         max_length=150,
         null=True,
         blank=True,
-        help_text="Cluster this attempt is routed to; null means whichever "
-        "dispatcher claims it",
+        help_text="Requested routing target; null means whichever dispatcher "
+        "claims it. Also the executor, except when an explicit broker "
+        "override bypasses routing",
     )
 
     # Enqueue override for callers whose worker-side entry point is not the
