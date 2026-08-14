@@ -9,9 +9,12 @@ Django-Q2's existing utilities and patterns.
 """
 
 import logging
+import math
+import os
 import pydoc
 import signal
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Value
@@ -50,10 +53,51 @@ TIMER_BUFFER = 3
 QUEUE_POLL_INTERVAL = 1.0
 
 
+class _DeadlineRegistry:
+    """
+    Per-task deadline tracking behind the single shared timer.
+
+    The sentinel guard treats timer.value as a countdown: it decrements
+    positive values by GUARD_CYCLE each pass and reincarnates the worker
+    when the value reaches exactly 0. With concurrent tasks the timer must
+    always hold the countdown of the earliest in-flight deadline, not just
+    whichever task happened to arm it first.
+    """
+
+    def __init__(self, timer: Value):
+        self._timer = timer
+        self._lock = threading.Lock()
+        self._deadlines: dict[object, float] = {}
+
+    def add(self, key, timeout_seconds: float) -> None:
+        with self._lock:
+            self._deadlines[key] = time.monotonic() + timeout_seconds + TIMER_BUFFER
+            self._publish()
+
+    def remove(self, key) -> None:
+        with self._lock:
+            self._deadlines.pop(key, None)
+            self._publish()
+
+    def _publish(self) -> None:
+        with self._timer.get_lock():
+            # A recycle signal outranks deadline tracking; the worker is
+            # already shutting down and the sentinel must see TIMER_RECYCLE.
+            if self._timer.value == TIMER_RECYCLE:
+                return
+            if not self._deadlines:
+                self._timer.value = TIMER_IDLE
+            else:
+                remaining = min(self._deadlines.values()) - time.monotonic()
+                # Integer countdowns land on exactly 0 under the guard's
+                # GUARD_CYCLE decrements; 0 means "expired, terminate me".
+                self._timer.value = max(math.ceil(remaining), 0)
+
+
 def _execute_task_in_thread(
     task: dict,
     result_queue: Queue,
-    timer: Value,
+    deadlines: _DeadlineRegistry,
     inflight_semaphore: Semaphore,
     timeout: int,
 ) -> None:
@@ -71,10 +115,11 @@ def _execute_task_in_thread(
     Args:
         task: Task dictionary containing func, args, kwargs, etc.
         result_queue: Queue to put results for the monitor process.
-        timer: Shared multiprocessing Value for timeout tracking.
+        deadlines: Registry keeping the shared timer on the earliest deadline.
         inflight_semaphore: Semaphore to release when task completes.
         timeout: Task timeout in seconds.
     """
+    task_key = object()
     try:
         # Close stale connections before task execution
         close_old_django_connections()
@@ -97,13 +142,11 @@ def _execute_task_in_thread(
         # Signal pre-execution (same as Django-Q2)
         pre_execute.send(sender="django_q", func=f, task=task)
 
-        # Update timer to indicate busy state
-        # In threaded mode, timer tracks "any thread busy" state
-        with timer.get_lock():
-            if timer.value == TIMER_IDLE:
-                timer_value = task.pop("timeout", timeout) or timeout
-                if timer_value and timer_value > 0:
-                    timer.value = timer_value + TIMER_BUFFER
+        # Register this task's deadline so the shared timer always reflects
+        # the earliest one among in-flight tasks
+        task_timeout = task.pop("timeout", timeout) or timeout
+        if task_timeout and task_timeout > 0:
+            deadlines.add(task_key, task_timeout)
 
         # Execute the task (mirrors Django-Q2 worker execution)
         try:
@@ -145,10 +188,9 @@ def _execute_task_in_thread(
         stop_heartbeat(task.get("id"))
         # Always close connections after task execution
         close_old_django_connections()
-        # Reset timer to idle after task completion
-        with timer.get_lock():
-            if timer.value > 0:
-                timer.value = TIMER_IDLE
+        # Drop this task's deadline; the timer re-arms to the earliest
+        # remaining one, or TIMER_IDLE when nothing is in flight
+        deadlines.remove(task_key)
         # Release semaphore to allow next task
         inflight_semaphore.release()
 
@@ -210,6 +252,7 @@ def threaded_worker(
         max_workers=threads, thread_name_prefix="qraft_worker"
     )
     inflight_semaphore = Semaphore(max_inflight)
+    deadlines = _DeadlineRegistry(timer)
 
     task_count = 0
     if timeout is None:
@@ -253,7 +296,7 @@ def threaded_worker(
             _execute_task_in_thread,
             task,
             result_queue,
-            timer,
+            deadlines,
             inflight_semaphore,
             timeout,
         )
@@ -265,7 +308,8 @@ def threaded_worker(
                 proc_name,
                 task_count,
             )
-            timer.value = TIMER_RECYCLE
+            with timer.get_lock():
+                timer.value = TIMER_RECYCLE
             should_stop = True
 
     # Graceful shutdown: wait for in-flight tasks to complete
@@ -294,6 +338,17 @@ def threaded_worker(
             proc_name,
             grace_period,
         )
+        # Executor threads are non-daemon: returning here would leave the
+        # interpreter joining them forever in threading._shutdown, and the
+        # sentinel's stop() spins until this process dies. Flush the result
+        # queue's feeder thread so already-finished results reach the
+        # monitor, then hard-exit past the stuck threads.
+        if isinstance(result_queue, Queue):
+            # In-process tests drive the loop with queue.Queue, which has no
+            # feeder thread to flush.
+            result_queue.close()
+            result_queue.join_thread()
+        os._exit(1)
 
     with timer.get_lock():
         if timer.value > 0:

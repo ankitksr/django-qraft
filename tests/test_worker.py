@@ -1,6 +1,9 @@
 """Tests for qraft.worker module (threaded_worker, _execute_task_in_thread)."""
 
+import os
+import threading
 import time
+from multiprocessing import Queue as MPQueue
 from multiprocessing import Value
 from queue import Queue as ThreadQueue
 from threading import Semaphore
@@ -8,7 +11,18 @@ from unittest.mock import patch
 
 import pytest
 
-from qraft.worker import TIMER_IDLE, _execute_task_in_thread, threaded_worker
+from qraft.worker import (
+    TIMER_IDLE,
+    TIMER_RECYCLE,
+    _DeadlineRegistry,
+    _execute_task_in_thread,
+    threaded_worker,
+)
+
+
+def fast_task():
+    # Module-level so the result dict pickles through a multiprocessing queue.
+    return "fast"
 
 
 def make_task(**overrides):
@@ -34,10 +48,11 @@ class TestExecuteTaskInThread:
         task = make_task(func=lambda x, y: x + y, args=(1, 2), kwargs={})
         result_queue = ThreadQueue()
         timer = Value("f", TIMER_IDLE)
+        deadlines = _DeadlineRegistry(timer)
         semaphore = Semaphore(1)
         semaphore.acquire()
 
-        _execute_task_in_thread(task, result_queue, timer, semaphore, timeout=30)
+        _execute_task_in_thread(task, result_queue, deadlines, semaphore, timeout=30)
 
         result_task = result_queue.get_nowait()
         assert result_task["result"] == 3
@@ -54,10 +69,11 @@ class TestExecuteTaskInThread:
         task = make_task(func=boom)
         result_queue = ThreadQueue()
         timer = Value("f", TIMER_IDLE)
+        deadlines = _DeadlineRegistry(timer)
         semaphore = Semaphore(1)
         semaphore.acquire()
 
-        _execute_task_in_thread(task, result_queue, timer, semaphore, timeout=30)
+        _execute_task_in_thread(task, result_queue, deadlines, semaphore, timeout=30)
 
         result_task = result_queue.get_nowait()
         assert result_task["success"] is False
@@ -68,17 +84,97 @@ class TestExecuteTaskInThread:
         task = make_task(func="not.a.real.module.func")
         result_queue = ThreadQueue()
         timer = Value("f", TIMER_IDLE)
+        deadlines = _DeadlineRegistry(timer)
         semaphore = Semaphore(1)
         semaphore.acquire()
 
         with patch("qraft.worker.pydoc.locate", return_value=None):
-            _execute_task_in_thread(task, result_queue, timer, semaphore, timeout=30)
+            _execute_task_in_thread(
+                task, result_queue, deadlines, semaphore, timeout=30
+            )
 
         result_task = result_queue.get_nowait()
         assert result_task["success"] is False
         assert "is not defined" in result_task["result"]
         # Semaphore must still be released even though the function never ran.
         assert semaphore.acquire(blocking=False) is True
+
+
+@pytest.mark.django_db
+class TestTimerDeadlines:
+    """The shared timer must track the earliest deadline among in-flight tasks."""
+
+    def _spawn(self, task, deadlines, semaphore, timeout=30):
+        semaphore.acquire()
+        thread = threading.Thread(
+            target=_execute_task_in_thread,
+            args=(task, ThreadQueue(), deadlines, semaphore, timeout),
+        )
+        thread.start()
+        return thread
+
+    def _wait_for(self, condition, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_timer_stays_armed_for_hanging_sibling(self):
+        timer = Value("f", TIMER_IDLE)
+        deadlines = _DeadlineRegistry(timer)
+        semaphore = Semaphore(2)
+        hang_gate = threading.Event()
+        short_gate = threading.Event()
+
+        hang_task = make_task(name="hang", func=lambda: hang_gate.wait(5), timeout=50)
+        short_task = make_task(
+            name="short", func=lambda: short_gate.wait(5), timeout=10
+        )
+
+        hang_thread = self._spawn(hang_task, deadlines, semaphore)
+        assert self._wait_for(lambda: timer.value > 0)
+        # Armed with the hanging task's countdown (50 + TIMER_BUFFER).
+        assert 40 < timer.value <= 53
+
+        short_thread = self._spawn(short_task, deadlines, semaphore)
+        # Earliest deadline wins: short task's countdown (10 + TIMER_BUFFER).
+        assert self._wait_for(lambda: 0 < timer.value <= 13)
+
+        short_gate.set()
+        short_thread.join(timeout=5)
+        # Short task finished; timer must re-arm for the hanging sibling,
+        # not reset to idle.
+        assert timer.value != TIMER_IDLE
+        assert 13 < timer.value <= 53
+
+        hang_gate.set()
+        hang_thread.join(timeout=5)
+        assert timer.value == TIMER_IDLE
+
+    def test_no_timeout_task_leaves_timer_idle(self):
+        timer = Value("f", TIMER_IDLE)
+        deadlines = _DeadlineRegistry(timer)
+        semaphore = Semaphore(1)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def func():
+            started.set()
+            gate.wait(5)
+
+        # No per-task timeout and no worker default (None -> TIMER_IDLE).
+        task = make_task(func=func)
+        thread = self._spawn(task, deadlines, semaphore, timeout=TIMER_IDLE)
+        # Arming happens before the function runs, so once it has started
+        # the timer state is settled.
+        assert started.wait(5)
+        assert timer.value == TIMER_IDLE
+
+        gate.set()
+        thread.join(timeout=5)
+        assert timer.value == TIMER_IDLE
 
 
 @pytest.mark.django_db
@@ -143,9 +239,10 @@ class TestThreadedWorkerLoop:
                     grace_period=0.5,
                 )
 
-        # Only the first two tasks were submitted before recycling; the timer
-        # was reset to idle after graceful shutdown, so we can't observe
-        # TIMER_RECYCLE directly, but the third task must remain unqueued.
+        # Only the first two tasks were submitted before recycling; the third
+        # task must remain unqueued, and the recycle signal must survive
+        # in-flight tasks finishing during the graceful shutdown.
+        assert timer.value == TIMER_RECYCLE
         assert task_queue.qsize() == 1
         results = []
         while not result_queue.empty():
@@ -176,8 +273,6 @@ class TestThreadedWorkerLoop:
         def unblock_after_delay():
             time.sleep(0.1)
             release_event.put(None)
-
-        import threading
 
         unblocker = threading.Thread(target=unblock_after_delay)
         unblocker.start()
@@ -222,6 +317,7 @@ class TestThreadedWorkerLoop:
         with (
             patch("qraft.worker.signal.signal"),
             patch("qraft.worker.setproctitle", None),
+            patch("qraft.worker.os._exit") as mock_exit,
         ):
             threaded_worker(
                 task_queue,
@@ -235,9 +331,13 @@ class TestThreadedWorkerLoop:
 
         assert completed == [True]
         assert result_queue.get_nowait()["success"] is True
+        # Tasks finished inside the grace period: no forced exit.
+        mock_exit.assert_not_called()
 
-    def test_grace_period_timeout_returns_without_waiting_forever(self):
-        """If a task outlives the grace period, the worker still returns."""
+    def test_grace_period_timeout_forces_exit(self):
+        """If a task outlives the grace period, the worker must hard-exit:
+        executor threads are non-daemon, so a plain return would hang the
+        process (and the sentinel's stop()) forever."""
         task_queue = ThreadQueue()
         result_queue = ThreadQueue()
         timer = Value("f", TIMER_IDLE)
@@ -248,6 +348,7 @@ class TestThreadedWorkerLoop:
         with (
             patch("qraft.worker.signal.signal"),
             patch("qraft.worker.setproctitle", None),
+            patch("qraft.worker.os._exit") as mock_exit,
         ):
             threaded_worker(
                 task_queue,
@@ -260,5 +361,62 @@ class TestThreadedWorkerLoop:
             )
         elapsed = time.monotonic() - start
 
-        # Must return close to the grace period, not wait for the full 0.5s task.
+        # Must exit close to the grace period, not wait for the full 0.5s task.
         assert elapsed < 0.4
+        mock_exit.assert_called_once_with(1)
+
+    def test_forced_exit_flushes_finished_results(self):
+        """Results already produced must survive the forced exit: the
+        multiprocessing queue's feeder thread is flushed before os._exit."""
+        hang_gate = threading.Event()
+        task_queue = ThreadQueue()
+        result_queue = MPQueue()
+        timer = Value("f", TIMER_IDLE)
+        task_queue.put(make_task(name="fast", func=fast_task))
+        task_queue.put(make_task(name="hang", func=lambda: hang_gate.wait(10)))
+        task_queue.put("STOP")
+
+        # close() also closes this process's reader handle, so keep a
+        # duplicate to prove the flushed data reached the pipe.
+        from multiprocessing.connection import Connection
+
+        reader = Connection(os.dup(result_queue._reader.fileno()))
+        exit_calls = []
+
+        try:
+            with (
+                patch("qraft.worker.signal.signal"),
+                patch("qraft.worker.setproctitle", None),
+                patch.object(
+                    result_queue, "close", wraps=result_queue.close
+                ) as mock_close,
+                patch.object(
+                    result_queue, "join_thread", wraps=result_queue.join_thread
+                ) as mock_join,
+                patch(
+                    "qraft.worker.os._exit",
+                    side_effect=lambda code: exit_calls.append(
+                        (code, mock_close.called, mock_join.called)
+                    ),
+                ),
+            ):
+                threaded_worker(
+                    task_queue,
+                    result_queue,
+                    timer,
+                    30,
+                    threads=2,
+                    max_inflight=2,
+                    grace_period=0.5,
+                )
+        finally:
+            hang_gate.set()
+
+        # os._exit(1) fired with the queue already closed and flushed.
+        assert exit_calls == [(1, True, True)]
+        # The fast task's result reached the pipe before the exit.
+        assert reader.poll(1)
+        result = reader.recv()
+        reader.close()
+        assert result["name"] == "fast"
+        assert result["success"] is True
