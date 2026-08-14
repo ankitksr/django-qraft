@@ -309,6 +309,25 @@ class QraftTaskAttempt(models.Model):
         help_text="When the attempt completed",
     )
 
+    # Worker identity, stamped from inside the executing process at
+    # pre_execute time (see qraft.lease.stamp_start). `cluster` above already
+    # carries the routing target, which is also the cluster that actually ran
+    # the attempt in every normal path (a named lane is only drained by the
+    # worker process bound to it) - these two fields add the pid and, for
+    # threaded workers, which pool thread within that process.
+    worker_pid = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="OS pid of the worker process that executed this attempt",
+    )
+    worker_thread = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Executor thread name within the worker process; blank for "
+        "standard (non-threaded) workers",
+    )
+
     def __str__(self):
         status = (
             "pending" if self.success is None else ("ok" if self.success else "failed")

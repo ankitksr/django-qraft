@@ -143,6 +143,9 @@ class QraftTaskAttemptInline(_UsageDisplay, _ReadOnly, admin.TabularInline):
         "success",
         "exception_class",
         "usage_display",
+        "cluster",
+        "worker_pid",
+        "worker_thread",
         "date_created",
         "date_completed",
     ]
@@ -259,10 +262,13 @@ class QraftTaskAttemptAdmin(_UsageDisplay, _QraftTaskLinkAdmin, admin.ModelAdmin
         "success_display",
         "exception_class",
         "usage_display",
+        "cluster",
+        "worker_pid",
+        "worker_thread",
         "date_created",
         "date_completed",
     ]
-    list_filter = ["success", "date_created"]
+    list_filter = ["success", "cluster", "date_created"]
     search_fields = ["id", "q2_task_id", "exception_class", "qraft_task__id"]
     readonly_fields = [
         "id",
@@ -272,6 +278,9 @@ class QraftTaskAttemptAdmin(_UsageDisplay, _QraftTaskLinkAdmin, admin.ModelAdmin
         "success",
         "exception_class",
         "usage_display",
+        "cluster",
+        "worker_pid",
+        "worker_thread",
         "date_created",
         "date_completed",
     ]

@@ -1,5 +1,6 @@
 """Tests for qraft.lease (execution lease and heartbeat)."""
 
+import os
 import threading
 
 import pytest
@@ -27,6 +28,36 @@ class TestStampStart:
 
     def test_false_for_plain_django_q_task(self, db):
         assert lease.stamp_start("not-a-qraft-task") is False
+
+    def test_stamps_worker_pid(self, qraft_task_attempt):
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.worker_pid == os.getpid()
+
+    def test_stamps_the_current_thread_name_for_pool_threads(
+        self, qraft_task_attempt, monkeypatch
+    ):
+        # A real second thread can't share the transactional test DB
+        # connection (sqlite locks it), so rename the current thread instead
+        # of spawning one - stamp_start only reads the name, not identity.
+        original_name = threading.current_thread().name
+        threading.current_thread().name = "qraft_worker_2"
+        try:
+            lease.stamp_start(qraft_task_attempt.q2_task_id)
+        finally:
+            threading.current_thread().name = original_name
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.worker_thread == "qraft_worker_2"
+
+    def test_main_thread_is_not_reported_as_a_worker_thread(self, qraft_task_attempt):
+        """The standard (non-threaded) worker executes on MainThread, which
+        isn't a pool thread worth reporting."""
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.worker_thread is None
 
 
 @pytest.mark.django_db

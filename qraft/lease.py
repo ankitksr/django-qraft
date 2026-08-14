@@ -23,6 +23,7 @@ handler resolves the attempt and the heartbeat UPDATE matches no rows - and
 """
 
 import logging
+import os
 import threading
 
 from django.db import close_old_connections, connections
@@ -57,14 +58,28 @@ def stamp_start(q2_task_id: str) -> bool:
     """
     Mark an attempt as started and open its lease.
 
+    Also stamps worker identity (pid, and thread name for threaded workers)
+    from inside the executing process - this runs at `pre_execute`, in the
+    worker itself, for both the standard django_q worker and qraft's
+    threaded worker (see qraft.worker._execute_task_in_thread), so
+    `os.getpid()` is always the real worker pid rather than the monitor's.
+
     Returns False when no Qraft attempt owns this Django-Q2 task (a plain
     django_q task), in which case there is nothing to heartbeat.
     """
     from .models import QraftTaskAttempt
 
     now = timezone.now()
+    # ThreadPoolExecutor threads are named via `thread_name_prefix`
+    # (qraft.worker uses "qraft_worker"); the standard worker executes on
+    # "MainThread", which isn't a pool thread worth reporting.
+    thread_name = threading.current_thread().name
+    worker_thread = thread_name if thread_name != "MainThread" else None
     updated = QraftTaskAttempt.objects.filter(q2_task_id=q2_task_id).update(
-        date_started=now, heartbeat_at=now
+        date_started=now,
+        heartbeat_at=now,
+        worker_pid=os.getpid(),
+        worker_thread=worker_thread,
     )
     return bool(updated)
 
