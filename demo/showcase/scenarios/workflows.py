@@ -532,6 +532,16 @@ def cancel(ctx):
     for index in range(4):
         early.append(run, f"ce-{index}", seconds=3.0)
     early_id = early.run()
+
+    early_before = QraftIterModel.objects.get(id=early_id)
+    if early_before.status != WorkflowStatus.RUNNING:
+        ctx.check(
+            "cancel window was still open",
+            False,
+            f"workflow already {early_before.status}; the race window closed early",
+        )
+        return
+
     QraftIter("showcase.tasks.sleep_task", iter_id=early_id).cancel()
 
     ctx.equals(
