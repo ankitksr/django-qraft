@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`async_task()` validates callables are importable at enqueue**: bound methods and
+  `functools.partial` objects are rejected with `ValueError` instead of enqueueing a
+  path that silently diverges or crashes on retry. Pass a module-level function or its
+  dotted-path string.
+- **Qraft forces `save=True` on every enqueued task** so Django-Q2 always writes a
+  success row for the hook handler. With `SAVE_LIMIT < 0` that also disables django_q's
+  own trimming of successful results — size retention via `retention_days` /
+  `retention_max_tasks` accordingly.
+
 ### Planned
 - Coroutine tasks on the `django.tasks` backend
 - Priority routing for scheduled retries

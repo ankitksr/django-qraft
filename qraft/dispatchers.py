@@ -88,11 +88,14 @@ class ChainDispatcher:
 
         The advance and the next step's creation/enqueue share the locked
         transaction: if the enqueue fails, the advance rolls back with it,
-        so a redelivery can retry instead of finding the chain stranded at
-        an index whose task was never queued. With the ORM broker the queue
-        row is in the same database, so the commit publishes the advance and
-        the enqueue together (the argument _queue_chain_step makes for the
-        task/link pairing).
+        so the chain stays clean at step i instead of stranded at an index
+        whose task was never queued. With the ORM broker the queue row is
+        in the same database, so the commit publishes the advance and the
+        enqueue together (the argument _queue_chain_step makes for the
+        task/link pairing). On a non-ORM broker a broker-down enqueue still
+        rolls the ORM advance back, but there is no redelivery actor
+        (ack_failure=True; the monitor delivers once) - the chain stays
+        RUNNING at step i until manual intervention.
         """
         next_step = self.chain.steps.filter(step_index=self.step.step_index + 1).first()
         completed = False

@@ -120,6 +120,15 @@ def reconcile_finished(grace: float | None = None) -> int:
     handler had its chance, so a completion still inside `grace` is left for
     the monitor's own delivery to resolve.
 
+    Two residuals remain:
+    (a) With SAVE_LIMIT > 0 django_q may trim the saved success row before
+        the >= 90s grace elapses on a busy cluster; after that the orphan
+        sweep re-executes a succeeded task.
+    (b) It cannot replay attempts that resolved but crashed before workflow
+        routing / hook dispatch (the post-commit window in hooks.py) -
+        resolution is fenced by the CAS, so those stay "resolved" with no
+        further recovery here.
+
     Args:
         grace: Seconds a saved completion may sit unresolved before it is
             replayed (default: the heartbeat grace).

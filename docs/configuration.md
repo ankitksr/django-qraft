@@ -263,6 +263,12 @@ Two `save_limit` values carry no count to mirror and so inherit nothing:
 `0`, which is Django-Q2's "keep everything", and any negative value, which
 tells Django-Q2 to save no successful results at all.
 
+Qraft forces `save=True` on every task it enqueues, so a successful run
+always writes a Django-Q2 `Task` row for the hook handler. Combined with
+`SAVE_LIMIT < 0`, that means django_q's own trimming of successful results
+is effectively disabled — size retention with `retention_days` /
+`retention_max_tasks` (or a positive `save_limit`) accordingly.
+
 `save_limit_per` (`group`/`name`/`func`) is not mirrored. Qraft rows have no
 equivalent grouping, so the inherited bound is always global.
 

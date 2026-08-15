@@ -364,10 +364,10 @@ class TestChainDispatcher:
 
 class TestChainAdvanceEnqueueAtomicity:
     """Regression: a broker failure while queueing step N+1 must roll back the
-    index advance, or the chain wedges at RUNNING with no task for N+1 and the
-    duplicate-completion guard turns every redelivery into a no-op."""
+    index advance, or the chain wedges at RUNNING with no task for N+1.
+    There is no redelivery actor (ack_failure=True); recovery is manual."""
 
-    def test_enqueue_failure_rolls_back_advance_and_redelivery_retries(self, db):
+    def test_enqueue_failure_rolls_back_advance_leaving_chain_at_step(self, db):
         chain, (step0, step1) = _chain_with_steps(2)
         attempt = _chain_attempt(step0, success=True, task_status=TaskStatus.SUCCEEDED)
 
@@ -385,7 +385,7 @@ class TestChainAdvanceEnqueueAtomicity:
         # step0's task survives; the rolled-back step1 task does not
         assert QraftTask.objects.count() == 1
 
-        # Redelivery of the same completion retries and succeeds.
+        # Manual re-handle (not broker redelivery) can still advance.
         with patch("qraft.tasks.q2_async_task") as mock_async:
             mock_async.return_value = "q2-next"
             ChainDispatcher(chain, step0, attempt).handle()

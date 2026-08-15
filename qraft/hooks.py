@@ -61,7 +61,10 @@ def dispatch_hook_once(dispatch_model, lookup: dict, hook_path: str, enqueue) ->
     lives in the same database, so both commit or neither does (the reasoning
     of qraft.scheduler._claim_and_enqueue). With a broker that writes outside
     the database an enqueue failure removes the claim again and the hook is
-    lost - nothing above this layer retries it.
+    lost - nothing above this layer retries it. The other direction also
+    exists on non-ORM brokers: the external enqueue can commit while the
+    claim transaction rolls back, so a later redelivery can claim again and
+    the hook runs twice.
 
     Args:
         dispatch_model: HookDispatch or WorkflowHookDispatch

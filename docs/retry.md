@@ -911,6 +911,13 @@ task_id = async_task(
 
 ## Advanced Topics
 
+### Callable must be importable at enqueue
+
+Retries re-queue by dotted path, not the live object. `async_task()` now
+rejects bound methods and `functools.partial` at enqueue (they previously
+enqueued and silently diverged or crashed on retry). Pass a module-level
+function or its dotted-path string.
+
 ### Retry Policy Serialization
 
 Retry policies are stored as JSON in the QraftTask model:
