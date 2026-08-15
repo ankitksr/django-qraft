@@ -18,14 +18,34 @@ from qraft.retry import RetryPolicy
 
 _logger = logging.getLogger("qraft")
 
-# Keys django_q's own async_task() treats specially (django_q/tasks.py
-# opt_keys), and that Qraft either forces to a fixed value or validates at
-# the top of async_task(). django_q checks q_options for each of these
-# *before* falling back to the plain keyword argument, so a caller who
-# cannot pass one of these directly (rejected above) could still smuggle it
-# in via q_options and silently override the invariant. Not every opt_key is
-# here - only the ones Qraft itself sets or validates; e.g. `timeout` and
-# `group` are plain passthroughs with nothing to protect.
+# django_q/tasks.py opt_keys: popped as task options before the remainder
+# become the function's kwargs. A name from this set in our **kwargs would
+# be consumed as an option on attempt 1 and replayed into the function on
+# retry (TypeError or behavior change).
+_DJANGO_Q_OPT_KEYS = frozenset(
+    {
+        "hook",
+        "group",
+        "save",
+        "sync",
+        "cached",
+        "ack_failure",
+        "iter_count",
+        "iter_cached",
+        "chain",
+        "broker",
+        "cluster",
+        "timeout",
+    }
+)
+
+# Subset of _DJANGO_Q_OPT_KEYS that Qraft either forces to a fixed value or
+# validates at the top of async_task(). django_q checks q_options for each
+# of these *before* falling back to the plain keyword argument, so a caller
+# who cannot pass one of these directly (rejected above) could still
+# smuggle it in via q_options and silently override the invariant. Not
+# every opt_key is here - only the ones Qraft itself sets or validates;
+# e.g. `timeout` and `group` are plain passthroughs with nothing to protect.
 _RESERVED_Q_OPTIONS = frozenset(
     {"hook", "save", "sync", "cached", "ack_failure", "broker", "cluster"}
 )
@@ -296,6 +316,21 @@ def async_task(
     if qraft_options is None:
         qraft_options = {}
 
+    # Names that are real async_task() parameters (hook/group/save/...) never
+    # land in **kwargs; what can is the rest of django_q's opt_keys
+    # (cluster/chain/iter_count/iter_cached). Those would be stripped as
+    # options on attempt 1 and replayed as function kwargs on retry.
+    colliding = _DJANGO_Q_OPT_KEYS.intersection(kwargs)
+    if colliding:
+        raise ValueError(
+            f"async_task() keyword argument(s) {sorted(colliding)} collide "
+            "with django_q option names: on attempt 1 they are consumed as "
+            "task options instead of reaching the function, but "
+            "task_kwargs replays them into the function on retry. Pass "
+            "cluster via qraft_options; pass the other options via "
+            "q_options (reserved invariant keys are rejected there too)."
+        )
+
     # Idempotency: a task already enqueued under this key is never
     # re-enqueued, regardless of its current status. Callers that want to
     # run again must use a new key.
@@ -458,6 +493,19 @@ def _create_workflow_task(
     """
     from qraft.models import QraftBatchModel, QraftIterModel
 
+    # Member kwargs are the function's kwargs, but q2_async_task treats
+    # django_q opt_keys as options. A collision would override Qraft's
+    # forced hook/save/ack_failure/group on attempt 1 and never reach the
+    # member function (while task_kwargs still stores them for retry).
+    colliding = _DJANGO_Q_OPT_KEYS.intersection(kwargs)
+    if colliding:
+        raise ValueError(
+            f"workflow member keyword argument(s) {sorted(colliding)} "
+            "collide with django_q option names and would be consumed as "
+            "task options instead of reaching the member function. Rename "
+            "the callable's parameters."
+        )
+
     retry_policy = RetryPolicy.from_options(qraft_options)
 
     qraft_metadata = {
@@ -478,6 +526,7 @@ def _create_workflow_task(
     # Workflow ID doubles as the Q2 group, for result aggregation
     workflow_id = qraft_iter_id or qraft_batch_id
     q2_kwargs = {
+        **kwargs,
         "hook": "qraft.hooks.qraft_hook_handler",
         "group": str(workflow_id) if workflow_id else None,
         # See async_task(): Qraft's retries must not race Django-Q2 redelivery.
@@ -486,7 +535,6 @@ def _create_workflow_task(
         # Task row unless it asks, and no row means the hook never fires -
         # here that leaves the member uncounted and the workflow hung.
         "save": True,
-        **kwargs,
     }
     cluster = qraft_options.get("cluster")
     if cluster is not None:

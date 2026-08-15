@@ -496,6 +496,88 @@ class TestForcedSavePersistence:
 
 
 @pytest.mark.django_db
+class TestWorkflowMemberOptKeyCollision:
+    """
+    Member kwargs that share a name with django_q opt_keys would override
+    Qraft's forced hook/save/ack_failure/group and never reach the function.
+    """
+
+    def test_save_false_rejected(self, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+        with pytest.raises(ValueError, match="save"):
+            _create_workflow_task(
+                func="test.function",
+                args=[],
+                kwargs={"save": False},
+                qraft_options={},
+                qraft_iter_id=iter_model.id,
+            )
+
+    def test_hook_rejected(self, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+        with pytest.raises(ValueError, match="hook"):
+            _create_workflow_task(
+                func="test.function",
+                args=[],
+                kwargs={"hook": "evil.hook"},
+                qraft_options={},
+                qraft_iter_id=iter_model.id,
+            )
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_harmless_kwarg_passes(self, mock_q2_async, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        mock_q2_async.return_value = "q2-workflow-ok"
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+
+        _create_workflow_task(
+            func="test.function",
+            args=[],
+            kwargs={"payload": {"n": 1}},
+            qraft_options={},
+            qraft_iter_id=iter_model.id,
+        )
+
+        call_kwargs = mock_q2_async.call_args[1]
+        assert call_kwargs["payload"] == {"n": 1}
+        assert call_kwargs["save"] is True
+        assert call_kwargs["hook"] == "qraft.hooks.qraft_hook_handler"
+
+
+@pytest.mark.django_db
+class TestAsyncTaskKwargsOptKeyCollision:
+    """
+    Opt-key names in **kwargs split attempt 1 (consumed as options) from
+    retry (replayed into the function). Real async_task() parameters never
+    land in **kwargs; cluster/chain do.
+    """
+
+    def test_cluster_kwarg_rejected(self):
+        with pytest.raises(ValueError, match="cluster"):
+            async_task("test.function", cluster="io-workers")
+
+    def test_chain_kwarg_rejected(self):
+        with pytest.raises(ValueError, match="chain"):
+            async_task("test.function", chain=["a.b", "c.d"])
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_cluster_via_qraft_options_still_works(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-cluster-ok"
+
+        async_task("test.function", qraft_options={"cluster": "io-workers"})
+
+        assert mock_q2_async.call_args[1]["cluster"] == "io-workers"
+
+
+@pytest.mark.django_db
 class TestIdempotencyBackoffDedupe:
     """
     A4: a SCHEDULED backoff attempt has a null q2_task_id until a dispatcher
