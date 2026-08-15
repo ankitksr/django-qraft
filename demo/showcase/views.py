@@ -444,31 +444,40 @@ def run_scenario(request, key: str):
             return JsonResponse({"started": False, "reason": "already running"})
         _ACTIVE.add(key)
 
-    manager = _clusters()
+    try:
+        manager = _clusters()
 
-    def work():
-        try:
-            boot = [name for name in item.clusters if name not in item.manual_clusters]
-            manager.ensure(boot)
-            for name in item.manual_clusters:
-                manager.stop(name)
-            runner.run_one(item, manager, log=lambda message: None)
-        except Exception as error:  # surfaced through the run row below
-            ScenarioRun.objects.create(
-                id=uuid.uuid4(),
-                key=item.key,
-                group=item.group,
-                title=item.title,
-                status=ScenarioRun.ERROR,
-                error=str(error),
-                finished_at=timezone.now(),
-            )
-        finally:
-            with _LOCK:
-                _ACTIVE.discard(key)
-            connection.close()
+        def work():
+            try:
+                boot = [
+                    name for name in item.clusters if name not in item.manual_clusters
+                ]
+                manager.ensure(boot)
+                for name in item.manual_clusters:
+                    manager.stop(name)
+                runner.run_one(item, manager, log=lambda message: None)
+            except Exception as error:  # surfaced through the run row below
+                ScenarioRun.objects.create(
+                    id=uuid.uuid4(),
+                    key=item.key,
+                    group=item.group,
+                    title=item.title,
+                    status=ScenarioRun.ERROR,
+                    error=str(error),
+                    finished_at=timezone.now(),
+                )
+            finally:
+                with _LOCK:
+                    _ACTIVE.discard(key)
+                connection.close()
 
-    threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
+    except Exception:
+        # ClusterManager()/Thread.start() failed before work()'s finally
+        # owns the key - drop it so reset isn't stuck at 409 forever.
+        with _LOCK:
+            _ACTIVE.discard(key)
+        raise
     return JsonResponse({"started": True})
 
 

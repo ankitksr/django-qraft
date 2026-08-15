@@ -365,8 +365,12 @@ $("reset").onclick = async () => {
   $("reset").disabled = false;
   $("reset").textContent = "reset";
   if (!response.ok) {
-    const body = await response.json();
-    alert(body.error || "Reset failed.");
+    let message = "Reset failed.";
+    try {
+      const body = await response.json();
+      message = body.error || message;
+    } catch (_) { /* non-JSON 500 */ }
+    alert(message);
     return;
   }
   poll();
