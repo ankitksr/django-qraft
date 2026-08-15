@@ -4,9 +4,10 @@ import logging
 import time
 from uuid import UUID
 
+from django.utils import timezone
 from django.utils.module_loading import import_string
 
-from qraft.models import WorkflowStatus
+from qraft.models import InvalidStatusTransition, WorkflowStatus
 from qraft.results import TaskResult, WorkflowResult
 
 _logger = logging.getLogger("qraft.workflow")
@@ -22,6 +23,17 @@ _TERMINAL_STATUSES = frozenset(
         WorkflowStatus.SUCCEEDED,
         WorkflowStatus.FAILED,
         WorkflowStatus.CANCELLED,
+    }
+)
+
+# Statuses cancel() may still move to CANCELLED. Matches VALID_TRANSITIONS
+# that list CANCELLED as a target; a completion that already committed past
+# these must not be overwritten by a late cancel.
+_CANCELLABLE_STATUSES = frozenset(
+    {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.WAITING_APPROVAL,
     }
 )
 
@@ -68,25 +80,43 @@ class BaseWorkflow:
         self._model.refresh_from_db()
         return self._model.status
 
-    def cancel(self) -> None:
+    def cancel(self) -> bool:
         """
         Cancel the workflow.
 
-        Sets status to CANCELLED. This stops future orchestration only - no
-        new steps queued, no hooks fired, no counters updated - but does not
-        revoke member tasks already queued or running; they complete and
-        their outcome is ignored.
+        Sets status to CANCELLED via a conditional UPDATE so a completion
+        that already committed to a terminal state cannot be overwritten.
+        This stops future orchestration only - no new steps queued, no hooks
+        fired, no counters updated - but does not revoke member tasks already
+        queued or running; they complete and their outcome is ignored.
+
+        Returns:
+            True if the cancel took effect.
 
         Raises:
-            InvalidStatusTransition: If workflow can't be cancelled from current state
+            InvalidStatusTransition: If the workflow can't be cancelled from
+                its current state (including when a race already committed a
+                terminal status).
         """
+        updated = self._model.__class__.objects.filter(
+            pk=self._model.pk,
+            status__in=_CANCELLABLE_STATUSES,
+        ).update(
+            status=WorkflowStatus.CANCELLED,
+            date_updated=timezone.now(),
+        )
+        if updated:
+            self._model.status = WorkflowStatus.CANCELLED
+            _logger.info(
+                "%s %s cancelled",
+                self._workflow_type.capitalize(),
+                self._model.id,
+            )
+            return True
+
         self._model.refresh_from_db()
-        self._model.transition_to(WorkflowStatus.CANCELLED)
-        self._model.save(update_fields=["status", "date_updated"])
-        _logger.info(
-            "%s %s cancelled",
-            self._workflow_type.capitalize(),
-            self._model.id,
+        raise InvalidStatusTransition(
+            f"Cannot transition from {self._model.status} to {WorkflowStatus.CANCELLED}"
         )
 
     def _poll_until_terminal(self, timeout_ms: int | None) -> None:

@@ -342,3 +342,29 @@ class TestIterIntegration:
         for call_obj in mock_q2_async.call_args_list:
             call_kwargs = call_obj[1]
             assert call_kwargs["cluster"] == "io-workers"
+
+
+class TestCancelGuardedUpdate:
+    """cancel() must not overwrite a completion that already committed."""
+
+    def test_cancel_racing_committed_succeeded_is_noop(self, db):
+        from qraft.models import InvalidStatusTransition
+
+        iter_task = QraftIter("myapp.tasks.process")
+        iter_task._model.status = WorkflowStatus.SUCCEEDED
+        iter_task._model.save(update_fields=["status", "date_updated"])
+
+        with pytest.raises(InvalidStatusTransition):
+            iter_task.cancel()
+
+        iter_task._model.refresh_from_db()
+        assert iter_task._model.status == WorkflowStatus.SUCCEEDED
+
+    def test_cancel_from_running_takes_effect(self, db):
+        iter_task = QraftIter("myapp.tasks.process")
+        iter_task._model.status = WorkflowStatus.RUNNING
+        iter_task._model.save(update_fields=["status", "date_updated"])
+
+        assert iter_task.cancel() is True
+        iter_task._model.refresh_from_db()
+        assert iter_task._model.status == WorkflowStatus.CANCELLED
