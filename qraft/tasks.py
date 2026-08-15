@@ -50,6 +50,25 @@ _RESERVED_Q_OPTIONS = frozenset(
     {"hook", "save", "sync", "cached", "ack_failure", "broker", "cluster"}
 )
 
+# django_q also pops these from keywords (not in opt_keys above). q_options
+# would win over the forced hook/save/ack_failure in workflow q2_kwargs;
+# task_name would split attempt-1 vs retry naming.
+_WORKFLOW_MEMBER_REJECTED_KEYS = _DJANGO_Q_OPT_KEYS | frozenset(
+    {"q_options", "task_name"}
+)
+
+
+def _reject_workflow_member_opt_keys(kwargs: dict) -> None:
+    """Raise if workflow-member kwargs collide with django_q option names."""
+    colliding = _WORKFLOW_MEMBER_REJECTED_KEYS.intersection(kwargs)
+    if colliding:
+        raise ValueError(
+            f"workflow member keyword argument(s) {sorted(colliding)} "
+            "collide with django_q option names and would be consumed as "
+            "task options instead of reaching the member function. Rename "
+            "the callable's parameters."
+        )
+
 
 def _existing_task_for_key(idempotency_key: str) -> str | None:
     """
@@ -180,6 +199,7 @@ def async_task(
     sync: bool = False,
     cached: bool | int | None = None,
     broker: Any | None = None,
+    cluster: str | None = None,
     task_name: str | None = None,
     q_options: dict | None = None,
     # New Qraft parameters (config-only)
@@ -202,8 +222,12 @@ def async_task(
         hook (str, optional):
             Legacy Django-Q2 hook. Deprecated. If no Qraft hooks are provided,
             this will be treated as a `success_hook` with a warning.
-        group, timeout, broker:
-            Same semantics as Django-Q2 async_task.
+        group, timeout, broker, cluster:
+            Same semantics as Django-Q2 async_task. `cluster` may also be
+            set via `qraft_options["cluster"]`; if both are given they must
+            match. It is never stored in task_kwargs, so retries re-route
+            from the attempt row instead of replaying `cluster` into the
+            function.
         ack_failure:
             Forced to True - Qraft schedules its own retries, so Django-Q2
             must never also redeliver a failed message. `False` is rejected.
@@ -316,10 +340,10 @@ def async_task(
     if qraft_options is None:
         qraft_options = {}
 
-    # Names that are real async_task() parameters (hook/group/save/...) never
-    # land in **kwargs; what can is the rest of django_q's opt_keys
-    # (cluster/chain/iter_count/iter_cached). Those would be stripped as
-    # options on attempt 1 and replayed as function kwargs on retry.
+    # Names that are real async_task() parameters (hook/group/save/cluster/...)
+    # never land in **kwargs; what can is the rest of django_q's opt_keys
+    # (chain/iter_count/iter_cached). Those would be stripped as options on
+    # attempt 1 and replayed as function kwargs on retry.
     colliding = _DJANGO_Q_OPT_KEYS.intersection(kwargs)
     if colliding:
         raise ValueError(
@@ -327,8 +351,8 @@ def async_task(
             "with django_q option names: on attempt 1 they are consumed as "
             "task options instead of reaching the function, but "
             "task_kwargs replays them into the function on retry. Pass "
-            "cluster via qraft_options; pass the other options via "
-            "q_options (reserved invariant keys are rejected there too)."
+            "options via q_options (reserved invariant keys are rejected "
+            "there too)."
         )
 
     # Idempotency: a task already enqueued under this key is never
@@ -390,8 +414,21 @@ def async_task(
         "priority": priority,
     }
 
-    # Extract cluster routing from qraft_options
-    cluster = qraft_options.get("cluster")
+    # Cluster routing: named parameter and qraft_options["cluster"] are
+    # equivalent; both must agree when both are set. Kept out of
+    # task_kwargs (above) so retries inherit from the attempt row.
+    options_cluster = qraft_options.get("cluster")
+    if (
+        cluster is not None
+        and options_cluster is not None
+        and cluster != options_cluster
+    ):
+        raise ValueError(
+            f"async_task(cluster={cluster!r}) conflicts with "
+            f"qraft_options['cluster']={options_cluster!r}"
+        )
+    if cluster is None:
+        cluster = options_cluster
 
     # Priority lanes: only takes effect against a cluster running
     # qraft.brokers.QraftOrmBroker (see that module's docstring). The lane is
@@ -494,17 +531,12 @@ def _create_workflow_task(
     from qraft.models import QraftBatchModel, QraftIterModel
 
     # Member kwargs are the function's kwargs, but q2_async_task treats
-    # django_q opt_keys as options. A collision would override Qraft's
-    # forced hook/save/ack_failure/group on attempt 1 and never reach the
-    # member function (while task_kwargs still stores them for retry).
-    colliding = _DJANGO_Q_OPT_KEYS.intersection(kwargs)
-    if colliding:
-        raise ValueError(
-            f"workflow member keyword argument(s) {sorted(colliding)} "
-            "collide with django_q option names and would be consumed as "
-            "task options instead of reaching the member function. Rename "
-            "the callable's parameters."
-        )
+    # django_q opt_keys (and q_options/task_name) as options. A collision
+    # would override Qraft's forced hook/save/ack_failure/group on attempt
+    # 1 and never reach the member function (while task_kwargs still
+    # stores them for retry). Also called at append time as the early
+    # user-facing guard; kept here as a backstop.
+    _reject_workflow_member_opt_keys(kwargs)
 
     retry_policy = RetryPolicy.from_options(qraft_options)
 

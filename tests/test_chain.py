@@ -110,6 +110,16 @@ class TestChainStepManagement:
         with pytest.raises(ValueError, match="already been run"):
             simple_chain.append("myapp.tasks.task4")
 
+    def test_append_rejects_opt_key_kwargs_immediately(self, db):
+        """Opt-key kwargs must fail at append, before run creates steps."""
+        chain = QraftChain()
+        with pytest.raises(ValueError, match="save"):
+            chain.append("myapp.tasks.task1", save=False)
+
+        assert chain._steps == []
+        assert chain._model.status == WorkflowStatus.PENDING
+        assert QraftChainStep.objects.filter(chain=chain._model).count() == 0
+
 
 class TestChainExecution:
     """Test chain execution and lifecycle."""

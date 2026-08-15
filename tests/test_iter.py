@@ -105,6 +105,15 @@ class TestIterItemManagement:
         with pytest.raises(ValueError, match="already been run"):
             simple_iter.append(6)
 
+    def test_append_rejects_opt_key_kwargs_immediately(self, db):
+        """Opt-key kwargs must fail at append, before run fans out."""
+        iter_task = QraftIter("myapp.tasks.process_item")
+        with pytest.raises(ValueError, match="save"):
+            iter_task.append(1, save=False)
+
+        assert iter_task._items == []
+        assert iter_task._model.status == WorkflowStatus.PENDING
+
 
 class TestIterExecution:
     """Test iter execution and lifecycle."""

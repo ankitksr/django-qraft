@@ -121,6 +121,16 @@ class TestBatchTaskManagement:
         with pytest.raises(ValueError, match="already been run"):
             simple_batch.append("myapp.tasks.task4")
 
+    def test_add_rejects_opt_key_kwargs_immediately(self, db):
+        """Opt-key kwargs must fail at add/append, before run fans out."""
+        batch = QraftBatch()
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            with pytest.raises(ValueError, match="save"):
+                batch.add("myapp.tasks.task1", save=False)
+
+        assert batch._tasks == []
+        assert batch._model.status == WorkflowStatus.PENDING
+
 
 class TestBatchExecution:
     """Test batch execution and lifecycle."""

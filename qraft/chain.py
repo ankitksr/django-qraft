@@ -97,6 +97,10 @@ class QraftChain(BaseWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError("Cannot append to a chain that has already been run")
 
+        from qraft.tasks import _reject_workflow_member_opt_keys
+
+        _reject_workflow_member_opt_keys(kwargs)
+
         step_data = {
             "func": func,
             "task_args": list(args),

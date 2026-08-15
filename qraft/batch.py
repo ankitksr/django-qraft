@@ -96,6 +96,10 @@ class QraftBatch(ParallelWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError("Cannot add to a batch that has already been run")
 
+        from qraft.tasks import _reject_workflow_member_opt_keys
+
+        _reject_workflow_member_opt_keys(kwargs)
+
         task_data = {
             "func": func,
             "args": args,

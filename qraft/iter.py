@@ -90,6 +90,10 @@ class QraftIter(ParallelWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError("Cannot append to an iter that has already been run")
 
+        from qraft.tasks import _reject_workflow_member_opt_keys
+
+        _reject_workflow_member_opt_keys(kwargs)
+
         self._items.append({"args": args, "kwargs": kwargs})
         _logger.debug("Appended item %d to iter %s", len(self._items), self._model.id)
 

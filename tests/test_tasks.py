@@ -530,6 +530,34 @@ class TestWorkflowMemberOptKeyCollision:
                 qraft_iter_id=iter_model.id,
             )
 
+    def test_q_options_rejected(self, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+        with pytest.raises(ValueError, match="q_options"):
+            _create_workflow_task(
+                func="test.function",
+                args=[],
+                kwargs={"q_options": {"hook": "evil", "save": False}},
+                qraft_options={},
+                qraft_iter_id=iter_model.id,
+            )
+
+    def test_task_name_rejected(self, db):
+        from qraft.models import QraftIterModel
+        from qraft.tasks import _create_workflow_task
+
+        iter_model = QraftIterModel.objects.create(func="test.function", total_count=1)
+        with pytest.raises(ValueError, match="task_name"):
+            _create_workflow_task(
+                func="test.function",
+                args=[],
+                kwargs={"task_name": "x"},
+                qraft_options={},
+                qraft_iter_id=iter_model.id,
+            )
+
     @patch("qraft.tasks.q2_async_task")
     def test_harmless_kwarg_passes(self, mock_q2_async, db):
         from qraft.models import QraftIterModel
@@ -556,13 +584,9 @@ class TestWorkflowMemberOptKeyCollision:
 class TestAsyncTaskKwargsOptKeyCollision:
     """
     Opt-key names in **kwargs split attempt 1 (consumed as options) from
-    retry (replayed into the function). Real async_task() parameters never
-    land in **kwargs; cluster/chain do.
+    retry (replayed into the function). Real async_task() parameters
+    (including cluster) never land in **kwargs; chain/iter_count still can.
     """
-
-    def test_cluster_kwarg_rejected(self):
-        with pytest.raises(ValueError, match="cluster"):
-            async_task("test.function", cluster="io-workers")
 
     def test_chain_kwarg_rejected(self):
         with pytest.raises(ValueError, match="chain"):
@@ -575,6 +599,51 @@ class TestAsyncTaskKwargsOptKeyCollision:
         async_task("test.function", qraft_options={"cluster": "io-workers"})
 
         assert mock_q2_async.call_args[1]["cluster"] == "io-workers"
+
+
+@pytest.mark.django_db
+class TestAsyncTaskClusterParam:
+    """Named cluster= routes like qraft_options['cluster'] and stays out of task_kwargs."""
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_cluster_param_routes(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-cluster-param"
+
+        async_task("test.function", cluster="io-workers")
+
+        assert mock_q2_async.call_args[1]["cluster"] == "io-workers"
+        attempt = QraftTaskAttempt.objects.get()
+        assert attempt.cluster == "io-workers"
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_cluster_param_not_in_task_kwargs(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-cluster-no-kwargs"
+
+        async_task("test.function", cluster="io-workers", payload=1)
+
+        qraft_task = QraftTask.objects.get()
+        assert "cluster" not in qraft_task.task_kwargs
+        assert qraft_task.task_kwargs == {"payload": 1}
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_cluster_param_matches_qraft_options(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-cluster-agree"
+
+        async_task(
+            "test.function",
+            cluster="io-workers",
+            qraft_options={"cluster": "io-workers"},
+        )
+
+        assert mock_q2_async.call_args[1]["cluster"] == "io-workers"
+
+    def test_cluster_param_conflicts_with_qraft_options(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            async_task(
+                "test.function",
+                cluster="io-workers",
+                qraft_options={"cluster": "cpu-workers"},
+            )
 
 
 @pytest.mark.django_db
