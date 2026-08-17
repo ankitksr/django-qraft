@@ -57,7 +57,21 @@ Phase 2 of the Django-Q2 absorption plan
   fan-out enqueues members atomically, closing double-queue windows under duplicate
   hook delivery
 - **Workflow cancel is a guarded update**: cancel only lands from a cancellable state,
-  and a committed completion racing the cancel wins instead of being overwritten
+  and a committed completion racing the cancel wins instead of being overwritten.
+  Cancel now also stops member retries (a failed member of a cancelled workflow
+  schedules no new attempts) and dispatches the workflow's `on_cancelled` hook
+- **Completion routing survives a monitor crash**: resolution commits with a
+  `routed=False` flag; the reaper replays workflow routing and hook dispatch (both
+  idempotent) for attempts whose post-commit dispatch died, instead of wedging the
+  workflow at RUNNING forever
+- **Retention cannot delete revived or live work**: the batched delete re-applies
+  the sweep's filter, so a task a DLQ requeue flipped back to PENDING between
+  select and delete survives; a terminal workflow with still-running members is
+  kept until they settle
+- **Chain `run()`/`resume()`/`approve()` transition and enqueue in one locked
+  transaction**: a crash between them no longer strands the chain RUNNING with
+  nothing queued, and a concurrent second resume or racing cancel fails the
+  transition instead of double-queueing the step
 
 ### Changed
 - **`async_task()` validates harder at enqueue**: callables must be importable (bound
@@ -78,6 +92,9 @@ Phase 2 of the Django-Q2 absorption plan
   rollout
 - Migration `0007_worker_identity`: `QraftTaskAttempt.worker_pid`, `worker_thread`
 - Migration `0008_drop_redundant_db_index`
+- Migration `0009_attempt_routed`: `QraftTaskAttempt.routed`, backfilled True for
+  already-resolved attempts
+- Migration `0010_alter_qrafttaskattempt_cluster`: help-text catch-up, no DB change
 
 ### Demo
 - Demo rebuilt as a self-verifying scenario suite: 32 scenarios in 6 groups
