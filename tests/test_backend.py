@@ -5,7 +5,6 @@ Requires Django 6.0+ (django.tasks). Skipped entirely otherwise so the main
 suite stays green on older Django installs.
 """
 
-import ast
 from datetime import timedelta
 from unittest.mock import Mock, patch
 
@@ -162,7 +161,10 @@ class TestGetResult:
 
 @pytest.mark.django_db
 class TestRunAfter:
-    def test_creates_schedule_and_pending_qraft_task(self, backend):
+    def test_creates_scheduled_attempt_and_pending_qraft_task(self, backend):
+        """A deferred task is a SCHEDULED attempt row, not a Q2 Schedule."""
+        from qraft.models.tasks import AttemptState
+
         run_after = timezone.now() + timedelta(minutes=5)
         task = _make_django_task(run_after=run_after)
 
@@ -173,23 +175,15 @@ class TestRunAfter:
         assert qraft_task.func == "tests.test_backend.sample_task_func"
         assert qraft_task.task_args == [1, 2]
         assert qraft_task.task_kwargs == {"x": "y"}
-        assert qraft_task.attempts.count() == 0
         assert result.id == str(qraft_task.id)
 
-        schedule = Schedule.objects.get()
-        # The schedule fires the unwrapping runner, not the dotted path:
-        # the @task decorator makes the module attribute a non-callable
-        # Task wrapper.
-        assert schedule.func == "qraft.backend.run_task"
-        schedule_args = ast.literal_eval(schedule.args)
-        assert schedule_args[0] == "tests.test_backend.sample_task_func"
-        assert schedule.schedule_type == Schedule.ONCE
-        assert schedule.next_run == run_after
-        assert schedule.hook == "qraft.hooks.qraft_hook_handler"
+        attempt = qraft_task.attempts.get()
+        assert attempt.attempt_number == 1
+        assert attempt.state == AttemptState.SCHEDULED
+        assert attempt.not_before == run_after
+        assert attempt.q2_task_id is None
 
-        schedule_kwargs = ast.literal_eval(schedule.kwargs)
-        marker = schedule_kwargs["q_options"]["task_name"]
-        assert marker == f"qraft:{qraft_task.id}:1"
+        assert not Schedule.objects.exists()
 
     def test_get_result_is_ready_before_the_schedule_fires(self, backend):
         run_after = timezone.now() + timedelta(minutes=5)
