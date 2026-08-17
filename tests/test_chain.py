@@ -314,3 +314,55 @@ class TestChainIntegration:
         mock_q2_async.assert_called_once()
         call_kwargs = mock_q2_async.call_args[1]
         assert call_kwargs["cluster"] == "io-workers"
+
+
+class TestResumeConcurrency:
+    """resume() transitions and enqueues under one lock."""
+
+    def test_stale_second_resume_is_rejected(self, db, simple_chain):
+        """Regression: two handles resuming the same failed chain must not
+        double-queue the step; the second fails the locked transition."""
+        from qraft.models import InvalidStatusTransition
+
+        simple_chain.run()
+        simple_chain._model.status = WorkflowStatus.FAILED
+        simple_chain._model.current_step_index = 1
+        simple_chain._model.save()
+        step = simple_chain._model.steps.get(step_index=1)
+        old_task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task", status=TaskStatus.EXHAUSTED
+        )
+        step.qraft_task = old_task
+        step.save()
+
+        stale = QraftChain(chain_id=simple_chain.id)  # still sees FAILED
+        simple_chain.resume()
+        step.refresh_from_db()
+        first_resume_task = step.qraft_task
+
+        with pytest.raises(InvalidStatusTransition):
+            stale.resume()
+
+        # The winning resume's task is untouched; nothing was double-queued
+        step.refresh_from_db()
+        assert step.qraft_task == first_resume_task
+
+    def test_resume_into_cancelled_chain_is_rejected(self, db, simple_chain):
+        """A cancel landing between resume()'s status check and its locked
+        transition must win; no step may be enqueued into a cancelled chain."""
+        from qraft.models import InvalidStatusTransition
+
+        simple_chain.run()
+        simple_chain._model.status = WorkflowStatus.FAILED
+        simple_chain._model.save()
+
+        stale = QraftChain(chain_id=simple_chain.id)  # sees FAILED
+        QraftChainModel.objects.filter(id=simple_chain.id).update(
+            status=WorkflowStatus.CANCELLED
+        )
+
+        with pytest.raises(InvalidStatusTransition):
+            stale.resume()
+
+        simple_chain._model.refresh_from_db()
+        assert simple_chain._model.status == WorkflowStatus.CANCELLED

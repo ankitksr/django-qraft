@@ -133,6 +133,10 @@ class QraftChain(BaseWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError(f"Chain already run (status: {self._model.status})")
 
+        # The status transition and the enqueue commit together, mirroring
+        # ChainDispatcher._handle_step_success: a crash between them would
+        # otherwise strand the chain RUNNING with no queued task and no
+        # recovery actor.
         with transaction.atomic():
             for idx, step_data in enumerate(self._steps):
                 QraftChainStep.objects.create(
@@ -148,6 +152,8 @@ class QraftChain(BaseWorkflow):
             if first_step.requires_approval:
                 self._model.transition_to(WorkflowStatus.WAITING_APPROVAL)
                 self._model.save(update_fields=["status", "date_updated"])
+            else:
+                _queue_chain_step(self._model, first_step)
 
         if first_step.requires_approval:
             _logger.info(
@@ -155,8 +161,6 @@ class QraftChain(BaseWorkflow):
                 self._model.id,
             )
             return self._model.id
-
-        _queue_chain_step(self._model, first_step)
 
         _logger.info(
             "Started QraftChain %s with %d steps",
@@ -178,18 +182,23 @@ class QraftChain(BaseWorkflow):
         if self._model.status != WorkflowStatus.FAILED:
             raise ValueError("Can only resume failed chains")
 
-        current_step = self._model.steps.get(step_index=self._model.current_step_index)
-
+        # Lock, transition, and enqueue in one transaction (mirrors
+        # _handle_step_success): a second concurrent resume, or a cancel
+        # landing in between, fails the locked transition instead of
+        # double-queueing the step or enqueueing into a cancelled chain.
         with transaction.atomic():
-            self._model.transition_to(WorkflowStatus.RUNNING)
-            self._model.save(update_fields=["status", "date_updated"])
+            chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
+            chain.transition_to(WorkflowStatus.RUNNING)
+            chain.save(update_fields=["status", "date_updated"])
 
+            current_step = chain.steps.get(step_index=chain.current_step_index)
             if current_step.qraft_task:
                 current_step.qraft_task = None
                 current_step.save(update_fields=["qraft_task"])
 
-        _queue_chain_step(self._model, current_step)
+            _queue_chain_step(chain, current_step)
 
+        self._model = chain
         _logger.info(
             "Resumed QraftChain %s from step %d",
             self._model.id,
@@ -209,9 +218,11 @@ class QraftChain(BaseWorkflow):
             chain.transition_to(WorkflowStatus.RUNNING)
             chain.save(update_fields=["status", "date_updated"])
             step = chain.steps.get(step_index=chain.current_step_index)
+            # Enqueue under the same lock: a cancel landing after the commit
+            # must find either a parked chain or a queued step, never the gap.
+            _queue_chain_step(chain, step)
 
         self._model = chain
-        _queue_chain_step(chain, step)
 
         _logger.info(
             "QraftChain %s approved, queued step %d", chain.id, step.step_index
