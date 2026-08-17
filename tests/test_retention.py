@@ -1,6 +1,7 @@
 """Tests for qraft.retention (bounded pruning of settled rows)."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
@@ -264,3 +265,67 @@ class TestPolicyLogging:
 
         assert "older than 30.0 day(s)" in caplog.text
         assert "save_limit" not in caplog.text
+
+
+class TestRevivedRows:
+    """The delete re-applies the sweep's filter, not just the selected pks."""
+
+    def test_delete_refilters_rows_revived_after_select(self):
+        """Regression: a DLQ requeue flipping a task back to PENDING between
+        the sweep's select and its delete must not have the row (and its
+        fresh retry attempt) cascaded away."""
+        from django.db.models import QuerySet
+
+        task = _task()
+        original_delete = QuerySet.delete
+
+        def revive_then_delete(qs):
+            QraftTask.objects.filter(pk=task.pk).update(status=TaskStatus.PENDING)
+            return original_delete(qs)
+
+        with patch.object(QuerySet, "delete", revive_then_delete):
+            deleted = sweep_retention(retention_days=30)
+
+        assert deleted == {}
+        assert QraftTask.objects.filter(pk=task.pk).exists()
+
+
+class TestLiveMemberWorkflows:
+    """A terminal workflow waits for its live members before pruning."""
+
+    def test_terminal_workflow_with_live_members_is_kept(self):
+        iter_model = QraftIterModel.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            total_count=2,
+            status=WorkflowStatus.CANCELLED,
+        )
+        _age(iter_model, 90)
+        live = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.RUNNING,
+            qraft_iter=iter_model,
+        )
+
+        assert sweep_retention(retention_days=30) == {}
+        assert QraftIterModel.objects.filter(pk=iter_model.pk).exists()
+        assert QraftTask.objects.filter(pk=live.pk).exists()
+
+    def test_workflow_prunes_once_members_settle(self):
+        iter_model = QraftIterModel.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            total_count=1,
+            status=WorkflowStatus.CANCELLED,
+        )
+        member = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.FAILED,
+            qraft_iter=iter_model,
+        )
+        _age(member, 90)
+        _age(iter_model, 90)
+
+        deleted = sweep_retention(retention_days=30)
+
+        assert deleted.get("QraftIterModel") == 1
+        # Member cascades with its workflow
+        assert not QraftTask.objects.filter(pk=member.pk).exists()

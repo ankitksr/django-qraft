@@ -60,6 +60,11 @@ def _delete_in_batches(queryset, batch_size: int) -> int:
 
     The slice is re-evaluated each round rather than materialised up front,
     so memory stays flat regardless of how far behind the sweep has fallen.
+
+    The delete re-applies the queryset's own filter, not just `pk__in`: a row
+    can be revived between the select and the delete (a DLQ requeue flips a
+    terminal task back to PENDING and gives it a SCHEDULED attempt), and a
+    bare pk delete would cascade that live work away.
     """
     model = queryset.model
     deleted = 0
@@ -67,10 +72,11 @@ def _delete_in_batches(queryset, batch_size: int) -> int:
         ids = list(queryset.values_list("pk", flat=True)[:batch_size])
         if not ids:
             break
-        count, _details = model.objects.filter(pk__in=ids).delete()
-        if not count:
+        _count, details = queryset.filter(pk__in=ids).delete()
+        batch_deleted = details.get(model._meta.label, 0)
+        if not batch_deleted:
             break
-        deleted += len(ids)
+        deleted += batch_deleted
     else:
         logger.warning(
             "Retention sweep hit the %d-batch ceiling for %s; more rows remain",
@@ -183,15 +189,24 @@ def sweep_retention(
     cutoff = max(cutoffs)
     deleted: dict[str, int] = {}
 
-    for model in (QraftChainModel, QraftIterModel, QraftBatchModel):
+    # A terminal workflow can still have live members: cancel does not revoke
+    # a running task, and FAILED can land while stragglers run. Deleting the
+    # workflow would cascade those away mid-flight, so it waits for them.
+    live_member = (TaskStatus.PENDING, TaskStatus.RUNNING)
+    workflow_querysets = (
+        QraftChainModel.objects.exclude(steps__qraft_task__status__in=live_member),
+        QraftIterModel.objects.exclude(tasks__status__in=live_member),
+        QraftBatchModel.objects.exclude(tasks__status__in=live_member),
+    )
+    for queryset in workflow_querysets:
         count = _delete_in_batches(
-            model.objects.filter(
+            queryset.filter(
                 status__in=TERMINAL_WORKFLOW_STATUSES, date_updated__lt=cutoff
             ),
             batch_size,
         )
         if count:
-            deleted[model.__name__] = count
+            deleted[queryset.model.__name__] = count
 
     tasks = QraftTask.objects.filter(
         status__in=TERMINAL_TASK_STATUSES, date_updated__lt=cutoff
