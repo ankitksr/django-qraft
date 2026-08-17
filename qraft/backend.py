@@ -303,8 +303,11 @@ class QraftTaskBackend(BaseTaskBackend):
             id=str(qraft_task.id),
             status=_RESULT_STATUS[qraft_task.status],
             enqueued_at=qraft_task.date_created,
-            started_at=first_attempt.date_created if first_attempt else None,
-            last_attempted_at=latest_attempt.date_created if latest_attempt else None,
+            # date_started (stamped by the lease at pre_execute), not
+            # date_created: a SCHEDULED attempt's row exists long before any
+            # worker touches it, and must not read as "started".
+            started_at=first_attempt.date_started if first_attempt else None,
+            last_attempted_at=latest_attempt.date_started if latest_attempt else None,
             finished_at=latest_attempt.date_completed if latest_attempt else None,
             args=qraft_task.task_args,
             kwargs=qraft_task.task_kwargs,
