@@ -12,6 +12,7 @@ from qraft.models import (  # noqa: E402
     QraftIterModel,
     QraftTask,
     TaskStatus,
+    WorkflowHookDispatch,
     WorkflowStatus,
 )
 
@@ -377,3 +378,26 @@ class TestCancelGuardedUpdate:
         assert iter_task.cancel() is True
         iter_task._model.refresh_from_db()
         assert iter_task._model.status == WorkflowStatus.CANCELLED
+
+
+class TestCancelHook:
+    """cancel() dispatches on_cancelled, not just reject()."""
+
+    def test_cancel_dispatches_on_cancelled_hook(self, db):
+        it = QraftIter(
+            func="demo.showcase.tasks.noop_task",
+            on_cancelled="showcase.tasks.on_cancelled",
+        )
+        it.append(1)
+
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-iter-cancel-hook"
+            assert it.cancel() is True
+
+        mock_async.assert_called_once()
+        assert mock_async.call_args[0][0] == "showcase.tasks.on_cancelled"
+        assert WorkflowHookDispatch.objects.filter(
+            workflow_type="iter",
+            workflow_id=it.id,
+            hook_type="cancelled",
+        ).exists()

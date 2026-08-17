@@ -117,8 +117,9 @@ class TestQraftHookHandler:
         )
         mock_q2_task_success.id = "q2-diet-1"
 
-        # 6 = resolve + savepoint/release pair + locked select + 2 updates
-        with django_assert_max_num_queries(6):
+        # 7 = resolve + savepoint/release pair + locked select + 2 updates
+        # + the post-dispatch routed flip
+        with django_assert_max_num_queries(7):
             qraft_hook_handler(mock_q2_task_success)
 
         task.refresh_from_db()
@@ -200,7 +201,7 @@ class TestHookDispatcher:
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
 
         with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(mock_q2_task_success)
+            dispatcher.dispatch(success=True)
 
             mock_call.assert_called_once_with(
                 hook_path="test.hooks.on_success",
@@ -220,7 +221,7 @@ class TestHookDispatcher:
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
 
         with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(mock_q2_task_failure)
+            dispatcher.dispatch(success=False)
 
             mock_call.assert_called_once_with(
                 hook_path="test.hooks.on_failure",
@@ -244,7 +245,7 @@ class TestHookDispatcher:
 
         with patch.object(dispatcher, "_call_hook") as mock_call:
             # dispatch() now assumes retry logic was handled by caller
-            dispatcher.dispatch(mock_q2_task_failure)
+            dispatcher.dispatch(success=False)
 
             # Failure hook SHOULD be called (dispatch no longer handles retry)
             mock_call.assert_called_once_with(
@@ -265,7 +266,7 @@ class TestHookDispatcher:
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
 
         with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(mock_q2_task_success)
+            dispatcher.dispatch(success=True)
 
             # No hooks should be called
             mock_call.assert_not_called()
@@ -515,3 +516,70 @@ class TestHookRouting:
         # Nothing retries a hook, so an unacknowledged failure would be
         # redelivered by the broker forever.
         assert self._dispatch(qraft_task, qraft_task_attempt)["ack_failure"] is True
+
+
+class TestCancelledWorkflowRetrySuppression:
+    """A failed member of a cancelled workflow must not schedule new retries."""
+
+    def test_failed_member_of_cancelled_workflow_is_not_retried(
+        self, db, mock_q2_task_failure
+    ):
+        from qraft.models import QraftIterModel, WorkflowStatus
+
+        iter_model = QraftIterModel.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            total_count=2,
+            status=WorkflowStatus.CANCELLED,
+        )
+        task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.RUNNING,
+            qraft_iter=iter_model,
+            retry_policy={
+                "max_attempts": 3,
+                "base_delay": 10.0,
+                "backoff_strategy": "exponential",
+                "jitter": False,
+            },
+        )
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=1, q2_task_id=mock_q2_task_failure.id
+        )
+
+        qraft_hook_handler(mock_q2_task_failure)
+
+        task.refresh_from_db()
+        assert task.status == TaskStatus.FAILED
+        # No SCHEDULED retry row was created for the cancelled workflow's member
+        assert task.attempts.count() == 1
+        attempt.refresh_from_db()
+        assert attempt.success is False
+        assert attempt.routed is True
+
+
+class TestRoutedFlag:
+    """Resolution commits routed=False; the flag flips after post-commit work."""
+
+    def test_success_path_marks_attempt_routed(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_success
+    ):
+        mock_q2_task_success.id = qraft_task_attempt.q2_task_id
+
+        with patch("qraft.hooks.HookDispatcher"):
+            qraft_hook_handler(mock_q2_task_success)
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.routed is True
+
+    def test_scheduled_retry_marks_attempt_routed_at_commit(
+        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
+    ):
+        """A retry leaves no post-commit work, so routed commits with it."""
+        mock_q2_task_failure.id = qraft_task_attempt.q2_task_id
+
+        qraft_hook_handler(mock_q2_task_failure)
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.routed is True
+        # The retry row itself exists (and is not the replay sweep's business)
+        assert qraft_task.attempts.count() == 2

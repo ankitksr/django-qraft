@@ -8,7 +8,7 @@ from django.utils import timezone
 from django_q.models import Task as Q2Task
 
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
-from qraft.reaper import reap_orphans, reconcile_finished
+from qraft.reaper import reap_orphans, reconcile_finished, replay_unrouted
 
 STALE_AFTER = 60
 
@@ -261,3 +261,66 @@ class TestQueuedTaskIds:
 
         with patch("django_q.brokers.get_broker", return_value=Mock()):
             assert _queued_q2_task_ids() is None
+
+
+class TestReplayUnrouted:
+    """Resolved attempts whose post-commit routing died get it replayed."""
+
+    def _resolved_attempt(self, success=True, age=600, routed=False, **task_extra):
+        task = QraftTask.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            status=TaskStatus.SUCCEEDED if success else TaskStatus.FAILED,
+            **task_extra,
+        )
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id=f"q2-unrouted-{task.id}",
+            success=success,
+            routed=routed,
+            date_completed=timezone.now() - timedelta(seconds=age),
+        )
+        return task, attempt
+
+    def test_replays_hook_dispatch_and_marks_routed(self, db):
+        from qraft.models import HookDispatch
+
+        task, attempt = self._resolved_attempt(success_hook="test.hooks.success")
+
+        with patch("qraft.hooks.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-replayed-hook"
+            assert replay_unrouted() == 1
+
+        attempt.refresh_from_db()
+        assert attempt.routed is True
+        assert HookDispatch.objects.filter(
+            qraft_task=task, hook_type="success"
+        ).exists()
+
+    def test_recent_resolutions_are_left_for_the_live_handler(self, db):
+        self._resolved_attempt(age=0)
+        assert replay_unrouted() == 0
+
+    def test_routed_resolutions_are_skipped(self, db):
+        self._resolved_attempt(routed=True)
+        assert replay_unrouted() == 0
+
+    def test_replays_workflow_routing(self, db):
+        from qraft.models import QraftIterModel, WorkflowStatus
+
+        iter_model = QraftIterModel.objects.create(
+            func="demo.showcase.tasks.noop_task",
+            total_count=1,
+            status=WorkflowStatus.RUNNING,
+        )
+        _task, attempt = self._resolved_attempt(qraft_iter=iter_model)
+
+        with patch("qraft.dispatchers.q2_async_task"):
+            assert replay_unrouted() == 1
+
+        iter_model.refresh_from_db()
+        assert iter_model.completed_count == 1
+        assert iter_model.status == WorkflowStatus.SUCCEEDED
+        attempt.refresh_from_db()
+        assert attempt.routed is True
+        assert attempt.counted is True

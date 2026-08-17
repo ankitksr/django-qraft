@@ -283,6 +283,17 @@ class QraftTaskAttempt(models.Model):
         help_text="Whether this attempt has been counted by a parallel dispatcher",
     )
 
+    # Resolution commits before workflow routing and hook dispatch run; this
+    # flag is what lets the reaper find a resolution whose post-commit work
+    # died (monitor crash) and replay it, instead of leaving the workflow
+    # wedged. True also for resolutions with no post-commit work (a scheduled
+    # retry).
+    routed = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Whether post-resolution routing and hook dispatch completed",
+    )
+
     usage = models.JSONField(
         null=True,
         blank=True,

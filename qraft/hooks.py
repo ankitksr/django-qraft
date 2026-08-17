@@ -224,6 +224,38 @@ def _resolve_attempt(q2_task):
     return attempt
 
 
+def _owning_workflow_cancelled(qraft_task) -> bool:
+    """
+    Fresh read of the owning workflow's status, True when it is CANCELLED.
+
+    Cancel stops future orchestration, and a retry is future orchestration: a
+    cancelled workflow must not keep generating new executions through a
+    member's whole backoff series. The status is re-read here rather than
+    trusted from the instance, since a cancel can commit at any point after
+    the member was resolved from the queue.
+    """
+    from .models import QraftChainStep, WorkflowStatus
+
+    try:
+        step = qraft_task.chain_step
+    except QraftChainStep.DoesNotExist:
+        step = None
+
+    workflow = (
+        step.chain
+        if step is not None
+        else qraft_task.qraft_iter or qraft_task.qraft_batch
+    )
+    if workflow is None:
+        return False
+    status = (
+        workflow.__class__.objects.filter(pk=workflow.pk)
+        .values_list("status", flat=True)
+        .first()
+    )
+    return status == WorkflowStatus.CANCELLED
+
+
 def qraft_hook_handler(q2_task):
     """
     Global hook handler that dispatches Qraft hooks based on task outcome.
@@ -285,9 +317,20 @@ def qraft_hook_handler(q2_task):
         # the failed completion: a crash leaves either both or neither, never
         # a task durably FAILED with its retry lost.
         if not q2_task.success:
-            retry_scheduled = handle_task_retry(
-                qraft_task, attempt, result_text=q2_task.result
-            )
+            if _owning_workflow_cancelled(attempt.qraft_task):
+                _logger.info(
+                    "QraftTask %s belongs to a cancelled workflow; not retrying",
+                    qraft_task.id,
+                )
+            else:
+                retry_scheduled = handle_task_retry(
+                    qraft_task, attempt, result_text=q2_task.result
+                )
+
+        # A scheduled retry leaves no post-commit work, so the resolution is
+        # fully routed the moment it commits.
+        if retry_scheduled:
+            QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
     # A scheduled retry means the task is not terminal yet
     if retry_scheduled:
@@ -297,7 +340,11 @@ def qraft_hook_handler(q2_task):
     # Routed with the pre-lock instance: its select_related already answered
     # the membership question, and membership is immutable after creation.
     if not route_workflow_completion(attempt.qraft_task, attempt):
-        HookDispatcher(qraft_task, attempt).dispatch(q2_task)
+        HookDispatcher(qraft_task, attempt).dispatch(q2_task.success)
+    # Routing and hook dispatch are idempotent (counted flag, step-index CAS,
+    # HookDispatch unique rows), so the flag needs setting only after they
+    # finish; a crash above leaves it False for the reaper to replay.
+    QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
 
 class HookDispatcher:
@@ -309,7 +356,7 @@ class HookDispatcher:
         self.qraft_task = qraft_task
         self.attempt = attempt
 
-    def dispatch(self, q2_task):
+    def dispatch(self, success):
         """
         Dispatch appropriate hook based on task outcome.
 
@@ -317,14 +364,16 @@ class HookDispatcher:
         It only dispatches success or failure hooks.
 
         Args:
-            q2_task: Django-Q2 Task model instance
+            success: Whether the task succeeded. A bool rather than the Q2
+                task object, so the reaper can replay dispatch from the
+                attempt row after the Q2 row is gone.
         """
-        if q2_task.success:
-            self.dispatch_success_hook(q2_task)
+        if success:
+            self.dispatch_success_hook()
         else:
-            self.dispatch_failure_hook(q2_task)
+            self.dispatch_failure_hook()
 
-    def dispatch_success_hook(self, q2_task):
+    def dispatch_success_hook(self):
         """Dispatch success hook if configured."""
         if not self.qraft_task.success_hook:
             return
@@ -336,7 +385,7 @@ class HookDispatcher:
             hook_type="success",
         )
 
-    def dispatch_failure_hook(self, q2_task):
+    def dispatch_failure_hook(self):
         """Dispatch failure hook if configured."""
         if not self.qraft_task.failure_hook:
             return

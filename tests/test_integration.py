@@ -97,17 +97,12 @@ class TestEndToEndWorkflows:
         qraft_task.success_hook = "test.hooks.on_success"
         qraft_task.save()
 
-        # Mock Q2 task
-        q2_task = Mock()
-        q2_task.success = True
-        q2_task.id = qraft_task_attempt.q2_task_id
-
         # Mock hook task ID
         mock_q2_async.return_value = "hook-task-789"
 
         # Dispatch hook
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-        dispatcher.dispatch(q2_task)
+        dispatcher.dispatch(success=True)
 
         # Verify hook was queued
         mock_q2_async.assert_called_once()
@@ -187,7 +182,7 @@ class TestEndToEndWorkflows:
 
     @patch("qraft.tasks.q2_async_task")
     def test_full_lifecycle_success(self, mock_q2_async):
-        """Test full lifecycle: create task -> complete successfully -> dispatch hook."""
+        """Full lifecycle: create task -> complete successfully -> dispatch hook."""
         from unittest.mock import Mock
 
         from qraft.hooks import qraft_hook_handler
@@ -195,7 +190,7 @@ class TestEndToEndWorkflows:
         mock_q2_async.return_value = "q2-task-success"
 
         # Step 1: Create task
-        task_id = async_task(
+        async_task(
             "test.function",
             qraft_options={"success_hook": "test.hooks.on_success"},
         )
@@ -240,7 +235,7 @@ class TestEndToEndWorkflows:
         mock_q2_async.return_value = "q2-task-retry"
 
         # Step 1: Create task with retry policy
-        task_id = async_task(
+        async_task(
             "test.function",
             qraft_options={
                 "max_attempts": 2,
@@ -294,7 +289,7 @@ class TestEndToEndWorkflows:
         q2_task_success.result = "success"
         q2_task_success.stopped = None
 
-        with patch("qraft.hooks.HookDispatcher") as mock_dispatcher:
+        with patch("qraft.hooks.HookDispatcher"):
             qraft_hook_handler(q2_task_success)
 
         # Verify final state

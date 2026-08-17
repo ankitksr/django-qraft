@@ -20,7 +20,7 @@ from django.utils import timezone
 from django_q.models import Task as Q2Task
 
 from .conf import get_conf
-from .hooks import qraft_hook_handler
+from .hooks import _owning_workflow_cancelled, qraft_hook_handler
 from .models import QraftTask, QraftTaskAttempt, TaskStatus
 from .retry import handle_task_retry
 
@@ -120,14 +120,11 @@ def reconcile_finished(grace: float | None = None) -> int:
     handler had its chance, so a completion still inside `grace` is left for
     the monitor's own delivery to resolve.
 
-    Two residuals remain:
-    (a) With SAVE_LIMIT > 0 django_q may trim the saved success row before
-        the >= 90s grace elapses on a busy cluster; after that the orphan
-        sweep re-executes a succeeded task.
-    (b) It cannot replay attempts that resolved but crashed before workflow
-        routing / hook dispatch (the post-commit window in hooks.py) -
-        resolution is fenced by the CAS, so those stay "resolved" with no
-        further recovery here.
+    One residual remains: with SAVE_LIMIT > 0 django_q may trim the saved
+    success row before the >= 90s grace elapses on a busy cluster; after that
+    the orphan sweep re-executes a succeeded task. (An attempt that resolved
+    but crashed before workflow routing / hook dispatch is not this sweep's
+    problem - `replay_unrouted()` recovers it through the `routed` flag.)
 
     Args:
         grace: Seconds a saved completion may sit unresolved before it is
@@ -155,6 +152,58 @@ def reconcile_finished(grace: float | None = None) -> int:
             q2_task.id,
         )
         qraft_hook_handler(q2_task)
+        replayed += 1
+    return replayed
+
+
+def replay_unrouted(grace: float | None = None) -> int:
+    """
+    Re-run routing and hook dispatch for resolved attempts that never got it.
+
+    Resolution commits before workflow routing and hook dispatch run
+    (hooks.py); a monitor crash in that window used to wedge the workflow at
+    RUNNING forever, or drop the task's hooks. Such an attempt is resolved
+    with `routed=False`. Once the resolution is older than `grace`, routing
+    and dispatch are replayed - both are idempotent (the parallel `counted`
+    flag, the chain step-index CAS, and the HookDispatch unique rows), so a
+    replay racing the live handler's own slow post-commit work double-does
+    nothing.
+
+    Args:
+        grace: Seconds a resolved attempt may sit unrouted before replay
+            (default: the heartbeat grace).
+
+    Returns:
+        Number of attempts replayed.
+    """
+    from .dispatchers import route_workflow_completion
+    from .hooks import HookDispatcher
+
+    conf = get_conf()
+    grace = grace if grace is not None else _heartbeat_grace(conf.heartbeat_interval)
+    cutoff = timezone.now() - timedelta(seconds=grace)
+
+    unrouted = QraftTaskAttempt.objects.filter(
+        success__isnull=False,
+        routed=False,
+        date_completed__lt=cutoff,
+    ).select_related(
+        "qraft_task",
+        "qraft_task__chain_step",
+        "qraft_task__chain_step__chain",
+    )
+
+    replayed = 0
+    for attempt in unrouted:
+        logger.warning(
+            "Replaying routing/hooks for attempt %d of QraftTask %s; its "
+            "resolution committed but post-commit dispatch never ran",
+            attempt.attempt_number,
+            attempt.qraft_task_id,
+        )
+        if not route_workflow_completion(attempt.qraft_task, attempt):
+            HookDispatcher(attempt.qraft_task, attempt).dispatch(attempt.success)
+        QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
         replayed += 1
     return replayed
 
@@ -192,6 +241,10 @@ def reap_orphans(stale_after: float | None = None) -> int:
     # and only needs replaying. Handled first so this sweep's Q2-row exclusion
     # below never turns "hook handler died after save" into a permanent stall.
     reconcile_finished(grace)
+
+    # Same principle one step later in the pipeline: resolved attempts whose
+    # post-commit routing/hook dispatch died get that work replayed.
+    replay_unrouted(grace)
 
     now = timezone.now()
     heartbeat_cutoff = now - timedelta(seconds=grace)
@@ -272,6 +325,9 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
         attempt.success = False
         attempt.exception_class = "OrphanedTask"
         attempt.date_completed = timezone.now()
+        # routed follows the same protocol as the hook handler: True when a
+        # retry absorbs the failure (no post-commit work), set after routing
+        # otherwise, so replay_unrouted() can recover a crash in between.
         attempt.save(update_fields=["success", "exception_class", "date_completed"])
 
         logger.warning(
@@ -281,7 +337,12 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
             attempt.q2_task_id,
         )
 
-        if not handle_task_retry(qraft_task, attempt):
+        retry_scheduled = not _owning_workflow_cancelled(
+            qraft_task
+        ) and handle_task_retry(qraft_task, attempt)
+        if retry_scheduled:
+            QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
+        else:
             # handle_task_retry only sets EXHAUSTED when a policy exists;
             # with no policy at all it leaves status untouched.
             qraft_task.refresh_from_db(fields=["status"])
@@ -294,5 +355,6 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
         from .dispatchers import route_workflow_completion
 
         route_workflow_completion(*routable)
+        QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
     return True

@@ -86,9 +86,11 @@ class BaseWorkflow:
 
         Sets status to CANCELLED via a conditional UPDATE so a completion
         that already committed to a terminal state cannot be overwritten.
-        This stops future orchestration only - no new steps queued, no hooks
-        fired, no counters updated - but does not revoke member tasks already
-        queued or running; they complete and their outcome is ignored.
+        This stops future orchestration - no new steps queued, no member
+        retries scheduled, no success/failure hooks fired, no counters
+        updated - and dispatches `on_cancelled` (idempotently, shared with
+        reject()). It does not revoke member tasks already queued or running;
+        they complete and their outcome is ignored.
 
         Returns:
             True if the cancel took effect.
@@ -112,6 +114,17 @@ class BaseWorkflow:
                 self._workflow_type.capitalize(),
                 self._model.id,
             )
+            if self._model.on_cancelled:
+                from qraft.dispatchers import _dispatch_workflow_hook
+
+                _dispatch_workflow_hook(
+                    workflow_type=self._workflow_type,
+                    workflow_id=self._model.id,
+                    hook_type="cancelled",
+                    hook_path=self._model.on_cancelled,
+                    hook_args=[],
+                    hook_kwargs={},
+                )
             return True
 
         self._model.refresh_from_db()
