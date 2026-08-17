@@ -126,6 +126,21 @@ Provider throttling (429/503/529) retries with forced exponential backoff and ho
 
 [Learn more →](docs/ai-workloads.md)
 
+### ⏱️ Exact-Delay Scheduling
+Delayed work (retries, requeues, `run_after` tasks) is a Qraft-owned row dispatched at its due time — a 2-second backoff fires in about 2 seconds, not on Django-Q2's 30-second scheduler cycle. Priority and target cluster survive the delay.
+
+[Learn more →](docs/retry.md)
+
+### 📊 Monitoring Dashboard
+A bundled staff-only dashboard: live task and workflow state, approve/reject/cancel/requeue actions, latency percentiles, and JSON endpoints for your own tooling.
+
+```python
+INSTALLED_APPS += ["qraft.dashboard"]
+# urls.py: path("qraft/", include("qraft.dashboard.urls"))
+```
+
+[Learn more →](docs/dashboard.md)
+
 ### 🛟 Crash Recovery
 A reaper resolves attempts whose worker died mid-run instead of leaving tasks stuck in RUNNING. It runs alongside the monitor; the cluster warns at startup if the broker has no delivery receipts.
 
@@ -461,10 +476,9 @@ Django-Qraft maintains full backward compatibility with Django-Q2:
 
 - [x] **v1.1.0**: Workflow primitives (Chain, Iter, Batch)
 - [x] **v1.2.0**: Orphan reaper, rate-limit-aware retries, idempotency keys, usage accounting, approval steps, cross-worker throttling, priority lanes, `django.tasks` backend
-- [ ] `TaskContext`, deferred and coroutine tasks on the `django.tasks` backend
-- [ ] Priority routing for scheduled retries
-- [ ] Enhanced monitoring and metrics
-- [ ] Dead letter queue for failed tasks
+- [x] **v1.2.1**: Execution lease with heartbeat, dead letter queue, `TaskContext` and deferred tasks on the `django.tasks` backend
+- [x] **v1.3.0**: Qraft-owned scheduling (exact delays, priority-preserving retries), monitoring dashboard, retention sweep, cluster routing
+- [ ] Coroutine tasks on the `django.tasks` backend
 - [ ] Nested workflow support
 
 [Future Plans →](docs/future/)

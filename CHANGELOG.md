@@ -7,21 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **`async_task()` validates callables are importable at enqueue**: bound methods and
-  `functools.partial` objects are rejected with `ValueError` instead of enqueueing a
-  path that silently diverges or crashes on retry. Pass a module-level function or its
-  dotted-path string.
-- **Qraft forces `save=True` on every enqueued task** so Django-Q2 always writes a
-  success row for the hook handler. With `SAVE_LIMIT < 0` that also disables django_q's
-  own trimming of successful results — size retention via `retention_days` /
-  `retention_max_tasks` accordingly.
-
 ### Planned
 - Coroutine tasks on the `django.tasks` backend
-- Priority routing for scheduled retries
-- Enhanced monitoring and metrics
 - Nested workflow support
+
+## [1.3.0] - 2026-08-18
+
+Phase 2 of the Django-Q2 absorption plan
+([q2-absorption.md](docs/future/q2-absorption.md)): Qraft owns scheduling.
+
+### Added
+- **Qraft-owned scheduling** (`qraft/scheduler.py`): a delayed attempt is a `SCHEDULED`
+  `QraftTaskAttempt` row — created up front with its final attempt number, target
+  cluster, and `not_before` due time — not a Django-Q2 `Schedule`. A dispatcher loop
+  (daemon thread beside the monitor) claims due rows by compare-and-swap
+  (`SELECT ... FOR UPDATE SKIP LOCKED` where the database offers it) and hands them to
+  the broker, stamping the q2 task id at enqueue. Delay is exact instead of quantized
+  to Django-Q2's 30-second scheduler cycle, and priority lanes survive the delay. All
+  three delay paths use it: retries (`RetryPolicy.schedule_retry()`), DLQ requeues
+  (`dlq.requeue()`), and deferred `django.tasks` (`run_after`). The marker fallback in
+  the hook handler stays for one release as the bridge for pre-1.3 schedules still in
+  flight. New settings `dispatch_interval`, `dispatch_batch`
+- **Bundled monitoring dashboard** (`qraft.dashboard`): staff-only Django app with
+  task and workflow views, approve/reject/cancel/requeue actions, and JSON state and
+  latency-percentile metrics endpoints. Add `qraft.dashboard` to `INSTALLED_APPS` and
+  mount `qraft.dashboard.urls` — see [docs/dashboard.md](docs/dashboard.md)
+- **Retention sweep** (`qraft/retention.py`): bounded, batched pruning of settled
+  `QraftTask`/`QraftTaskAttempt`/`HookDispatch`/workflow rows by age
+  (`retention_days`), count (`retention_max_tasks`), or the stricter of the two. Live
+  rows never go; a workflow is pruned as a unit. An explicit `Q_CLUSTER["save_limit"]`
+  is inherited as the count bound unless overridden
+  (`retention_inherited_from_save_limit`). Settings `retention_interval`,
+  `retention_batch_size`
+- **Worker identity on the attempt row**: the lease stamps worker pid and thread name
+  at `pre_execute`, so a stuck or dead attempt names its worker
+- **`cluster` is a real `async_task()` parameter**: routes the task to a named
+  `ALT_CLUSTERS` pool, replacing the `q_options`-only path. Workflow members validate
+  their cluster at `append()`. Retries and DLQ requeues inherit the owning cluster
+  instead of landing on whichever cluster dispatches them
+
+### Fixed
+- **Hook-handler retry-vs-completion race**: the retry decision commits in the same
+  transaction as the completion, and a result arriving for an attempt already resolved
+  (reaped, superseded) is dropped instead of double-dispatching
+- **Reaper replays saved completions the hook handler missed**: a completion Django-Q2
+  saved but never delivered (monitor died mid-dispatch) is resolved from the saved
+  result instead of being retried as a false orphan
+- **Chain advance queues the next step under the row lock**, and parallel workflow
+  fan-out enqueues members atomically, closing double-queue windows under duplicate
+  hook delivery
+- **Workflow cancel is a guarded update**: cancel only lands from a cancellable state,
+  and a committed completion racing the cancel wins instead of being overwritten
+
+### Changed
+- **`async_task()` validates harder at enqueue**: callables must be importable (bound
+  methods and `functools.partial` rejected), reserved `q_options` keys are rejected,
+  django-q option names hiding in function kwargs are rejected, and `save=True` is
+  forced so the hook handler always sees a result row
+- **Threaded workers enforce per-task deadlines**: a task overrunning its timeout gets
+  a grace period, then the worker process exits forcibly so the sentinel can recycle
+  it — a stuck thread no longer wedges the pool silently
+- **Grey-area semantics pinned**: `max_attempts` counts total executions (documented
+  on the field), priority lanes are strict (no cross-lane stealing), and workflow
+  cancel scope covers members not yet enqueued
+- Dropped the dead scheduler notify seam and the redundant `q2_task_id` index
+
+### Database
+- Migration `0006_scheduler_owned`: `QraftTaskAttempt.state`, `not_before`, `cluster`,
+  `dispatch_func`, `dispatch_args`; nullable with DB-level defaults for a safe live
+  rollout
+- Migration `0007_worker_identity`: `QraftTaskAttempt.worker_pid`, `worker_thread`
+- Migration `0008_drop_redundant_db_index`
+
+### Demo
+- Demo rebuilt as a self-verifying scenario suite: 32 scenarios in 6 groups
+  (`core`, `workflows`, `durability`, `ai`, `django-tasks`, `bench`), each proving its
+  claims through recorded checks. `manage.py demo {all|run|list|serve}`; `serve` boots
+  a scenario-runner dashboard with soak load and per-cluster controls
 
 ## [1.2.1] - 2026-08-05
 
@@ -363,7 +425,8 @@ extra infra, built for AI workloads.
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
-[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/ankitksr/django-qraft/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/ankitksr/django-qraft/compare/v1.1.0...v1.1.1

@@ -1,16 +1,20 @@
 # Django-Q2 absorption plan
 
 Qraft owns task state, retries, hooks, and orchestration. Django-Q2 still owns
-two things: the schedule mechanism and the worker loop. This document describes
-the two phases that remove those dependencies. Phase 1 (the execution lease and
-heartbeat, shipped in 1.2.1) already moved crash detection onto Qraft-owned
-state.
+one thing: the worker loop. This document describes the phases that remove the
+Q2 dependencies. Phase 1 (the execution lease and heartbeat, shipped in 1.2.1)
+moved crash detection onto Qraft-owned state. Phase 2 (owned scheduling,
+shipped in 1.3.0) moved delayed execution onto Qraft-owned rows.
 
 Both external reviews (codex, 2026-08) reached the same conclusion: durability
 that is inferred from another library's persistence is the weakest part of the
 architecture. Each phase below replaces one inference with owned state.
 
-## Phase 2 — own scheduling
+## Phase 2 — own scheduling (shipped in 1.3.0)
+
+Implemented as designed: `qraft/scheduler.py`, migration `0006_scheduler_owned`,
+all three delay paths converted. The marker fallback in the hook handler stays
+for one release as the bridge for pre-1.3 schedules still in flight.
 
 ### The problem
 
@@ -139,8 +143,8 @@ poll load as the latency itself.
 
 ## Sequencing and decision gates
 
-Phase 2 is low risk and self-contained; it can ship in a minor release with
-the marker fallback as the compatibility bridge. Phase 3 is a rewrite of the
+Phase 2 shipped in 1.3.0 with the marker fallback as the compatibility
+bridge. Phase 3 is a rewrite of the
 execution core. Do not start it until: Phase 2 has been stable in a release,
 real users report friction the wrapper cannot fix, and the Django-Q2
 compatibility story (migration path for existing `Q_CLUSTER` users) is

@@ -82,6 +82,12 @@ progress and the retries as they happen.
 
 The page is self-contained: inline CSS and JavaScript, no CDN, no build step.
 
+The library's own monitoring dashboard (`qraft.dashboard`) is mounted at
+`http://127.0.0.1:8000/qraft/` in the same server — the staff-facing view you
+would ship to production, with approve/reject/cancel actions and latency
+percentiles. The showcase page above is the demo's own scenario runner; the
+two are separate apps.
+
 ## Scenarios
 
 **core**

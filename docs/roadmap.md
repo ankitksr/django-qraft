@@ -12,6 +12,18 @@ dual-phase hooks, retry policies, and workflow enrichment (django-q2#202, #203, 
 retries, hooks, chaining, and workers from its first pass. No Django-native library today
 offers Canvas-depth workflows or AI-workload primitives.
 
+## Shipped in 1.3.0
+
+- **Qraft-owned scheduling** (phase 2 of the absorption plan). A delayed attempt is a
+  `SCHEDULED` row dispatched at its exact due time; retries, DLQ requeues, and deferred
+  `django.tasks` all go through it. Priority and target cluster survive the delay.
+- **Bundled monitoring dashboard** (`qraft.dashboard`) — see [dashboard.md](dashboard.md).
+- **Retention sweep** — bounded pruning of settled rows by age and/or count.
+- **Cluster routing** — `cluster` is a real `async_task()` parameter; retries and
+  requeues inherit the owning cluster.
+- **Cancel/completion hardening** — cancel is a guarded update, chain advance and
+  fan-out are atomic, the reaper replays completions the hook handler missed.
+
 ## Shipped in 1.2.0
 
 - **ORM broker as the blessed default.** `QraftCluster` warns at startup when the broker
@@ -35,13 +47,15 @@ offers Canvas-depth workflows or AI-workload primitives.
   ORM queue.
 - **Progress reporting.** `report_progress()` writes to `QraftTask.progress`.
 
-Remaining from the original plan: `TaskContext` injection, deferred (`run_after`) and
-coroutine tasks on the django.tasks backend; priority routing for scheduled retries.
+Remaining from the original plan: coroutine tasks on the django.tasks backend.
+(`TaskContext` and deferred tasks shipped in 1.2.1; priority routing for scheduled
+retries shipped in 1.3.0 with owned scheduling.)
 
 ## Architecture direction
 
 Incremental absorption of Django-Q2, one owned subsystem per phase: execution
-state (shipped, the lease), scheduling (phase 2), the worker loop (phase 3).
+state (shipped in 1.2.1, the lease), scheduling (shipped in 1.3.0, the owned
+scheduler), the worker loop (phase 3 — gated, not started).
 Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
 
 ## Deliberately not planned
