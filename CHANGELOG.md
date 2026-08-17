@@ -72,6 +72,9 @@ Phase 2 of the Django-Q2 absorption plan
   transaction**: a crash between them no longer strands the chain RUNNING with
   nothing queued, and a concurrent second resume or racing cancel fails the
   transition instead of double-queueing the step
+- **`django.tasks` `get_result().started_at` reads the lease's `date_started`**:
+  a SCHEDULED attempt's row exists before any worker touches it, so
+  `date_created` no longer means "started"
 
 ### Changed
 - **`async_task()` validates harder at enqueue**: callables must be importable (bound
