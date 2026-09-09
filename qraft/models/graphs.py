@@ -271,6 +271,20 @@ class QraftGraphNode(models.Model):
         db_default=1,
         help_text="Bumped on resume; the task FK is the generation marker",
     )
+    receipt = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "What the node published, written in the same transaction as the "
+            "application's own writes. Its presence is the proof the effect "
+            "committed; cleared when the node is re-run"
+        ),
+    )
+    receipt_attempt_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="The attempt that published the receipt",
+    )
 
     task = models.ForeignKey(
         "QraftTask",

@@ -404,6 +404,39 @@ def reap_orphans(stale_after: float | None = None) -> int:
     return reaped
 
 
+def _resolve_committed(attempt, qraft_task) -> bool:
+    """
+    Resolve an attempt whose output provably committed as a success.
+
+    Called under the task's row lock from `_reap_one`. The receipt is
+    authoritative: it exists only because the application's writes committed in
+    the same transaction, so the lost Django-Q2 result says nothing about
+    whether the work happened.
+    """
+    from qraft import graphs
+
+    now = timezone.now()
+    attempt.success = True
+    attempt.exception_class = None
+    attempt.date_completed = now
+    attempt.save(update_fields=["success", "exception_class", "date_completed"])
+
+    qraft_task.status = TaskStatus.SUCCEEDED
+    qraft_task.save(update_fields=["status", "date_updated"])
+
+    logger.warning(
+        "Attempt %d of QraftTask %s lost its result but had already published "
+        "at %s; resolving it as succeeded",
+        attempt.attempt_number,
+        qraft_task.id,
+        attempt.output_committed_at.isoformat(),
+    )
+
+    transaction.on_commit(lambda: graphs.handle_node_completion(qraft_task, attempt))
+    QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
+    return True
+
+
 def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
     """
     Reap a single attempt under a row lock, re-checking conditions still hold.
@@ -435,6 +468,13 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
             return False
         if Q2Task.objects.filter(id=attempt.q2_task_id).exists():
             return False
+
+        if attempt.output_committed_at is not None:
+            # The node published inside qraft.graphs.publish(), so its writes
+            # and its receipt committed together. The work is done and only the
+            # result was lost; reaping it as a failure would retry work that is
+            # already durable.
+            return _resolve_committed(attempt, qraft_task)
 
         attempt.success = False
         # Two different failures reach this point and a retry policy should be

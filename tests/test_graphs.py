@@ -655,3 +655,143 @@ class TestResume:
         assert QraftGraphNode.objects.get(
             graph_id=graph_id, key="publish"
         ).status == NodeStatus.SUCCEEDED
+
+
+class TestPublish:
+    """Writes and receipt commit together, or neither does."""
+
+    def _running_node(self):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        graph_id = builder.start()
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="ingest")
+        task = QraftTask.objects.get(pk=node.task_id)
+        attempt = task.attempts.order_by("-attempt_number").first()
+        return graph_id, node, task, attempt
+
+    def test_a_published_node_records_its_receipt_and_commit_stamp(self):
+        graph_id, node, task, attempt = self._running_node()
+
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with graphs.publish() as completion:
+                completion.succeed({"engine_run_id": 7})
+
+        node.refresh_from_db()
+        attempt.refresh_from_db()
+        assert node.receipt == {"engine_run_id": 7}
+        assert node.receipt_attempt_id == attempt.id
+        assert attempt.output_committed_at is not None
+
+    def test_a_body_that_raises_leaves_no_receipt(self):
+        graph_id, node, task, attempt = self._running_node()
+
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with pytest.raises(ValueError):
+                with graphs.publish() as completion:
+                    completion.succeed({"engine_run_id": 7})
+                    raise ValueError("boom")
+
+        node.refresh_from_db()
+        attempt.refresh_from_db()
+        # The receipt rolled back with the application's own writes.
+        assert node.receipt is None
+        assert attempt.output_committed_at is None
+
+    def test_forgetting_to_succeed_is_refused(self):
+        graph_id, node, task, attempt = self._running_node()
+
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with pytest.raises(graphs.GraphError, match="without calling succeed"):
+                with graphs.publish():
+                    pass
+
+        node.refresh_from_db()
+        assert node.receipt is None
+
+    def test_a_second_publication_is_refused(self):
+        graph_id, node, task, attempt = self._running_node()
+
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with graphs.publish() as completion:
+                completion.succeed({"n": 1})
+            with pytest.raises(graphs.GraphError, match="already published"):
+                with graphs.publish() as completion:
+                    completion.succeed({"n": 2})
+
+        node.refresh_from_db()
+        assert node.receipt == {"n": 1}
+
+    def test_a_superseded_attempt_may_not_publish(self):
+        """Fencing: a straggler from before a resume cannot write behind it."""
+        graph_id, node, task, attempt = self._running_node()
+        complete_node(graph_id, "ingest", success=False)
+        graphs.resume(graph_id)
+
+        # `attempt` belongs to the generation the resume replaced.
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with pytest.raises(graphs.GraphError, match="may not publish"):
+                with graphs.publish() as completion:
+                    completion.succeed({"stale": True})
+
+        node.refresh_from_db()
+        assert node.receipt is None
+
+    def test_a_resume_clears_the_receipt_so_the_rerun_can_publish(self):
+        graph_id, node, task, attempt = self._running_node()
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with graphs.publish() as completion:
+                completion.succeed({"engine_run_id": 7})
+        complete_node(graph_id, "ingest")
+
+        graphs.resume(graph_id, ["ingest"])
+
+        node.refresh_from_db()
+        assert node.receipt is None
+        assert node.receipt_attempt_id is None
+
+    def test_outside_a_graph_node_it_is_a_plain_transaction(self, db):
+        # The same engine function is callable from a bifrost task.
+        with graphs.publish() as completion:
+            completion.succeed({"ignored": True})
+        assert completion.node is None
+
+
+class TestCommittedOutputSurvivesALostResult:
+    def test_the_reaper_resolves_a_published_attempt_as_succeeded(
+        self, django_capture_on_commit_callbacks
+    ):
+        from qraft.reaper import reap_orphans
+
+        builder = build_graph()
+        add_node(builder, "ingest")
+        graph_id = builder.start()
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="ingest")
+        task = QraftTask.objects.get(pk=node.task_id)
+        task.status = TaskStatus.RUNNING
+        task.save(update_fields=["status"])
+        attempt = task.attempts.order_by("-attempt_number").first()
+
+        with patch("qraft.context.current_attempt", return_value=attempt):
+            with graphs.publish() as completion:
+                completion.succeed({"engine_run_id": 7})
+
+        # The worker published, then died before the monitor saw anything: the
+        # attempt is out with a broker, unresolved, with a dead lease.
+        QraftTaskAttempt.objects.filter(pk=attempt.pk).update(
+            state=AttemptState.QUEUED,
+            q2_task_id="q2-published",
+            heartbeat_at=timezone.now() - timezone.timedelta(hours=1),
+        )
+
+        with django_capture_on_commit_callbacks(execute=True):
+            assert reap_orphans(stale_after=60) == 1
+
+        attempt.refresh_from_db()
+        assert attempt.success is True
+        assert attempt.exception_class is None
+        assert QraftTask.objects.get(pk=task.pk).status == TaskStatus.SUCCEEDED
+        # And the graph advanced on the strength of the receipt.
+        assert (
+            QraftGraphNode.objects.get(pk=node.pk).status == NodeStatus.SUCCEEDED
+        )
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.SUCCEEDED

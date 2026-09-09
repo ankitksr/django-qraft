@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Completion receipts for graph nodes.** `qraft.graphs.publish()` is a transaction in
+  which the application's writes and the node's receipt commit together, so a crash
+  between the two is impossible and a resume's kept set is a fact rather than a guess. The
+  block locks the node and refuses an attempt it is no longer bound to, so a straggler from
+  before a resume cannot publish behind it, and a node publishes at most once per
+  generation. The reaper resolves an unresolved attempt carrying a commit stamp as
+  succeeded rather than reaping it, because the receipt outranks a lost Django-Q2 result.
+  New `QraftGraphNode.receipt`, `QraftGraphNode.receipt_attempt_id` and
+  `QraftTaskAttempt.output_committed_at`; migration `0017`
 - **Selective resume for graphs.** `graphs.resume(graph_id, nodes=None)` re-runs a set of
   nodes and everything downstream that ever ran, keeping every other node's result, and
   `graphs.preview_resume()` answers what it would do without writing. Rerun nodes advance

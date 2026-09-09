@@ -268,6 +268,53 @@ again instead of deduping against the settlement being resumed from.
 A wrong plan is not resumable. The plan is frozen at `start()`; the answer is a new graph
 with `previous_graph` set.
 
+### Publishing a node's output
+
+Django-Q2 records a task's outcome after the worker returns, so a crash in between leaves
+work committed and the attempt looking failed. A retry then redoes work that was already
+durable, and a resume's "kept" set becomes a guess rather than a fact.
+
+`graphs.publish()` closes that window for writes that go through the task's connection:
+
+```python
+def rules_node(event_log_id, category):
+    result = evaluate_pass(event_log_id, category)      # slow, no transaction held
+
+    with graphs.publish() as completion:                # short transaction
+        engine_run = write_results(result)
+        completion.succeed({"engine_run_id": engine_run.pk})
+```
+
+Inside the block the application's writes and the node's receipt commit together, so the
+receipt exists if and only if the effect does. A body that raises rolls back both. A body
+that never calls `succeed()` is refused, because a publication nobody declared is a bug
+rather than a silent no-op.
+
+Two requirements come with it. Every completion-critical write must use that transaction
+and that connection — pointing two database aliases at the same server is not enough — and
+nothing completion-critical may happen after `succeed()`. Computation belongs outside the
+block; wrapping a minutes-long provider call in a transaction is the mistake this shape
+exists to avoid.
+
+Outside a graph node the block is an ordinary transaction that records nothing, so the
+same function is callable from a plain task.
+
+**Publication authority.** The block locks the node row and refuses an attempt the node is
+no longer bound to. A straggler from before a resume therefore fails at the boundary
+rather than writing behind the resume's back, and a node can publish only once per
+generation. Several attempts may physically execute during a partition or a false orphan
+diagnosis; at most one can publish. Writes made outside the block are not fenced.
+
+**What recovery does with it.** When the reaper finds an unresolved attempt with a dead
+lease and a commit stamp, it resolves the attempt as *succeeded* and advances the graph,
+because the receipt is authoritative and the lost Django-Q2 result says nothing about
+whether the work happened. Without a stamp the same attempt is reaped as `ResultLost` or
+`OrphanedTask` and the retry policy decides.
+
+For a provider call no transaction can help: the call may be billed a moment before the
+worker dies. Declare such a node `idempotent`, key the application's own deduplication on
+the identity `current_node()` supplies, and do not expect exactly-once.
+
 ### Edge rules
 
 Each is enforced where the mistake is cheap. All raise `graphs.GraphError`.

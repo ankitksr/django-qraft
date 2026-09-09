@@ -430,6 +430,15 @@ class QraftTaskAttempt(models.Model):
             "NULL means the work ran and its result never reached the monitor"
         ),
     )
+    output_committed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When this attempt published a graph node's output through "
+            "qraft.graphs.publish(). Set with success still NULL means the "
+            "work committed and only its result was lost"
+        ),
+    )
     date_completed = models.DateTimeField(
         null=True,
         blank=True,

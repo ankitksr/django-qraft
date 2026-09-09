@@ -19,7 +19,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from qraft import metrics, signals
-from qraft.models import QraftTask, TaskStatus
+from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.graphs import (
     SETTLED_NODE_STATUSES,
     GraphStatus,
@@ -410,6 +410,97 @@ def _explicit_settlement(graph_id, status: str) -> bool:
     return True
 
 
+class Completion:
+    """Handed to the body of `publish()`; carries what the node produced."""
+
+    def __init__(self, node, attempt):
+        self.node = node
+        self.attempt = attempt
+        self._payload = None
+        self._succeeded = False
+
+    def succeed(self, payload: dict | None = None) -> None:
+        """Declare the node's output published. Call once, last."""
+        if self._succeeded:
+            raise GraphError("succeed() was already called for this publication")
+        self._succeeded = True
+        self._payload = payload or {}
+
+    @property
+    def recorded(self) -> bool:
+        return self._succeeded
+
+
+@contextmanager
+def publish():
+    """
+    The publication boundary for a node whose writes must not outlive their record.
+
+    Django-Q2 records a task's outcome after the worker returns, so a crash in
+    between leaves work committed and the attempt looking failed. A retry then
+    redoes work that was already durable. Inside this block the application's
+    writes and the node's receipt commit together, so the receipt exists if and
+    only if the effect does.
+
+        with graphs.publish() as completion:
+            engine_run = write_results(...)
+            completion.succeed({"engine_run_id": engine_run.pk})
+
+    Every completion-critical write must go through this transaction and this
+    connection, and nothing completion-critical may happen after `succeed()`.
+    Work outside the block is not covered.
+
+    Outside a graph node the block is an ordinary transaction and records
+    nothing, so the same function is callable from a plain task.
+    """
+    from qraft.context import current_attempt
+
+    attempt = current_attempt()
+    node = None
+    if attempt is not None:
+        node = getattr(attempt.qraft_task, "graph_node", None)
+
+    if node is None:
+        with transaction.atomic():
+            yield Completion(None, attempt)
+        return
+
+    with transaction.atomic():
+        locked = (
+            QraftGraphNode.objects.select_for_update()
+            .select_related("graph")
+            .get(pk=node.pk)
+        )
+        # Publication authority: only the generation the node currently points
+        # at may publish, and only once. A superseded attempt that is still
+        # running fails here rather than writing behind a resume's back.
+        if locked.task_id != attempt.qraft_task_id:
+            raise GraphError(
+                f"node {locked.key!r} of graph {locked.graph_id} is bound to task "
+                f"{locked.task_id}, not {attempt.qraft_task_id}; this attempt may "
+                "not publish"
+            )
+        if locked.receipt is not None:
+            raise GraphError(
+                f"node {locked.key!r} of graph {locked.graph_id} has already "
+                "published a receipt"
+            )
+
+        completion = Completion(locked, attempt)
+        yield completion
+
+        if not completion.recorded:
+            raise GraphError(
+                f"node {locked.key!r} left its publication without calling succeed()"
+            )
+
+        now = timezone.now()
+        QraftGraphNode.objects.filter(pk=locked.pk, receipt__isnull=True).update(
+            receipt=completion._payload, receipt_attempt_id=attempt.id
+        )
+        QraftTaskAttempt.objects.filter(pk=attempt.id).update(output_committed_at=now)
+
+
 def preview_resume(graph_id, nodes: list[str] | None = None) -> dict:
     """What `resume()` would re-run and what it would keep, without writing."""
     graph = get(graph_id)
@@ -458,6 +549,8 @@ def resume(graph_id, nodes: list[str] | None = None) -> int:
             settled_at=None,
             dispatched_at=None,
             skip_reason=None,
+            receipt=None,
+            receipt_attempt_id=None,
             generation=F("generation") + 1,
         )
         QraftGraph.objects.filter(pk=graph.pk).update(
