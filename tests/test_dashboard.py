@@ -528,6 +528,52 @@ class TestGraphsPanel:
         assert client.post(f"/qraft/graphs/nope/{graph_id}/").status_code == 404
 
 
+    def test_resume_action_carries_a_preview_and_reruns(self, db, client):
+        from qraft import graphs
+        from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+        from qraft.models.graphs import (
+            GraphStatus,
+            NodeStatus,
+            QraftGraph,
+            QraftGraphNode,
+        )
+
+        builder = graphs.Graph(subject=("worksheet", "9"))
+        builder.node("ingest", "app.tasks.ingest", recovery="transactional")
+        builder.node(
+            "rules", "app.tasks.ingest", after=("ingest",), recovery="transactional"
+        )
+        graph_id = builder.start()
+
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="ingest")
+        task = QraftTask.objects.get(pk=node.task_id)
+        task.status = TaskStatus.EXHAUSTED
+        task.save(update_fields=["status"])
+        attempt = task.attempts.order_by("-attempt_number").first()
+        QraftTaskAttempt.objects.filter(pk=attempt.pk).update(
+            success=False, date_completed=timezone.now()
+        )
+        attempt.refresh_from_db()
+        graphs.handle_node_completion(task, attempt)
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.FAILED
+
+        state = client.get("/qraft/api/state/").json()
+        row = next(r for r in state["graphs"] if r["id"] == str(graph_id))
+        assert row["can_resume"] is True
+        assert row["resume_preview"]["rerun"] == ["ingest"]
+
+        assert client.post(f"/qraft/graphs/{graph_id}/resume/").status_code == 200
+        graph = QraftGraph.objects.get(id=graph_id)
+        assert graph.status == GraphStatus.RUNNING
+        assert graph.generation == 2
+        assert (
+            QraftGraphNode.objects.get(graph_id=graph_id, key="ingest").status
+            == NodeStatus.RUNNING
+        )
+        # A running graph has nothing to resume.
+        assert client.post(f"/qraft/graphs/{graph_id}/resume/").status_code == 409
+
+
 @pytest.mark.usefixtures("public")
 class TestStallBadge:
     def test_a_flagged_attempt_shows_stalled_then_recovered(self, db, client):

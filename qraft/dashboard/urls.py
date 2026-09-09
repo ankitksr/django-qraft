@@ -12,6 +12,7 @@ urlpatterns = [
     path("chains/<uuid:chain_id>/approve/", views.approve_chain, name="approve"),
     path("chains/<uuid:chain_id>/reject/", views.reject_chain, name="reject"),
     path("graphs/<uuid:graph_id>/cancel/", views.cancel_graph, name="cancel_graph"),
+    path("graphs/<uuid:graph_id>/resume/", views.resume_graph, name="resume_graph"),
     path(
         "graphs/<uuid:graph_id>/nodes/<str:node_key>/skip/",
         views.skip_graph_node,

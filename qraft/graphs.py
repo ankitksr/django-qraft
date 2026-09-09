@@ -15,6 +15,7 @@ from datetime import timedelta
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 from qraft import metrics, signals
@@ -407,6 +408,113 @@ def _explicit_settlement(graph_id, status: str) -> bool:
         raise GraphError(f"graph {graph_id} is already {graph.status}")
     _dispatch_settled_hook(settled)
     return True
+
+
+def preview_resume(graph_id, nodes: list[str] | None = None) -> dict:
+    """What `resume()` would re-run and what it would keep, without writing."""
+    graph = get(graph_id)
+    rerun = _rerun_closure(graph, nodes)
+    kept = [
+        node.key
+        for node in graph.nodes.all().order_by("depth", "position")
+        if node.key not in rerun
+    ]
+    return {"rerun": sorted(rerun), "kept": kept}
+
+
+def resume(graph_id, nodes: list[str] | None = None) -> int:
+    """
+    Re-run a set of nodes and everything downstream, keeping the rest.
+
+    Allowed on a failed graph, and on a succeeded one when `nodes` names the
+    starting set explicitly -- that second form is how a finished graph is
+    partially re-run against the same plan. A cancelled graph is a decision,
+    not a fault, and is refused; so is a graph with work still in flight,
+    which is what settling on quiescence buys.
+
+    Returns the number of nodes moved back to pending.
+    """
+    now = timezone.now()
+    with transaction.atomic():
+        graph = _locked(graph_id)
+        if graph.status == GraphStatus.RUNNING:
+            raise GraphError(
+                f"graph {graph_id} is still running; resume is for a settled graph"
+            )
+        if graph.status == GraphStatus.CANCELLED:
+            raise GraphError(f"graph {graph_id} was cancelled and is not resumable")
+        if graph.status == GraphStatus.SUCCEEDED and not nodes:
+            raise GraphError(
+                f"graph {graph_id} succeeded; name the nodes to re-run explicitly"
+            )
+
+        rerun = _rerun_closure(graph, nodes)
+        if not rerun:
+            raise GraphError(f"graph {graph_id} has nothing to re-run")
+
+        QraftGraphNode.objects.filter(graph=graph, key__in=rerun).update(
+            status=NodeStatus.PENDING,
+            task=None,
+            settled_at=None,
+            dispatched_at=None,
+            skip_reason=None,
+            generation=F("generation") + 1,
+        )
+        QraftGraph.objects.filter(pk=graph.pk).update(
+            status=GraphStatus.RUNNING,
+            settled_at=None,
+            summary=None,
+            overdue_flagged_at=None,
+            resumed_at=now,
+            generation=F("generation") + 1,
+            date_updated=now,
+        )
+        # The next settlement is a genuinely new one, so its durable hook must
+        # dispatch again rather than dedupe against the settlement being
+        # resumed from.
+        from qraft.models import WorkflowHookDispatch
+
+        WorkflowHookDispatch.objects.filter(
+            workflow_type="graph", workflow_id=graph.id
+        ).delete()
+
+    _dispatch_frontier(graph_id)
+    return len(rerun)
+
+
+def _rerun_closure(graph: QraftGraph, nodes: list[str] | None) -> set[str]:
+    """
+    The named nodes plus every node reachable from them that ever ran.
+
+    A pending node is left out: it has no result to invalidate and the
+    frontier dispatches it when its dependencies are met.
+    """
+    all_nodes = {node.key: node for node in graph.nodes.all()}
+    if nodes is None:
+        named = {
+            key for key, node in all_nodes.items() if node.status == NodeStatus.FAILED
+        }
+    else:
+        unknown = sorted(set(nodes) - set(all_nodes))
+        if unknown:
+            raise GraphError(f"graph {graph.id} has no node(s) {', '.join(unknown)}")
+        named = set(nodes)
+
+    dependents: dict[str, list[str]] = {key: [] for key in all_nodes}
+    for key, node in all_nodes.items():
+        for dep in node.after:
+            dependents.setdefault(dep, []).append(key)
+
+    closure: set[str] = set()
+    stack = list(named)
+    while stack:
+        key = stack.pop()
+        if key in closure:
+            continue
+        closure.add(key)
+        stack.extend(dependents.get(key, ()))
+
+    return {key for key in closure if all_nodes[key].status != NodeStatus.PENDING}
 
 
 def _dispatch_frontier(graph_id) -> None:

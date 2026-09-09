@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Selective resume for graphs.** `graphs.resume(graph_id, nodes=None)` re-runs a set of
+  nodes and everything downstream that ever ran, keeping every other node's result, and
+  `graphs.preview_resume()` answers what it would do without writing. Rerun nodes advance
+  a generation and drop their task link, so a completion from before the resume settles
+  nothing; the graph's durable-hook dispatch rows are cleared so the next settlement fires
+  `on_settled` again. Refused while the graph is running -- the reason settlement waits for
+  quiescence -- and on a cancelled graph. A succeeded graph must name its nodes explicitly.
+  The dashboard carries the preview on the resume button
 - **Execution graphs (phase 1).** `QraftRun` / `QraftRunStage` evolve into `QraftGraph` /
   `QraftGraphNode` with explicit `after` edges, scheduler-owned dispatch,
   quiescent settlement, per-node hooks, `qraft.context.current_node()`,

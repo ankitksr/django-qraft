@@ -536,3 +536,122 @@ class TestSummary:
         assert by_key["rules"]["skip_reason"] == "no ACTIVE ruleset versions"
         # A skipped node never ran, so it has no task and no duration.
         assert by_key["rules"]["task_id"] is None
+
+
+class TestResume:
+    """Re-run a node and its dependents; keep everything else."""
+
+    def _failed_graph(self):
+        """ingest -> (rules.a, rules.b); rules.a fails, rules.b succeeds."""
+        builder = build_graph()
+        add_node(builder, "ingest")
+        add_node(builder, "rules.a", after=("ingest",))
+        add_node(builder, "rules.b", after=("ingest",))
+        add_node(builder, "publish", after=("rules.a",))
+        graph_id = builder.start()
+        complete_node(graph_id, "ingest")
+        complete_node(graph_id, "rules.a", success=False)
+        complete_node(graph_id, "rules.b")
+        return graph_id
+
+    def test_the_preview_names_the_rerun_and_kept_sets_without_writing(self):
+        graph_id = self._failed_graph()
+        before = QraftGraph.objects.get(id=graph_id).generation
+
+        preview = graphs.preview_resume(graph_id)
+
+        # publish never ran, so it is not re-run -- the frontier picks it up
+        # once rules.a succeeds.
+        assert preview["rerun"] == ["rules.a"]
+        assert preview["kept"] == ["ingest", "rules.b", "publish"]
+        assert QraftGraph.objects.get(id=graph_id).generation == before
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.FAILED
+
+    def test_resume_reruns_the_failed_node_and_keeps_its_siblings(self):
+        graph_id = self._failed_graph()
+
+        assert graphs.resume(graph_id) == 1
+
+        graph = QraftGraph.objects.get(id=graph_id)
+        assert graph.status == GraphStatus.RUNNING
+        assert graph.generation == 2
+        assert graph.settled_at is None
+        assert graph.resumed_at is not None
+
+        nodes = {n.key: n for n in QraftGraphNode.objects.filter(graph_id=graph_id)}
+        assert nodes["rules.a"].status == NodeStatus.RUNNING
+        assert nodes["rules.a"].generation == 2
+        # Kept nodes are untouched, generation included.
+        assert nodes["ingest"].status == NodeStatus.SUCCEEDED
+        assert nodes["ingest"].generation == 1
+        assert nodes["rules.b"].status == NodeStatus.SUCCEEDED
+        assert nodes["rules.b"].generation == 1
+
+    def test_a_rerun_node_carries_its_dependents_with_it(self):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        add_node(builder, "rules", after=("ingest",))
+        add_node(builder, "ai.category", after=("rules",))
+        add_node(builder, "ai.lender", after=("ingest",))
+        graph_id = builder.start()
+        complete_node(graph_id, "ingest")
+        complete_node(graph_id, "rules")
+        complete_node(graph_id, "ai.lender")
+        complete_node(graph_id, "ai.category")
+
+        # Re-running rules invalidates what read it, and nothing else.
+        assert graphs.preview_resume(graph_id, ["rules"]) == {
+            "rerun": ["ai.category", "rules"],
+            "kept": ["ingest", "ai.lender"],
+        }
+
+    def test_a_running_graph_and_a_cancelled_one_are_both_refused(self):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        graph_id = builder.start()
+        with pytest.raises(graphs.GraphError, match="still running"):
+            graphs.resume(graph_id)
+
+        graphs.cancel(graph_id)
+        with pytest.raises(graphs.GraphError, match="cancelled"):
+            graphs.resume(graph_id)
+
+    def test_a_succeeded_graph_needs_the_nodes_named(
+        self, django_capture_on_commit_callbacks
+    ):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        graph_id = builder.start()
+        with django_capture_on_commit_callbacks(execute=True):
+            complete_node(graph_id, "ingest")
+
+        with pytest.raises(graphs.GraphError, match="name the nodes"):
+            graphs.resume(graph_id)
+
+        assert graphs.resume(graph_id, ["ingest"]) == 1
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.RUNNING
+
+    def test_an_unknown_node_key_is_refused(self):
+        graph_id = self._failed_graph()
+        with pytest.raises(graphs.GraphError, match="no node"):
+            graphs.resume(graph_id, ["rules.typo"])
+
+    def test_the_resumed_graph_settles_again_and_fires_its_hook_again(
+        self, signal_log, django_capture_on_commit_callbacks
+    ):
+        # rules.a fails, so publish never runs and the graph settles failed.
+        graph_id = self._failed_graph()
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.FAILED
+
+        graphs.resume(graph_id, ["rules.a"])
+        complete_node(graph_id, "rules.a")
+        with django_capture_on_commit_callbacks(execute=True):
+            complete_node(graph_id, "publish")
+
+        graph = QraftGraph.objects.get(id=graph_id)
+        assert graph.status == GraphStatus.SUCCEEDED
+        # A resume starts a new settlement, so the hook is not deduped away.
+        assert len(signal_log["graph_settled"]) == 1
+        assert QraftGraphNode.objects.get(
+            graph_id=graph_id, key="publish"
+        ).status == NodeStatus.SUCCEEDED

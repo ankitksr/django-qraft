@@ -262,6 +262,8 @@ def _task_rows(now, filters: dict | None = None) -> list[dict]:
 
 
 def _graph_rows(now, filters: dict | None = None) -> list[dict]:
+    from qraft import graphs as graphs_module
+
     recent = _apply_filters(QraftGraph.objects.all(), filters or {}, graph_field="id")
     graphs = list(
         recent.order_by("-date_created").prefetch_related("nodes")[:GRAPH_LIMIT]
@@ -305,6 +307,14 @@ def _graph_rows(now, filters: dict | None = None) -> list[dict]:
                     )
                 ],
                 "can_cancel": graph.status == GraphStatus.RUNNING,
+                "can_resume": graph.status == GraphStatus.FAILED,
+                # The preview is what makes resume a decision rather than a
+                # guess, so it travels with the button.
+                "resume_preview": (
+                    graphs_module.preview_resume(graph.id)
+                    if graph.status == GraphStatus.FAILED
+                    else None
+                ),
             }
         )
     return rows
@@ -541,6 +551,22 @@ def cancel_graph(request, graph_id):
         return JsonResponse({"error": str(error)}, status=status)
     logger.info("Dashboard cancelled graph %s", graph_id)
     return JsonResponse({"cancelled": str(graph_id)})
+
+
+@require_POST
+@staff_required(json=True)
+@csrf_protect
+def resume_graph(request, graph_id):
+    """Re-run a failed graph's failed nodes and everything downstream."""
+    from qraft import graphs
+
+    try:
+        rerun = graphs.resume(graph_id)
+    except graphs.GraphError as error:
+        status = 404 if "unknown graph" in str(error) else 409
+        return JsonResponse({"error": str(error)}, status=status)
+    logger.info("Dashboard resumed graph %s (%d nodes)", graph_id, rerun)
+    return JsonResponse({"resumed": str(graph_id), "rerun": rerun})
 
 
 @require_POST

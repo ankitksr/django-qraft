@@ -233,6 +233,41 @@ already in flight finish. The graph outcome is `FAILED` if any node failed, `CAN
 any was cancelled, otherwise `SUCCEEDED` when every node is `SUCCEEDED` or `SKIPPED`.
 Settlement is one compare-and-swap on `settled_at`, so it fires exactly once.
 
+### Selective resume
+
+A settled graph can be re-run in part. `resume(graph_id, nodes=None)` moves a set of
+nodes back to pending at the next generation and dispatches the frontier again; every
+other node keeps its result.
+
+```python
+graphs.preview_resume(graph_id)
+# {"rerun": ["rules.entity"], "kept": ["ingest", "rules.revenue", "rules.nsf"]}
+
+graphs.resume(graph_id)          # every failed node
+graphs.resume(graph_id, ["rules.lender"])   # an explicit set
+```
+
+The rerun set is the named nodes plus **every node reachable from them along edges that
+ever ran**. Re-running `rules.lender` therefore re-runs an `ai.lender` node that read it
+and leaves `ai.category` alone. A node still pending is left out: it has no result to
+invalidate, and the frontier dispatches it when its dependencies are met.
+
+With `nodes=None` the named set is every failed node. Naming nodes explicitly is also how
+a *succeeded* graph is partially re-run, against the same plan and revision; a graph that
+succeeded refuses a resume that names nothing, so a re-run is always deliberate.
+
+Resume is refused while the graph is running, which is what settling on quiescence buys:
+there is no race between a resume and a straggler. It is also refused on a cancelled
+graph, because a cancel is a decision rather than a fault.
+
+Each rerun node's task link is cleared, so a completion from the generation before the
+resume is dropped rather than settling the node. The graph's own `WorkflowHookDispatch`
+rows are deleted in the same transaction, so the next settlement dispatches `on_settled`
+again instead of deduping against the settlement being resumed from.
+
+A wrong plan is not resumable. The plan is frozen at `start()`; the answer is a new graph
+with `previous_graph` set.
+
 ### Edge rules
 
 Each is enforced where the mistake is cheap. All raise `graphs.GraphError`.
