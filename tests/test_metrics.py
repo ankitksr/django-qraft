@@ -36,7 +36,8 @@ class TestFailureIsolation:
             "failures": 3,
             "last_error": "RuntimeError: exporter down",
         }
-        assert caplog.text.count("Metrics sink failed") == 1
+        assert len(caplog.records) == 1
+        assert caplog.records[0].args[0] == 1  # only the first failure is logged
         # Still called every time: a transient failure never disables the sink.
         assert broken.counter.call_count == 3
 
@@ -88,7 +89,10 @@ class TestEmissionPoints:
         # is memoised, so the start is announced and counted exactly once. A
         # true redelivery is covered in test_lease.TestRedeliveryGuard.
         lease.stamp_start("q2-m1")
-        assert recording_sink.names() == ["qraft.attempt.started", "qraft.attempt.pickup"]
+        assert recording_sink.names() == [
+            "qraft.attempt.started",
+            "qraft.attempt.pickup",
+        ]
         assert recording_sink.labels("qraft.attempt.started") == [
             {"func": "app.tasks.crunch", "cluster": "test"}
         ]
@@ -144,8 +148,12 @@ class TestEmissionPoints:
         )
         with django_capture_on_commit_callbacks(execute=True):
             assert reap_orphans() == 1
-        assert recording_sink.labels("qraft.attempt.finished")[0]["outcome"] == "orphaned"
-        assert recording_sink.labels("qraft.attempt.duration")[0]["outcome"] == "orphaned"
+        assert (
+            recording_sink.labels("qraft.attempt.finished")[0]["outcome"] == "orphaned"
+        )
+        assert (
+            recording_sink.labels("qraft.attempt.duration")[0]["outcome"] == "orphaned"
+        )
         assert recording_sink.labels("qraft.reaper.action") == [{"action": "orphaned"}]
 
         chain = QraftChainModel.objects.create(status=WorkflowStatus.RUNNING)
@@ -154,7 +162,9 @@ class TestEmissionPoints:
                 QraftChainModel, chain.id, WorkflowStatus.SUCCEEDED, "chain"
             )
             assert (
-                settle_workflow(QraftChainModel, chain.id, WorkflowStatus.FAILED, "chain")
+                settle_workflow(
+                    QraftChainModel, chain.id, WorkflowStatus.FAILED, "chain"
+                )
                 is None
             )
         assert recording_sink.labels("qraft.workflow.settled") == [
@@ -185,7 +195,9 @@ class TestEmissionPoints:
         assert chain.settled_at is None
         assert recording_sink.names() == []
 
-    def test_gauges_come_from_the_flagged_cluster_only(self, recording_sink, monkeypatch):
+    def test_gauges_come_from_the_flagged_cluster_only(
+        self, recording_sink, monkeypatch
+    ):
         import threading
 
         from qraft.conf import get_conf
@@ -231,14 +243,24 @@ class TestOpenTelemetrySink:
 
         meter.create_counter.assert_called_once_with("qraft.attempt.started")
         assert meter.create_counter.return_value.add.call_count == 2
-        meter.create_histogram.assert_called_once_with("qraft.attempt.duration", unit="s")
+        meter.create_histogram.assert_called_once_with(
+            "qraft.attempt.duration", unit="s"
+        )
         meter.create_observable_gauge.assert_called_once()
         callback = meter.create_observable_gauge.call_args.kwargs["callbacks"][0]
         observations = callback(None)
-        assert [(o.value, o.attributes) for o in observations] == [(3, {"cluster": "a"})]
+        assert [(o.value, o.attributes) for o in observations] == [
+            (3, {"cluster": "a"})
+        ]
 
     def test_no_sdk_is_a_silent_no_op(self):
+        """Without an SDK, the API hands back a no-op meter: instruments are
+        still created and every record is accepted rather than raising."""
         sink = OpenTelemetrySink()
         sink.counter("qraft.attempt.started", func="f")
         sink.histogram("qraft.attempt.duration", 1.0, func="f")
         sink.gauge("qraft.queue.depth", 1, cluster="a")
+
+        assert sink._counters["qraft.attempt.started"] is not None
+        assert sink._histograms["qraft.attempt.duration"] is not None
+        assert sink._gauges["qraft.queue.depth"] is not None
