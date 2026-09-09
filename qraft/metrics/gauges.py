@@ -50,18 +50,18 @@ def _queue_gauges(cluster: str, now) -> None:
     )
 
 
-def _run_gauges(now) -> None:
-    """Oldest open run per subject type; unbounded run ids never become labels."""
-    from qraft.models.runs import QraftRun, RunStatus
+def _graph_gauges(now) -> None:
+    """Oldest running graph per subject type; graph ids never become labels."""
+    from qraft.models.graphs import GraphStatus, QraftGraph
 
     oldest = (
-        QraftRun.objects.filter(status=RunStatus.OPEN)
+        QraftGraph.objects.filter(status=GraphStatus.RUNNING)
         .values("subject_type")
         .annotate(oldest=Min("date_started"))
     )
     for row in oldest:
         gauge(
-            "qraft.run.open_age_max",
+            "qraft.graph.open_age_max",
             seconds_between(row["oldest"], now) or 0.0,
             subject_type=row["subject_type"],
         )
@@ -98,4 +98,4 @@ def emit_gauges() -> None:
     gauge(
         "qraft.attempt.unrouted_age_max", seconds_between(oldest_unrouted, now) or 0.0
     )
-    _run_gauges(now)
+    _graph_gauges(now)

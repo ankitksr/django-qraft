@@ -29,7 +29,16 @@ _logger = logging.getLogger("qraft.metrics")
 
 # Label names that would carry per-entity cardinality into the metrics system.
 FORBIDDEN_LABELS = frozenset(
-    {"subject_id", "run_id", "run", "task_id", "attempt_id", "revision", "metadata"}
+    {
+        "subject_id",
+        "graph_id",
+        "graph",
+        "task_id",
+        "attempt_id",
+        "revision",
+        "metadata",
+        "generation",
+    }
 )
 
 LOG_INTERVAL = 60.0

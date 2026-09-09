@@ -190,8 +190,8 @@ a.chip:hover { text-decoration: underline; }
     </section>
 
     <section>
-      <h2>Runs <span class="count" id="run-count"></span></h2>
-      <div class="scroll" id="runs"><div class="empty">none</div></div>
+      <h2>Graphs <span class="count" id="graph-count"></span></h2>
+      <div class="scroll" id="graphs"><div class="empty">none</div></div>
     </section>
 
     <section>
@@ -278,33 +278,37 @@ function renderState(state) {
     <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
   </tr>`).join("") || `<tr><td colspan="10" class="empty">no tasks yet</td></tr>`;
 
-  const runs = state.runs || [];
-  $("run-count").textContent = runs.length;
-  $("runs").innerHTML = runs.map((run) => {
-    const actions = run.can_settle
-      ? `<button data-run-cancel="${esc(run.id)}">cancel</button>
-         <button data-run-abandon="${esc(run.id)}">abandon</button>` : "";
+  const graphs = state.graphs || [];
+  $("graph-count").textContent = graphs.length;
+  $("graphs").innerHTML = graphs.map((graph) => {
+    const actions = graph.can_cancel
+      ? `<button data-graph-cancel="${esc(graph.id)}">cancel</button>` : "";
     return `<div class="wf">
-      <div class="wf-head"><span class="kind">${esc(run.kind || "run")}</span>
-        <span class="faint">${esc(run.short)}</span>${chip(run.status)}
-        ${run.subject_type ? `<span class="faint" title="subject">${esc(run.subject_type)}:${esc(run.subject_id)}</span>` : ""}
-        ${run.overdue ? `<span class="overdue" title="open past QRAFT_RUN_OVERDUE_AFTER">⚠ overdue</span>` : ""}
-        ${run.previous_run ? `<span class="faint" title="reruns ${esc(run.previous_run_id)}">↩ ${esc(run.previous_run)}</span>` : ""}
+      <div class="wf-head"><span class="kind">${esc(graph.kind || "graph")}</span>
+        <span class="faint">${esc(graph.short)}</span>${chip(graph.status)}
+        <span class="faint">g${esc(graph.generation)}</span>
+        ${graph.subject_type ? `<span class="faint" title="subject">${esc(graph.subject_type)}:${esc(graph.subject_id)}</span>` : ""}
+        ${graph.overdue ? `<span class="overdue" title="running past QRAFT_GRAPH_OVERDUE_AFTER">⚠ overdue</span>` : ""}
+        ${graph.previous_graph ? `<span class="faint" title="reruns ${esc(graph.previous_graph_id)}">↩ ${esc(graph.previous_graph)}</span>` : ""}
         <span class="spacer"></span>${actions}
-        <span class="muted">${run.elapsed}s</span></div>
-      <div class="members">${run.stages.map((s) => {
-        const title = [s.unit_type || "no unit", s.unit_id, s.error].filter(Boolean).join(" · ");
-        const label = `${esc(s.name)}${s.error ? ` ${esc(s.error)}` : ""}`;
-        // The stage chip is the one click to the failure: a stage that failed
-        // before its subject existed shows up nowhere else.
-        return s.unit_url
-          ? `<a class="chip ${esc(s.status)}" href="${esc(s.unit_url)}" title="${esc(title)}">${label}</a>`
-          : `<span class="chip ${esc(s.status)}" title="${esc(title)}">${label}</span>`;
+        <span class="muted">${graph.elapsed}s</span></div>
+      <div class="members">${graph.nodes.map((n) => {
+        const title = [n.task_id, n.error].filter(Boolean).join(" · ");
+        const label = `${esc(n.key)}${n.error ? ` ${esc(n.error)}` : ""}`;
+        const skip = n.can_skip
+          ? `<button data-graph-skip="${esc(graph.id)}:${esc(n.key)}">skip</button>` : "";
+        const chipHtml = n.task_url
+          ? `<a class="chip ${esc(n.status)}" href="${esc(n.task_url)}" title="${esc(title)}">${label}</a>`
+          : `<span class="chip ${esc(n.status)}" title="${esc(title)}">${label}</span>`;
+        return `${chipHtml}${skip}`;
       }).join("")}</div>
     </div>`;
   }).join("") || `<div class="empty">none</div>`;
-  wire("[data-run-cancel]", (id) => post(`runs/cancel/${id}/`));
-  wire("[data-run-abandon]", (id) => post(`runs/abandon/${id}/`));
+  wire("[data-graph-cancel]", (id) => post(`graphs/${id}/cancel/`));
+  wire("[data-graph-skip]", (pair) => {
+    const [id, key] = pair.split(":");
+    return post(`graphs/${id}/nodes/${encodeURIComponent(key)}/skip/`);
+  });
 
   $("wf-count").textContent = state.workflows.length;
   $("workflows").innerHTML = state.workflows.map((wf) => {

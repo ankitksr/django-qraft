@@ -13,9 +13,9 @@ from .models import (
     QraftBatchModel,
     QraftChainModel,
     QraftChainStep,
+    QraftGraph,
+    QraftGraphNode,
     QraftIterModel,
-    QraftRun,
-    QraftRunStage,
     QraftTask,
     QraftTaskAttempt,
     WorkflowHookDispatch,
@@ -36,12 +36,11 @@ _TASK_STATUS_COLORS = {
     "exhausted": "#6f42c1",
 }
 
-_RUN_STATUS_COLORS = {
-    "open": "#007bff",
+_GRAPH_STATUS_COLORS = {
+    "running": "#007bff",
     "succeeded": "#28a745",
     "failed": "#dc3545",
     "cancelled": "#fd7e14",
-    "abandoned": _DEFAULT_STATUS_COLOR,
 }
 
 
@@ -193,13 +192,13 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
         "func",
         "subject_type",
         "subject_id",
-        "stage",
+        "node",
         "attempt_count",
         "date_created",
         "date_updated",
     ]
-    list_filter = ["status", "subject_type", "stage", "date_created"]
-    search_fields = ["id", "func", "subject_type", "subject_id", "run__id"]
+    list_filter = ["status", "subject_type", "node", "date_created"]
+    search_fields = ["id", "func", "subject_type", "subject_id", "graph__id"]
     readonly_fields = [
         "id",
         "date_created",
@@ -208,8 +207,9 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
         "func",
         "subject_type",
         "subject_id",
-        "run",
-        "stage",
+        "graph",
+        "node",
+        "graph_node",
         "task_args",
         "task_kwargs",
         "success_hook",
@@ -228,7 +228,7 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
     fieldsets = [
         (None, {"fields": ["id", "status", "func", "date_created", "date_updated"]}),
         ("Subject", {"fields": ["subject_type", "subject_id"]}),
-        ("Run", {"fields": ["run", "stage"]}),
+        ("Graph", {"fields": ["graph", "node", "graph_node"]}),
         ("Task Arguments", {"fields": ["task_args", "task_kwargs"]}),
         (
             "Success Hook",
@@ -539,42 +539,43 @@ class WorkflowHookDispatchAdmin(_ShortIdAdmin, admin.ModelAdmin):
     workflow_id_short.short_description = "Workflow ID"
 
 
-# ── Runs ─────────────────────────────────────────────────────
+# ── Graphs ───────────────────────────────────────────────────
 
 
-class QraftRunStageInline(_ReadOnly, admin.TabularInline):
-    """Inline display of a run's declared stages and their bound units."""
+class QraftGraphNodeInline(_ReadOnly, admin.TabularInline):
+    """Inline display of a graph's nodes."""
 
-    model = QraftRunStage
+    model = QraftGraphNode
     extra = 0
     readonly_fields = [
         "position",
-        "name",
+        "depth",
+        "key",
         "status",
-        "unit_type",
-        "unit_id",
+        "recovery",
+        "task",
         "skip_reason",
-        "bound_at",
+        "dispatched_at",
         "settled_at",
     ]
-    ordering = ["position"]
+    ordering = ["depth", "position"]
 
 
-class QraftRunMemberInline(_ReadOnly, admin.TabularInline):
-    """Tasks correlated with this run, whether or not they own a stage."""
+class QraftGraphMemberInline(_ReadOnly, admin.TabularInline):
+    """Tasks correlated with this graph."""
 
     model = QraftTask
-    fk_name = "run"
+    fk_name = "graph"
     extra = 0
-    fields = ["id", "stage", "func", "status", "date_created"]
+    fields = ["id", "node", "func", "status", "date_created"]
     readonly_fields = fields
     ordering = ["date_created"]
     verbose_name_plural = "Member tasks"
 
 
-@admin.register(QraftRun)
-class QraftRunAdmin(_ShortIdAdmin, admin.ModelAdmin):
-    """Read-only admin for QraftRun, with cancel and abandon as actions."""
+@admin.register(QraftGraph)
+class QraftGraphAdmin(_ShortIdAdmin, admin.ModelAdmin):
+    """Read-only admin for QraftGraph, with cancel as an action."""
 
     list_display = [
         "short_id",
@@ -583,6 +584,7 @@ class QraftRunAdmin(_ShortIdAdmin, admin.ModelAdmin):
         "subject_id",
         "kind",
         "revision",
+        "generation",
         "overdue_display",
         "date_started",
         "settled_at",
@@ -592,27 +594,34 @@ class QraftRunAdmin(_ShortIdAdmin, admin.ModelAdmin):
     readonly_fields = [
         "id",
         "status",
+        "generation",
+        "cluster",
         "subject_type",
         "subject_id",
         "kind",
         "revision",
         "metadata",
-        "previous_run",
+        "previous_graph",
         "date_started",
         "settled_at",
+        "resumed_at",
         "overdue_flagged_at",
         "on_settled",
         "on_settled_kwargs",
         "summary",
+        "request_key",
+        "plan_hash",
         "date_created",
         "date_updated",
     ]
-    inlines = [QraftRunStageInline, QraftRunMemberInline]
+    inlines = [QraftGraphNodeInline, QraftGraphMemberInline]
     ordering = ["-date_created"]
-    actions = ["cancel_runs", "abandon_runs"]
+    actions = ["cancel_graphs"]
 
     def status_display(self, obj):
-        return _colored_status(obj.status, obj.get_status_display(), _RUN_STATUS_COLORS)
+        return _colored_status(
+            obj.status, obj.get_status_display(), _GRAPH_STATUS_COLORS
+        )
 
     status_display.short_description = "Status"
 
@@ -621,29 +630,20 @@ class QraftRunAdmin(_ShortIdAdmin, admin.ModelAdmin):
 
     overdue_display.short_description = "Overdue"
 
-    def _settle_selected(self, request, queryset, action):
-        from qraft import runs
+    @admin.action(description="Cancel selected graphs")
+    def cancel_graphs(self, request, queryset):
+        from qraft import graphs
 
         settled = skipped = 0
-        for run in queryset:
+        for graph in queryset:
             try:
-                action(runs, run.id)
-            except runs.RunError:
+                graphs.cancel(graph.id)
+            except graphs.GraphError:
                 skipped += 1
             else:
                 settled += 1
         self.message_user(
             request,
-            f"Settled {settled} run(s); skipped {skipped} already terminal.",
+            f"Cancelled {settled} graph(s); skipped {skipped} already terminal.",
             level=messages.WARNING if skipped else messages.INFO,
-        )
-
-    @admin.action(description="Cancel selected runs")
-    def cancel_runs(self, request, queryset):
-        self._settle_selected(request, queryset, lambda runs, id: runs.cancel(id))
-
-    @admin.action(description="Abandon selected runs")
-    def abandon_runs(self, request, queryset):
-        self._settle_selected(
-            request, queryset, lambda runs, id: runs.abandon(id, reason="admin")
         )

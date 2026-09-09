@@ -35,15 +35,15 @@ from qraft.models import (
     InvalidStatusTransition,
     QraftBatchModel,
     QraftChainModel,
+    QraftGraph,
     QraftIterModel,
-    QraftRun,
     QraftTask,
     QraftTaskAttempt,
     RateBucket,
     TaskStatus,
     WorkflowStatus,
 )
-from qraft.models.runs import RunStatus, UnitType
+from qraft.models.graphs import GraphStatus, NodeStatus
 from qraft.models.tasks import AttemptState
 
 from . import metrics
@@ -52,7 +52,7 @@ logger = logging.getLogger("qraft.dashboard")
 
 TASK_LIMIT = 60
 WORKFLOW_LIMIT = 12
-RUN_LIMIT = 12
+GRAPH_LIMIT = 12
 MEMBER_LIMIT = 12
 DLQ_LIMIT = 20
 USAGE_ATTEMPT_CAP = 500
@@ -111,41 +111,14 @@ def _admin_url(task_id) -> str | None:
         return None
 
 
-# UnitType -> the admin change view for the row a stage is bound to. The task
-# page carries the attempt inline, which is where a stage failure's exception
-# and traceback actually are.
-_UNIT_ADMIN_VIEWS = {
-    UnitType.TASK: "admin:qraft_qrafttask_change",
-    UnitType.CHAIN: "admin:qraft_qraftchainmodel_change",
-    UnitType.ITER: "admin:qraft_qraftitermodel_change",
-    UnitType.BATCH: "admin:qraft_qraftbatchmodel_change",
-}
+def _task_url(task_id) -> str | None:
+    return _admin_url(task_id)
 
 
-def _unit_url(unit_type, unit_id) -> str | None:
-    """Admin link to the row a stage is bound to, or None when unreachable."""
-    view = _UNIT_ADMIN_VIEWS.get(unit_type)
-    if not view or not unit_id:
-        return None
-    try:
-        return reverse(view, args=[unit_id])
-    except NoReverseMatch:
-        return None
-
-
-def _stage_errors(runs) -> dict:
-    """
-    `(task id) -> latest attempt's exception class`, for the task-bound stages
-    of the runs being rendered.
-
-    A stage that failed before its subject existed is visible only on the run,
-    so the run row is where the exception has to surface.
-    """
+def _node_errors(graphs) -> dict:
+    """`(task id) -> latest attempt's exception class` for graph node tasks."""
     task_ids = [
-        stage.unit_id
-        for run in runs
-        for stage in run.stages.all()
-        if stage.unit_type == UnitType.TASK and stage.unit_id
+        node.task_id for graph in graphs for node in graph.nodes.all() if node.task_id
     ]
     if not task_ids:
         return {}
@@ -165,9 +138,9 @@ def dashboard(request):
 
 
 def _filters(request) -> dict:
-    """Subject/run filters from the query string; empty values are ignored."""
+    """Subject/graph filters from the query string; empty values are ignored."""
     filters = {}
-    for name in ("subject_type", "subject_id", "run"):
+    for name in ("subject_type", "subject_id", "graph"):
         value = request.GET.get(name)
         if value:
             filters[name] = value
@@ -177,7 +150,7 @@ def _filters(request) -> dict:
 def _apply_filters(
     queryset,
     filters: dict,
-    run_field: str = "run_id",
+    graph_field: str = "graph_id",
     subject_prefix: str = "",
 ):
     if "subject_type" in filters:
@@ -188,8 +161,8 @@ def _apply_filters(
         queryset = queryset.filter(
             **{f"{subject_prefix}subject_id": filters["subject_id"]}
         )
-    if "run" in filters:
-        queryset = queryset.filter(**{run_field: filters["run"]})
+    if "graph" in filters:
+        queryset = queryset.filter(**{graph_field: filters["graph"]})
     return queryset
 
 
@@ -288,42 +261,50 @@ def _task_rows(now, filters: dict | None = None) -> list[dict]:
     return rows
 
 
-def _run_rows(now, filters: dict | None = None) -> list[dict]:
-    recent = _apply_filters(QraftRun.objects.all(), filters or {}, run_field="id")
-    runs = list(recent.order_by("-date_created").prefetch_related("stages")[:RUN_LIMIT])
-    errors = _stage_errors(runs)
+def _graph_rows(now, filters: dict | None = None) -> list[dict]:
+    recent = _apply_filters(QraftGraph.objects.all(), filters or {}, graph_field="id")
+    graphs = list(
+        recent.order_by("-date_created").prefetch_related("nodes")[:GRAPH_LIMIT]
+    )
+    errors = _node_errors(graphs)
     rows = []
-    for run in runs:
-        end = run.settled_at or now
+    for graph in graphs:
+        end = graph.settled_at or now
         rows.append(
             {
-                "id": str(run.id),
-                "short": _short(run.id),
-                "subject_type": run.subject_type,
-                "subject_id": run.subject_id,
-                "kind": run.kind or "",
-                "revision": run.revision or "",
-                "status": run.status,
-                "elapsed": round((end - run.date_started).total_seconds(), 1),
-                "overdue": run.overdue_flagged_at is not None,
-                "previous_run": (
-                    _short(run.previous_run_id) if run.previous_run_id else ""
+                "id": str(graph.id),
+                "short": _short(graph.id),
+                "subject_type": graph.subject_type,
+                "subject_id": graph.subject_id,
+                "kind": graph.kind or "",
+                "revision": graph.revision or "",
+                "status": graph.status,
+                "generation": graph.generation,
+                "elapsed": round((end - graph.date_started).total_seconds(), 1),
+                "overdue": graph.overdue_flagged_at is not None,
+                "previous_graph": (
+                    _short(graph.previous_graph_id) if graph.previous_graph_id else ""
                 ),
-                "previous_run_id": (
-                    str(run.previous_run_id) if run.previous_run_id else ""
+                "previous_graph_id": (
+                    str(graph.previous_graph_id) if graph.previous_graph_id else ""
                 ),
-                "stages": [
+                "nodes": [
                     {
-                        "name": stage.name,
-                        "status": stage.status,
-                        "unit_type": stage.unit_type or "",
-                        "unit_id": str(stage.unit_id) if stage.unit_id else "",
-                        "unit_url": _unit_url(stage.unit_type, stage.unit_id),
-                        "error": errors.get(str(stage.unit_id)) or "",
+                        "key": node.key,
+                        "status": node.status,
+                        "task_id": str(node.task_id) if node.task_id else "",
+                        "task_url": _task_url(node.task_id),
+                        "error": errors.get(str(node.task_id)) or "",
+                        "can_skip": (
+                            graph.status == GraphStatus.RUNNING
+                            and node.status == NodeStatus.PENDING
+                        ),
                     }
-                    for stage in sorted(run.stages.all(), key=lambda s: s.position)
+                    for node in sorted(
+                        graph.nodes.all(), key=lambda n: (n.depth, n.position)
+                    )
                 ],
-                "can_settle": run.status == RunStatus.OPEN,
+                "can_cancel": graph.status == GraphStatus.RUNNING,
             }
         )
     return rows
@@ -413,7 +394,7 @@ def _usage_rollup(filters: dict) -> tuple[dict, dict | None]:
     attempts = _apply_filters(
         QraftTaskAttempt.objects.exclude(usage=None),
         filters,
-        run_field="qraft_task__run_id",
+        graph_field="qraft_task__graph_id",
         subject_prefix="qraft_task__",
     )
     rows = list(attempts.values_list("usage", flat=True)[:USAGE_ATTEMPT_CAP])
@@ -463,7 +444,7 @@ def state(request):
             "legacy_scheduled": Schedule.objects.count(),
             "filters": filters,
             "tasks": _task_rows(now, filters),
-            "runs": _run_rows(now, filters),
+            "graphs": _graph_rows(now, filters),
             "workflows": _workflow_rows(filters),
             "dlq": [
                 {
@@ -549,22 +530,32 @@ def reject_chain(request, chain_id):
 @require_POST
 @staff_required(json=True)
 @csrf_protect
-def settle_run(request, action, run_id):
-    """Cancel or abandon an open run. Neither revokes work already in flight."""
-    if action not in ("cancel", "abandon"):
-        return _not_found("run action", action)
-    from qraft import runs
+def cancel_graph(request, graph_id):
+    """Cancel a running graph. Does not revoke work already in flight."""
+    from qraft import graphs
 
     try:
-        if action == "cancel":
-            runs.cancel(run_id)
-        else:
-            runs.abandon(run_id, reason="dashboard")
-    except runs.RunError as error:
-        status = 404 if "unknown run" in str(error) else 409
+        graphs.cancel(graph_id)
+    except graphs.GraphError as error:
+        status = 404 if "unknown graph" in str(error) else 409
         return JsonResponse({"error": str(error)}, status=status)
-    logger.info("Dashboard %sed run %s", action, run_id)
-    return JsonResponse({action: str(run_id)})
+    logger.info("Dashboard cancelled graph %s", graph_id)
+    return JsonResponse({"cancelled": str(graph_id)})
+
+
+@require_POST
+@staff_required(json=True)
+@csrf_protect
+def skip_graph_node(request, graph_id, node_key):
+    from qraft import graphs
+
+    try:
+        graphs.skip(graph_id, node_key, reason="dashboard")
+    except graphs.GraphError as error:
+        status = 404 if "unknown graph" in str(error) else 409
+        return JsonResponse({"error": str(error)}, status=status)
+    logger.info("Dashboard skipped node %s of graph %s", node_key, graph_id)
+    return JsonResponse({"skipped": node_key})
 
 
 # QraftIter's constructor takes func positionally but ignores it when handed
