@@ -5,7 +5,7 @@ from uuid import uuid4
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
-from .mixins import RunMemberMixin, SubjectMixin, get_q2_task
+from .mixins import GraphMemberMixin, SubjectMixin, get_q2_task
 
 
 class QraftTaskQuerySet(models.QuerySet):
@@ -16,7 +16,7 @@ class QraftTaskQuerySet(models.QuerySet):
         ).order_by("-date_created")
 
 
-class QraftTask(SubjectMixin, RunMemberMixin, models.Model):
+class QraftTask(SubjectMixin, GraphMemberMixin, models.Model):
     """
     Extension model for Django-Q2 Task with enhanced Qraft functionality.
 
@@ -186,6 +186,15 @@ class QraftTask(SubjectMixin, RunMemberMixin, models.Model):
     )
     # Chain linkage is via QraftChainStep.qraft_task OneToOne
     # (reverse: task.chain_step)
+
+    graph_node = models.ForeignKey(
+        "QraftGraphNode",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+        help_text="The node this task is the current execution of",
+    )
 
     @property
     def attempt_count(self) -> int:
@@ -425,6 +434,12 @@ class QraftTaskAttempt(models.Model):
         null=True,
         blank=True,
         help_text="When the attempt completed",
+    )
+
+    output_committed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When a transactional node published its receipt (phase 3)",
     )
 
     # Worker identity, stamped from inside the executing process at

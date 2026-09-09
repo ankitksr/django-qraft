@@ -6,7 +6,7 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
 from .mixins import (
-    RunMemberMixin,
+    GraphMemberMixin,
     SubjectMixin,
     WorkflowHookMixin,
     WorkflowStatus,
@@ -15,7 +15,7 @@ from .mixins import (
 
 
 class QraftChainModel(
-    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+    SubjectMixin, GraphMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
 ):
     """Database model for chain workflow state (sequential execution)."""
 
@@ -119,7 +119,7 @@ class QraftChainStep(models.Model):
 
 
 class QraftIterModel(
-    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+    SubjectMixin, GraphMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
 ):
     """Database model for iter workflow state (same function, many inputs)."""
 
@@ -177,7 +177,7 @@ class QraftIterModel(
 
 
 class QraftBatchModel(
-    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+    SubjectMixin, GraphMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
 ):
     """Database model for batch workflow state (different functions, parallel)."""
 

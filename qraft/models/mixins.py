@@ -77,29 +77,27 @@ class SubjectMixin(models.Model):
         abstract = True
 
 
-class RunMemberMixin(models.Model):
+class GraphMemberMixin(models.Model):
     """
-    The run and stage a task or workflow is correlated with.
+    The graph and node key a task or workflow is correlated with.
 
-    `SET_NULL`, never `CASCADE`: deleting a run must never delete work. The
-    pair is correlation only - a member of a workflow carries the same values
-    so it filters and logs correctly, but only the stage's one bound unit ever
-    settles the stage.
+    `SET_NULL`, never `CASCADE`: deleting a graph must never delete work. A
+    node's own task also carries `graph_node` (CASCADE) for membership.
     """
 
-    run = models.ForeignKey(
-        "QraftRun",
+    graph = models.ForeignKey(
+        "QraftGraph",
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
         related_name="%(class)s_members",
-        help_text="Run this work is correlated with",
+        help_text="Graph this work is correlated with",
     )
-    stage = models.CharField(
+    node = models.CharField(
         max_length=100,
         null=True,
         blank=True,
-        help_text="Stage of the run this work is correlated with",
+        help_text="Node key within the graph, for correlation",
     )
 
     class Meta:
