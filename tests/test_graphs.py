@@ -885,3 +885,4 @@ class TestApproval:
         # Waiting on a person is not running late.
         assert graphs.flag_overdue() == 0
         assert QraftGraph.objects.get(id=graph_id).overdue_flagged_at is None
+

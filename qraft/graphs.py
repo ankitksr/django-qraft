@@ -667,7 +667,18 @@ def _node(graph: QraftGraph, node_key: str) -> QraftGraphNode:
 
 
 def _dispatch_frontier(graph_id) -> None:
-    """Dispatch every pending node whose dependencies are met."""
+    """Dispatch every pending node whose dependencies are met.
+
+    Opens its own transaction: callers reach here both from inside one (the
+    dispatcher, holding the graph lock already) and from outside it (`resume`,
+    after its own transaction committed), and `_locked` needs one either way.
+    An inner `atomic()` is a savepoint, so the nested case is unchanged.
+    """
+    with transaction.atomic():
+        _dispatch_frontier_locked(graph_id)
+
+
+def _dispatch_frontier_locked(graph_id) -> None:
     graph = _locked(graph_id)
     if graph.status != GraphStatus.RUNNING:
         return

@@ -87,7 +87,9 @@ class TestProgressRace:
     def test_concurrent_reports_lose_no_write_and_stamp_advanced_once(self):
         from qraft import context
 
-        task = QraftTask.objects.create(func="app.tasks.crunch", status=TaskStatus.RUNNING)
+        task = QraftTask.objects.create(
+            func="app.tasks.crunch", status=TaskStatus.RUNNING
+        )
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task, attempt_number=1, q2_task_id="q2-progress-race"
         )
@@ -274,7 +276,9 @@ class TestProgressAttributionRace:
         from qraft import context
         from qraft.scheduler import schedule_attempt
 
-        task = QraftTask.objects.create(func="app.tasks.crunch", status=TaskStatus.RUNNING)
+        task = QraftTask.objects.create(
+            func="app.tasks.crunch", status=TaskStatus.RUNNING
+        )
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task, attempt_number=1, q2_task_id="q2-attr-1"
         )
@@ -351,13 +355,21 @@ class TestSubjectBindRace:
         the locked re-read inside `_create_and_enqueue` the task keeps a null
         subject that nothing ever fills in.
         """
-        from qraft import runs
-        from qraft.models.runs import QraftRun
+        from qraft import graphs
+        from qraft.models.graphs import QraftGraph
 
-        run_id = runs.start(None, ["ingest", "score"])
+        builder = graphs.Graph()
+        builder.node("ingest", "tests.e2e_tasks.succeed", recovery="transactional")
+        builder.node(
+            "score",
+            "tests.e2e_tasks.succeed",
+            after=("ingest",),
+            recovery="transactional",
+        )
+        graph_id = builder.start()
         labels_read = threading.Event()
         bind_done = threading.Event()
-        real_member_labels = runs.member_labels
+        real_member_labels = graphs.member_labels
 
         def slow_member_labels(*args, **kwargs):
             labels = real_member_labels(*args, **kwargs)
@@ -367,28 +379,28 @@ class TestSubjectBindRace:
 
         def bind():
             labels_read.wait(timeout=10)
-            runs.bind_subject(run_id, ("worksheet", 4117))
+            graphs.bind_subject(graph_id, ("worksheet", 4117))
             bind_done.set()
 
         def enqueue():
             with (
                 patch("qraft.tasks.q2_async_task", return_value="q2-race-subject"),
-                patch.object(runs, "member_labels", slow_member_labels),
+                patch.object(graphs, "member_labels", slow_member_labels),
             ):
                 from qraft.tasks import async_task
 
                 async_task(
                     "tests.e2e_tasks.succeed",
                     "x",
-                    qraft_options={"run": run_id, "stage": "score"},
+                    qraft_options={"graph": graph_id, "node": "score"},
                 )
 
         run_concurrently(bind, enqueue)
 
-        assert QraftRun.objects.get(id=run_id).subject_type == "worksheet"
-        task = QraftTask.objects.get(stage="score")
+        assert QraftGraph.objects.get(id=graph_id).subject_type == "worksheet"
+        task = QraftTask.objects.get(node="score", graph_node__isnull=True)
         # Either it landed before the bind and was backfilled, or it waited on
-        # the run's lock and read the bound subject. Never null.
+        # the graph's lock and read the bound subject. Never null.
         assert (task.subject_type, task.subject_id) == ("worksheet", "4117")
 
 
@@ -396,17 +408,19 @@ class TestBudgetRace:
     """Two workers cannot both spend the last request."""
 
     def test_the_last_request_is_spent_once(self):
-        from qraft import runs
+        from qraft import graphs
         from qraft.context import BudgetExhausted, consume_budget, remaining_budget
 
-        run_id = runs.start(("worksheet", 1), ["ai"], budgets={"openai_requests": 1})
+        builder = graphs.Graph(subject=("worksheet", 1), budgets={"openai_requests": 1})
+        builder.node("ai", "tests.e2e_tasks.succeed", recovery="transactional")
+        graph_id = builder.start()
         outcomes = []
         barrier = threading.Barrier(2)
 
         def spend():
             barrier.wait(timeout=10)
             try:
-                outcomes.append(consume_budget("openai_requests", run_id=run_id))
+                outcomes.append(consume_budget("openai_requests", graph_id=graph_id))
             except BudgetExhausted:
                 outcomes.append("exhausted")
 
@@ -414,6 +428,42 @@ class TestBudgetRace:
 
         assert sorted(outcomes, key=str) == [0, "exhausted"]
         assert remaining_budget("openai_requests", graph_id=graph_id) == 0
+
+
+class TestResumeOutsideATransaction:
+    """`resume()` dispatches after its own transaction commits.
+
+    Under `TestCase` every test already sits inside a transaction and SQLite
+    ignores `select_for_update` outright, so the frontier's row lock looks fine
+    on both. On Postgres in autocommit it raises unless the dispatch opens a
+    transaction of its own -- which is how this surfaced, on the first live run.
+    """
+
+    def test_the_frontier_locks_inside_its_own_transaction(self):
+        from qraft import graphs
+        from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+        from qraft.models.graphs import NodeStatus, QraftGraphNode
+
+        builder = graphs.Graph(subject=("worksheet", 4117))
+        builder.node("ingest", "tests.e2e_tasks.succeed", recovery="transactional")
+        graph_id = builder.start()
+
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="ingest")
+        task = QraftTask.objects.get(pk=node.task_id)
+        task.status = TaskStatus.EXHAUSTED
+        task.save(update_fields=["status"])
+        attempt = task.attempts.order_by("-attempt_number").first()
+        QraftTaskAttempt.objects.filter(pk=attempt.pk).update(
+            success=False, date_completed=timezone.now()
+        )
+        attempt.refresh_from_db()
+        graphs.handle_node_completion(task, attempt)
+
+        graphs.resume(graph_id)
+
+        node.refresh_from_db()
+        assert node.status == NodeStatus.RUNNING
+        assert node.generation == 2
 
 
 class TestParallelCounterRace:
@@ -484,7 +534,6 @@ class TestParallelCounterRace:
         )
         assert len(signal_log["workflow_settled"]) == 1
 
-
 class TestChainAdvanceRace:
     """
     One chain step's completion delivered twice at once.
@@ -533,7 +582,6 @@ class TestChainAdvanceRace:
         # Step 0's task plus step 1's. A second advance past the guard would
         # create a third and orphan the one the step no longer points at.
         assert QraftTask.objects.count() == 2
-
 
 class TestThrottleRace:
     """
