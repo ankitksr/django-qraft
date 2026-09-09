@@ -183,7 +183,7 @@ def replay_unrouted(grace: float | None = None) -> int:
     Returns:
         Number of attempts replayed.
     """
-    from . import runs
+    from . import graphs
     from .dispatchers import route_workflow_completion
     from .hooks import HookDispatcher
 
@@ -209,9 +209,11 @@ def replay_unrouted(grace: float | None = None) -> int:
             attempt.attempt_number,
             attempt.qraft_task_id,
         )
-        if not route_workflow_completion(attempt.qraft_task, attempt):
+        if attempt.qraft_task.graph_node_id:
+            graphs.handle_node_completion(attempt.qraft_task, attempt)
             HookDispatcher(attempt.qraft_task, attempt).dispatch(attempt.success)
-        runs.note_unit_settled(attempt.qraft_task)
+        elif not route_workflow_completion(attempt.qraft_task, attempt):
+            HookDispatcher(attempt.qraft_task, attempt).dispatch(attempt.success)
         QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
         replayed += 1
     if replayed:
@@ -349,12 +351,10 @@ def reap_orphans(stale_after: float | None = None) -> int:
     # Observation only: a run open past its threshold is flagged, never failed.
     # An unenqueued stage is an application defect, and skip/cancel/abandon are
     # the operator's tools for it.
-    from . import runs
+    from . import graphs
 
-    runs.flag_overdue()
-    # The run's own equivalent of replay_unrouted(): a settlement that
-    # committed but never queued its durable hook.
-    runs.replay_settled_hooks(grace)
+    graphs.flag_overdue()
+    graphs.replay_settled_hooks(grace)
 
     now = timezone.now()
     heartbeat_cutoff = now - timedelta(seconds=grace)
@@ -479,13 +479,16 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
         metrics.counter_on_commit("qraft.reaper.action", action="orphaned")
 
     if routable is not None:
-        from . import runs
+        from . import graphs
         from .dispatchers import route_workflow_completion
         from .hooks import HookDispatcher
 
-        if not route_workflow_completion(*routable):
-            HookDispatcher(*routable).dispatch(attempt.success)
-        runs.note_unit_settled(routable[0])
+        qraft_task, routable_attempt = routable
+        if qraft_task.graph_node_id:
+            graphs.handle_node_completion(qraft_task, routable_attempt)
+            HookDispatcher(qraft_task, routable_attempt).dispatch(False)
+        elif not route_workflow_completion(qraft_task, routable_attempt):
+            HookDispatcher(qraft_task, routable_attempt).dispatch(False)
         QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
     return True

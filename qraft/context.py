@@ -42,8 +42,9 @@ CONTEXT_KEYS = (
     "attempt_id",
     "attempt_number",
     "func",
-    "run_id",
-    "stage",
+    "graph_id",
+    "node_key",
+    "generation",
     "subject_type",
     "subject_id",
 )
@@ -108,13 +109,17 @@ def set_delivery_claim(claim: tuple) -> None:
 def bind_attempt(attempt, qraft_task=None) -> dict:
     """Publish the executing attempt's ids to the logging filter and signals."""
     task = qraft_task if qraft_task is not None else attempt.qraft_task
+    node = getattr(task, "graph_node", None)
     bound = {
         "task_id": str(task.id),
         "attempt_id": str(attempt.id),
         "attempt_number": attempt.attempt_number,
         "func": task.func,
-        "run_id": str(run_id) if (run_id := getattr(task, "run_id", None)) else None,
-        "stage": getattr(task, "stage", None),
+        "graph_id": (
+            str(graph_id) if (graph_id := getattr(task, "graph_id", None)) else None
+        ),
+        "node_key": getattr(task, "node", None),
+        "generation": node.generation if node is not None else None,
         "subject_type": task.subject_type,
         "subject_id": task.subject_id,
     }
@@ -157,6 +162,34 @@ def current_context() -> dict:
     if attempt is None:
         return empty
     return bind_attempt(attempt)
+
+
+def current_node() -> dict | None:
+    """
+    Identity of the graph node this delivery is executing, if any.
+
+    Returns graph id, node key, generation, task and attempt ids, attempt
+    number, subject, and metadata for application-side correlation columns.
+    """
+    attempt = current_attempt()
+    if attempt is None:
+        return None
+    task = attempt.qraft_task
+    node = getattr(task, "graph_node", None)
+    if node is None:
+        return None
+    graph = node.graph
+    return {
+        "graph_id": str(graph.id),
+        "node_key": node.key,
+        "generation": node.generation,
+        "task_id": str(task.id),
+        "attempt_id": str(attempt.id),
+        "attempt_number": attempt.attempt_number,
+        "subject_type": graph.subject_type,
+        "subject_id": graph.subject_id,
+        "metadata": graph.metadata,
+    }
 
 
 def current_attempt_id() -> str | None:
@@ -322,10 +355,10 @@ def record_usage(**fields) -> None:
 
 
 class BudgetExhausted(Exception):
-    """Raised by `consume_budget()` when a run's allowance for a key is spent."""
+    """Raised by `consume_budget()` when a graph's allowance for a key is spent."""
 
 
-def _pg_consume_budget(run_id, key: str, n: int) -> int | None:
+def _pg_consume_budget(graph_id, key: str, n: int) -> int | None:
     """
     Decrement one budget key in a single guarded UPDATE.
 
@@ -333,45 +366,47 @@ def _pg_consume_budget(run_id, key: str, n: int) -> int | None:
     the key below zero matches no row, so two workers cannot both spend the
     last request. RETURNING hands back what is left.
     """
-    from qraft.models.runs import QraftRun
+    from qraft.models.graphs import QraftGraph
 
     sql = (
-        f"UPDATE {_table(QraftRun)} SET budgets = "
+        f"UPDATE {_table(QraftGraph)} SET budgets = "
         "jsonb_set(budgets, ARRAY[%s], to_jsonb(((budgets->>%s)::numeric - "
         "%s::numeric))) WHERE id = %s AND jsonb_typeof(budgets->%s) = 'number' "
         "AND (budgets->>%s)::numeric >= %s::numeric "
         "RETURNING (budgets->>%s)::numeric"
     )
     with connection.cursor() as cursor:
-        cursor.execute(sql, [key, key, n, run_id, key, key, n, key])
+        cursor.execute(sql, [key, key, n, graph_id, key, key, n, key])
         row = cursor.fetchone()
     return int(row[0]) if row else None
 
 
-def _locked_consume_budget(run_id, key: str, n: int) -> int | None:
-    from qraft.models.runs import QraftRun
+def _locked_consume_budget(graph_id, key: str, n: int) -> int | None:
+    from qraft.models.graphs import QraftGraph
 
     with transaction.atomic():
-        run = QraftRun.objects.select_for_update().only("id", "budgets").get(id=run_id)
-        budgets = dict(run.budgets or {})
+        graph = (
+            QraftGraph.objects.select_for_update()
+            .only("id", "budgets")
+            .get(id=graph_id)
+        )
+        budgets = dict(graph.budgets or {})
         remaining = budgets.get(key)
         if not _is_numeric(remaining) or remaining < n:
             return None
         budgets[key] = remaining - n
-        run.budgets = budgets
-        run.save(update_fields=["budgets"])
+        graph.budgets = budgets
+        graph.save(update_fields=["budgets"])
         return int(budgets[key])
 
 
-def consume_budget(key: str, n: int = 1, run_id=None) -> int | None:
+def consume_budget(key: str, n: int = 1, graph_id=None) -> int | None:
     """
     Spend `n` from the executing run's budget for `key`, atomically.
 
     A budget bounds how many provider requests one pipeline may make, across
-    every stage and every retry of every stage - the question a token-bucket
-    throttle cannot answer, because a bucket refills. Declare it at
-    `runs.start(..., budgets={"openai_requests": 40})` and spend it one call
-    at a time::
+    every node and every retry of every node. Declare it at graph start and
+    spend it one call at a time::
 
         qraft.context.consume_budget("openai_requests")   # before the call
         response = client.responses.create(...)
@@ -384,11 +419,11 @@ def consume_budget(key: str, n: int = 1, run_id=None) -> int | None:
     Args:
         key: Budget name, as declared on the run.
         n: How much to spend. Must be positive.
-        run_id: The run to charge; defaults to the executing attempt's.
+        graph_id: The graph to charge; defaults to the executing attempt's.
 
     Returns:
         int: what is left after the decrement, or None when nothing is
-        metered - outside a run, or for a key the run does not declare.
+        metered - outside a graph, or for a key the graph does not declare.
         A key with no budget is unmetered by design: Qraft does not invent a
         limit the application never asked for.
 
@@ -398,46 +433,46 @@ def consume_budget(key: str, n: int = 1, run_id=None) -> int | None:
     if n <= 0:
         raise ValueError(f"consume_budget(n={n!r}) must spend a positive amount")
 
-    run_id = run_id if run_id is not None else current_context().get("run_id")
-    if not run_id:
-        _logger.debug("consume_budget() called outside a run, ignoring")
+    graph_id = graph_id if graph_id is not None else current_context().get("graph_id")
+    if not graph_id:
+        _logger.debug("consume_budget() called outside a graph, ignoring")
         return None
 
-    if not _budget_declares(run_id, key):
+    if not _budget_declares(graph_id, key):
         return None
 
     if connection.vendor == "postgresql":
-        remaining = _pg_consume_budget(run_id, key, n)
+        remaining = _pg_consume_budget(graph_id, key, n)
     else:
-        remaining = _locked_consume_budget(run_id, key, n)
+        remaining = _locked_consume_budget(graph_id, key, n)
 
     if remaining is None:
         raise BudgetExhausted(
-            f"run {run_id} has no {key!r} budget left for {n} more; "
-            "the stage must stop rather than spend past its allowance"
+            f"graph {graph_id} has no {key!r} budget left for {n} more; "
+            "the node must stop rather than spend past its allowance"
         )
     return remaining
 
 
-def _budget_declares(run_id, key: str) -> bool:
-    """Whether the run declares this key at all. An undeclared key is unmetered."""
-    from qraft.models.runs import QraftRun
+def _budget_declares(graph_id, key: str) -> bool:
+    """Whether the graph declares this key at all. An undeclared key is unmetered."""
+    from qraft.models.graphs import QraftGraph
 
     budgets = (
-        QraftRun.objects.filter(id=run_id).values_list("budgets", flat=True).first()
+        QraftGraph.objects.filter(id=graph_id).values_list("budgets", flat=True).first()
     )
     return bool(budgets) and key in budgets
 
 
-def remaining_budget(key: str, run_id=None) -> int | None:
+def remaining_budget(key: str, graph_id=None) -> int | None:
     """What is left of a budget key, without spending any. None when unmetered."""
-    from qraft.models.runs import QraftRun
+    from qraft.models.graphs import QraftGraph
 
-    run_id = run_id if run_id is not None else current_context().get("run_id")
-    if not run_id:
+    graph_id = graph_id if graph_id is not None else current_context().get("graph_id")
+    if not graph_id:
         return None
     budgets = (
-        QraftRun.objects.filter(id=run_id).values_list("budgets", flat=True).first()
+        QraftGraph.objects.filter(id=graph_id).values_list("budgets", flat=True).first()
     )
     value = (budgets or {}).get(key)
     return int(value) if _is_numeric(value) else None
@@ -673,12 +708,12 @@ def aggregate_workflow_usage(workflow) -> dict:
     return _sum_usage(usages)
 
 
-def aggregate_run_usage(run_id) -> dict:
-    """Sum usage across every attempt of every task in a run."""
+def aggregate_graph_usage(graph_id) -> dict:
+    """Sum usage across every attempt of every task in a graph."""
     from qraft.models.tasks import QraftTaskAttempt
 
     return _sum_usage(
-        QraftTaskAttempt.objects.filter(qraft_task__run_id=run_id).values_list(
+        QraftTaskAttempt.objects.filter(qraft_task__graph_id=graph_id).values_list(
             "usage", flat=True
         )
     )

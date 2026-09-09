@@ -52,8 +52,8 @@ class QraftBatch(ParallelWorkflow):
         failure_kwargs: dict | None = None,
         batch_id: UUID | str | None = None,
         subject: tuple | None = None,
-        run=None,
-        stage: str | None = None,
+        graph=None,
+        node: str | None = None,
         hook_context: bool = False,
     ):
         self._tasks = []
@@ -65,14 +65,13 @@ class QraftBatch(ParallelWorkflow):
         if batch_id:
             self._model = QraftBatchModel.objects.get(id=batch_id)
         else:
-            from qraft import runs
+            from qraft import graphs
             from qraft.tasks import parse_subject
 
             subject_type, subject_id = parse_subject(subject)
-            # The run's row lock is held across the insert, so a
-            # concurrent runs.bind_subject() cannot leave this workflow with
-            # a null subject it never backfills.
-            with runs.correlating(run, stage, subject_type, subject_id) as correlation:
+            with graphs.correlating(
+                graph, node, subject_type, subject_id
+            ) as correlation:
                 self._model = QraftBatchModel.objects.create(
                     success_hook=on_success,
                     success_args=list(success_args),
@@ -84,8 +83,8 @@ class QraftBatch(ParallelWorkflow):
                     progress_hook=progress_hook,
                     subject_type=correlation["subject_type"],
                     subject_id=correlation["subject_id"],
-                    run_id=correlation["run_id"],
-                    stage=correlation["stage"],
+                    graph_id=correlation["graph_id"],
+                    node=correlation["node"],
                     hook_context=hook_context,
                 )
 
@@ -178,8 +177,6 @@ class QraftBatch(ParallelWorkflow):
                 self._model.save(
                     update_fields=["total_count", "status", "date_updated"]
                 )
-                self._bind_to_run()
-
                 for idx, task_data in enumerate(self._tasks):
                     _create_workflow_task(
                         func=task_data["func"],

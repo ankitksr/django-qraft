@@ -57,8 +57,8 @@ class QraftChain(BaseWorkflow):
         failure_kwargs: dict | None = None,
         chain_id: UUID | str | None = None,
         subject: tuple | None = None,
-        run=None,
-        stage: str | None = None,
+        graph=None,
+        node: str | None = None,
         hook_context: bool = False,
     ):
         self._steps = []
@@ -70,14 +70,13 @@ class QraftChain(BaseWorkflow):
         if chain_id:
             self._model = QraftChainModel.objects.get(id=chain_id)
         else:
-            from qraft import runs
+            from qraft import graphs
             from qraft.tasks import parse_subject
 
             subject_type, subject_id = parse_subject(subject)
-            # The run's row lock is held across the insert, so a
-            # concurrent runs.bind_subject() cannot leave this workflow with
-            # a null subject it never backfills.
-            with runs.correlating(run, stage, subject_type, subject_id) as correlation:
+            with graphs.correlating(
+                graph, node, subject_type, subject_id
+            ) as correlation:
                 self._model = QraftChainModel.objects.create(
                     success_hook=on_success,
                     success_args=list(success_args),
@@ -88,8 +87,8 @@ class QraftChain(BaseWorkflow):
                     on_cancelled=on_cancelled,
                     subject_type=correlation["subject_type"],
                     subject_id=correlation["subject_id"],
-                    run_id=correlation["run_id"],
-                    stage=correlation["stage"],
+                    graph_id=correlation["graph_id"],
+                    node=correlation["node"],
                     hook_context=hook_context,
                 )
 
@@ -170,7 +169,6 @@ class QraftChain(BaseWorkflow):
 
             self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["status", "date_updated"])
-            self._bind_to_run()
 
             first_step = self._model.steps.get(step_index=0)
             if first_step.requires_approval:
@@ -211,27 +209,6 @@ class QraftChain(BaseWorkflow):
         # landing in between, fails the locked transition instead of
         # double-queueing the step or enqueueing into a cancelled chain.
         with transaction.atomic():
-            # The run is locked before its status is read, so a cancel racing
-            # this cannot slip between the check and the enqueue. A chain that
-            # is a stage's unit failed its run the moment it failed, so in
-            # practice this only passes in the crash window replay_unrouted()
-            # closes; the expected path after a settled run is a new run.
-            if self._model.run_id:
-                from qraft.models.runs import QraftRun, RunStatus
-
-                run_status = (
-                    QraftRun.objects.select_for_update()
-                    .filter(pk=self._model.run_id)
-                    .values_list("status", flat=True)
-                    .first()
-                )
-                if run_status != RunStatus.OPEN:
-                    raise ValueError(
-                        f"chain {self._model.id} belongs to run "
-                        f"{self._model.run_id}, which is {run_status}; start a "
-                        "new run instead of resuming"
-                    )
-
             chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
             chain.transition_to(WorkflowStatus.RUNNING)
             # Cleared with the transition: the next settlement is a genuinely

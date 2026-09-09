@@ -135,24 +135,8 @@ class BaseWorkflow:
             f"Cannot transition from {self._model.status} to {WorkflowStatus.CANCELLED}"
         )
 
-    def _bind_to_run(self) -> None:
-        """
-        Bind this workflow as its stage's one completion unit.
-
-        Called from inside run()'s transaction, so a refused bind (the run
-        settled, the stage already has a unit) rolls the whole fan-out back
-        rather than leaving members queued under a stage nothing owns.
-        """
-        if self._model.run_id and self._model.stage:
-            from qraft import runs
-
-            runs.bind(self._model.run_id, self._model.stage, self._model)
-
     def _announce_cancelled(self) -> None:
         """Signal, count and hook a cancellation that just took effect."""
-        from qraft import runs
-
-        runs.note_unit_settled(self._model)
         signals.send(
             signals.workflow_settled,
             self._model.__class__,

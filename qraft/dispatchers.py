@@ -74,11 +74,6 @@ def settle_workflow(model, workflow_id, status: str, workflow_type: str):
     metrics.counter_on_commit(
         "qraft.workflow.settled", workflow_type=workflow_type, outcome=status
     )
-    # Immediately after the workflow's own compare-and-swap, so the window
-    # between the two is the one replay_unrouted() already covers.
-    from qraft import runs
-
-    runs.note_unit_settled(workflow)
     return workflow
 
 
@@ -596,7 +591,7 @@ def _dispatch_workflow_hook(
     Dispatch workflow-level hook with idempotency.
 
     Args:
-        workflow_type: 'chain', 'iter', 'batch' or 'run'
+        workflow_type: 'chain', 'iter', 'batch' or 'graph'
         workflow_id: UUID of the workflow
         hook_type: 'success', 'failure', 'cancelled' or 'settled'
         hook_path: Dotted path to hook function

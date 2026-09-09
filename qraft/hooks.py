@@ -115,8 +115,9 @@ def hook_context(attempt, qraft_task, outcome: str) -> dict:
         "attempt_number": payload["attempt_number"],
         "outcome": outcome,
         "exception_class": payload["exception_class"],
-        "run_id": payload["run_id"],
-        "stage": payload["stage"],
+        "graph_id": payload["graph_id"],
+        "node_key": payload["node_key"],
+        "generation": payload["generation"],
         "subject_type": payload["subject_type"],
         "subject_id": payload["subject_id"],
         "result_ref": attempt.q2_task_id,
@@ -279,7 +280,7 @@ def _resolve_attempt(q2_task):
 
 def _owning_workflow_cancelled(qraft_task) -> bool:
     """
-    Fresh read of the owning workflow's status, True when it is CANCELLED.
+    Fresh read of the owning workflow's or graph's status, True when CANCELLED.
 
     Cancel stops future orchestration, and a retry is future orchestration: a
     cancelled workflow must not keep generating new executions through a
@@ -288,6 +289,15 @@ def _owning_workflow_cancelled(qraft_task) -> bool:
     the member was resolved from the queue.
     """
     from .models import QraftChainStep, WorkflowStatus
+    from .models.graphs import GraphStatus, QraftGraph
+
+    if qraft_task.graph_node_id:
+        status = (
+            QraftGraph.objects.filter(pk=qraft_task.graph_id)
+            .values_list("status", flat=True)
+            .first()
+        )
+        return status == GraphStatus.CANCELLED
 
     try:
         step = qraft_task.chain_step
@@ -319,7 +329,7 @@ def qraft_hook_handler(q2_task):
     Args:
         q2_task: Django-Q2 Task object passed by the monitor process
     """
-    from . import runs
+    from . import graphs
     from .dispatchers import route_workflow_completion
     from .models import QraftTask, QraftTaskAttempt, TaskStatus
 
@@ -397,14 +407,11 @@ def qraft_hook_handler(q2_task):
     if retry_scheduled:
         return
 
-    # Workflow tasks get workflow-level hooks only, never task-level ones.
-    # Routed with the pre-lock instance: its select_related already answered
-    # the membership question, and membership is immutable after creation.
-    if not route_workflow_completion(attempt.qraft_task, attempt):
+    if qraft_task.graph_node_id:
+        graphs.handle_node_completion(qraft_task, attempt)
         HookDispatcher(qraft_task, attempt).dispatch(q2_task.success)
-    # A no-op unless this task is a run stage's bound unit; a workflow member
-    # carries the same run and stage but never settles one.
-    runs.note_unit_settled(qraft_task)
+    elif not route_workflow_completion(attempt.qraft_task, attempt):
+        HookDispatcher(qraft_task, attempt).dispatch(q2_task.success)
     # Routing, run settlement and hook dispatch are all idempotent (counted
     # flag, step-index CAS, stage settled_at CAS, HookDispatch unique rows), so
     # the flag needs setting only after they finish; a crash above leaves it

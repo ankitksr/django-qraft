@@ -27,8 +27,9 @@ attempt_finished = Signal()
 task_settled = Signal()
 workflow_settled = Signal()
 attempt_stall_suspected = Signal()
-run_settled = Signal()
-run_overdue = Signal()
+node_settled = Signal()
+graph_settled = Signal()
+graph_overdue = Signal()
 
 
 def _iso(value):
@@ -44,6 +45,7 @@ def _text(value):
 def attempt_payload(attempt, qraft_task=None, outcome: str | None = None) -> dict:
     """Id-only view of an attempt and its task, shared by every attempt signal."""
     task = qraft_task if qraft_task is not None else attempt.qraft_task
+    node = getattr(task, "graph_node", None)
     return {
         "task_id": str(task.id),
         "attempt_id": str(attempt.id),
@@ -52,13 +54,12 @@ def attempt_payload(attempt, qraft_task=None, outcome: str | None = None) -> dic
         "status": task.status,
         "outcome": outcome,
         "exception_class": attempt.exception_class,
-        "run_id": _text(getattr(task, "run_id", None)),
-        "stage": getattr(task, "stage", None),
+        "graph_id": _text(getattr(task, "graph_id", None)),
+        "node_key": getattr(task, "node", None),
+        "generation": node.generation if node is not None else None,
         "subject_type": task.subject_type,
         "subject_id": task.subject_id,
         "cluster": attempt.cluster,
-        # How many deliveries of this attempt a worker began, and whether the
-        # one being reported is a repeat the guard refused.
         "execution_count": attempt.execution_count,
         "redelivered": attempt.execution_count > 1
         or attempt.exception_class == "RedeliveredAttempt",
@@ -73,30 +74,32 @@ def workflow_payload(workflow, workflow_type: str, outcome: str) -> dict:
         "workflow_id": str(workflow.id),
         "workflow_type": workflow_type,
         "outcome": outcome,
-        "run_id": _text(getattr(workflow, "run_id", None)),
-        "stage": getattr(workflow, "stage", None),
+        "graph_id": _text(getattr(workflow, "graph_id", None)),
+        "node": getattr(workflow, "node", None),
         "subject_type": workflow.subject_type,
         "subject_id": workflow.subject_id,
         "settled_at": _iso(workflow.settled_at),
     }
 
 
-def run_payload(run) -> dict:
-    """Id-only view of a run, shared by `run_settled` and `run_overdue`."""
+def graph_payload(graph) -> dict:
+    """Id-only view of a graph, shared by `graph_settled` and `graph_overdue`."""
     return {
-        "run_id": str(run.id),
-        "subject_type": run.subject_type,
-        "subject_id": run.subject_id,
-        "kind": run.kind,
-        "revision": run.revision,
-        "outcome": run.status,
-        "stages": {
-            stage.name: stage.status for stage in run.stages.all().order_by("position")
+        "graph_id": str(graph.id),
+        "subject_type": graph.subject_type,
+        "subject_id": graph.subject_id,
+        "kind": graph.kind,
+        "revision": graph.revision,
+        "outcome": graph.status,
+        "generation": graph.generation,
+        "nodes": {
+            node.key: node.status
+            for node in graph.nodes.all().order_by("depth", "position")
         },
-        "previous_run_id": _text(run.previous_run_id),
-        "date_started": _iso(run.date_started),
-        "settled_at": _iso(run.settled_at),
-        "overdue_flagged_at": _iso(run.overdue_flagged_at),
+        "previous_graph_id": _text(graph.previous_graph_id),
+        "date_started": _iso(graph.date_started),
+        "settled_at": _iso(graph.settled_at),
+        "overdue_flagged_at": _iso(graph.overdue_flagged_at),
     }
 
 

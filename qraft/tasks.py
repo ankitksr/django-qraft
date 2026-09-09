@@ -220,40 +220,25 @@ def _wrapped_dispatch(qraft_metadata: dict, func, args, q2_kwargs: dict):
     )
 
 
-def _create_and_enqueue(
-    qraft_metadata: dict, func, args, q2_kwargs: dict, bind_stage: str | None = None
-):
+def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
     """
     Create a QraftTask, queue it to Django-Q2, and record attempt 1.
 
-    All four happen in one transaction so a failed enqueue leaves no
-    half-built task behind, and a refused stage bind (the run settled, the
-    stage already has a unit) leaves nothing queued at all.
-
-    Args:
-        bind_stage: Stage name to bind this task to as the run's completion
-            unit. Workflow members pass None: they carry the run and stage for
-            correlation but never settle a stage.
+    All three happen in one transaction so a failed enqueue leaves no
+    half-built task behind.
 
     Returns:
         tuple[QraftTask, str]: the created task and its Django-Q2 task ID
     """
-    from qraft import runs
+    from qraft import graphs
 
     func, args, q2_kwargs = _wrapped_dispatch(qraft_metadata, func, args, q2_kwargs)
     with transaction.atomic():
-        # Re-read the subject under the run's row lock: `runs.bind_subject()`
-        # holds that lock while it backfills members, so a task inserted here
-        # either precedes the bind (and the backfill catches it) or waits and
-        # reads the bound subject. The lock is the same one `runs.bind()`
-        # takes a few lines down.
-        if qraft_metadata.get("run_id") and not qraft_metadata.get("subject_type"):
-            run = runs._locked(qraft_metadata["run_id"])
-            qraft_metadata["subject_type"] = run.subject_type
-            qraft_metadata["subject_id"] = run.subject_id
+        if qraft_metadata.get("graph_id") and not qraft_metadata.get("subject_type"):
+            graph = graphs._locked(qraft_metadata["graph_id"])
+            qraft_metadata["subject_type"] = graph.subject_type
+            qraft_metadata["subject_id"] = graph.subject_id
         qraft_task = QraftTask.objects.create(**qraft_metadata)
-        if bind_stage:
-            runs.bind(qraft_metadata["run_id"], bind_stage, qraft_task)
         q2_task_id = q2_async_task(func, *args, **q2_kwargs)
         QraftTaskAttempt.objects.create(
             qraft_task=qraft_task,
@@ -382,13 +367,11 @@ def async_task(
                     domain entity this task is for; the id is stored as a
                     string. Retries inherit it; `QraftTask.objects
                     .for_subject()` finds every task for it.
-                run (str | UUID): id of the `qraft.runs` run this task is a
-                    stage of. Paired with `stage`, the task becomes that
-                    stage's one completion unit at enqueue. A run implies its
-                    subject: a task that names no subject inherits the run's,
-                    and one that names a different subject raises.
-                stage (str): name of the run stage this task completes. Must
-                    be one the run declared, and must not already have a unit.
+                graph (str | UUID): id of the `qraft.graphs` graph this task
+                    is correlated with. Paired with `node`, names the node key
+                    for filtering and logging. A graph implies its subject.
+                node (str): node key within the graph, for correlation only.
+                    Graph node tasks are dispatched by qraft, not async_task.
                 stall_after (int): seconds an attempt may heartbeat without
                     its progress advancing before the reaper flags it as a
                     suspected stall. Observation only - the attempt keeps
@@ -503,12 +486,12 @@ def async_task(
     # Build retry policy
     retry_policy = RetryPolicy.from_options(qraft_options)
 
-    from qraft import runs
+    from qraft import graphs
 
     subject_type, subject_id = parse_subject(qraft_options.get("subject"))
-    stage = qraft_options.get("stage")
-    correlation = runs.member_labels(
-        qraft_options.get("run"), stage, subject_type, subject_id
+    node = qraft_options.get("node")
+    correlation = graphs.member_labels(
+        qraft_options.get("graph"), node, subject_type, subject_id
     )
 
     # Prepare Qraft metadata
@@ -529,8 +512,8 @@ def async_task(
         "priority": priority,
         "subject_type": correlation["subject_type"],
         "subject_id": correlation["subject_id"],
-        "run_id": correlation["run_id"],
-        "stage": correlation["stage"],
+        "graph_id": correlation["graph_id"],
+        "node": correlation["node"],
         "stall_after": qraft_options.get("stall_after"),
         "hook_context": bool(qraft_options.get("hook_context", False)),
     }
@@ -608,7 +591,7 @@ def async_task(
     # runs outside it, against the winner's already-committed row.
     try:
         qraft_task, q2_task_id = _create_and_enqueue(
-            qraft_metadata, func, args, q2_kwargs, bind_stage=correlation["stage"]
+            qraft_metadata, func, args, q2_kwargs
         )
     except IntegrityError:
         existing_q2_task_id = (
@@ -653,7 +636,7 @@ def _create_workflow_task(
         qraft_iter_id: UUID of parent QraftIter (if part of iter)
         qraft_batch_id: UUID of parent QraftBatch (if part of batch)
         labels: Correlation fields copied from the workflow onto the member
-            (`subject_type`, `subject_id`, and later `run`/`stage`) - see
+            (`subject_type`, `subject_id`, and later `graph`/`node`) - see
             `workflow_member_labels`
 
     Returns:
@@ -728,14 +711,12 @@ def workflow_member_labels(workflow) -> dict:
     """
     Correlation fields a workflow copies onto every member it creates.
 
-    Members inherit the subject, run and stage so they filter and log
-    correctly; membership itself still rides on the workflow foreign keys, and
-    a member never binds or settles a stage - the workflow is the stage's one
-    completion unit.
+    Members inherit the subject, graph and node so they filter and log
+    correctly; membership itself still rides on the workflow foreign keys.
     """
     return {
         "subject_type": workflow.subject_type,
         "subject_id": workflow.subject_id,
-        "run_id": workflow.run_id,
-        "stage": workflow.stage,
+        "graph_id": workflow.graph_id,
+        "node": workflow.node,
     }
