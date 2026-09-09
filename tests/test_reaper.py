@@ -12,7 +12,7 @@ from qraft.reaper import reap_orphans, reconcile_finished, replay_unrouted
 
 STALE_AFTER = 60
 
-# Comfortably past max(3 * heartbeat_interval, MIN_HEARTBEAT_GRACE).
+# Comfortably past max(3 * heartbeat_interval, min_heartbeat_grace).
 DEAD_HEARTBEAT_AGE = 600
 
 
@@ -491,9 +491,9 @@ class TestHeartbeatGrace:
         self, settings, monkeypatch
     ):
         from qraft import conf
-        from qraft.reaper import MIN_HEARTBEAT_GRACE, _heartbeat_grace
+        from qraft.reaper import _heartbeat_grace
 
-        assert MIN_HEARTBEAT_GRACE == 90.0
+        assert conf.get_conf().min_heartbeat_grace == 90.0
         # Floor wins for a short interval, 3x wins for a long one.
         assert _heartbeat_grace(2.0) == 90.0
         assert _heartbeat_grace(60.0) == 180.0

@@ -27,13 +27,6 @@ from .retry import handle_task_retry
 
 logger = logging.getLogger("qraft")
 
-# Default floor on the heartbeat grace period, so a short heartbeat_interval
-# can't make the reaper trigger-happy under load or clock skew. Lowerable per
-# cluster through the `min_heartbeat_grace` setting: for a sub-second task the
-# floor, not `heartbeat_interval`, is what detection latency costs.
-MIN_HEARTBEAT_GRACE = 90.0
-
-
 def _heartbeat_grace(heartbeat_interval: float) -> float:
     """Seconds a heartbeat may go unrefreshed before the worker counts as dead."""
     return max(3 * heartbeat_interval, get_conf().min_heartbeat_grace)

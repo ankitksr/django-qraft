@@ -186,6 +186,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   called but never awaited. Django's async rules apply inside the coroutine: use the
   async ORM or `sync_to_async`, since the sync ORM raises `SynchronousOnlyOperation`
   under a running event loop
+- **Postgres concurrency tests** (`tests/test_postgres_concurrency.py`, marker
+  `postgres`) and a Postgres CI job. Every compare-and-swap in Qraft is a no-op under
+  SQLite, which ignores `select_for_update()`, so the settlement, delivery-claim,
+  progress-attribution, budget and subject-bind races are only really tested here
+- **A security model** in `docs/architecture.md`: the queue carries signed pickles, so
+  `SECRET_KEY` is a code-execution credential, not just a session secret
 - **End-to-end tests** (`tests/test_e2e.py`): the enqueue seam is no longer mocked
   everywhere. These drive the real path — `async_task()` writes an `OrmQ` row, Django-Q2's
   own `pusher`/`worker`/`monitor` loops run in-process, and the saved `Task` row fires
@@ -280,8 +286,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `qraft.pricing.cost()`, which returns a `Decimal` either way
 
 ### Planned
-- Coroutine tasks on the `django.tasks` backend
-- Nested workflow support
+- Chain and Batch as facades over the execution graph
 
 ## [1.3.0] - 2026-08-18
 
