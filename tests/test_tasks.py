@@ -860,78 +860,80 @@ class TestObservabilityOptions:
 
 
 @pytest.mark.django_db
-class TestRunOptions:
-    """run / stage in qraft_options: binding, inheritance, and the edge rules."""
+class TestGraphOptions:
+    """graph / node in qraft_options: correlation, inheritance, and edge rules."""
 
     @patch("qraft.tasks.q2_async_task")
-    def test_run_and_stage_bind_the_task_and_imply_the_subject(self, mock_q2_async):
-        from qraft import runs
-        from qraft.models.runs import QraftRunStage, StageStatus, UnitType
+    def test_graph_and_node_correlate_the_task_and_imply_the_subject(
+        self, mock_q2_async
+    ):
+        from qraft import graphs
 
-        mock_q2_async.return_value = "q2-run-1"
-        run_id = runs.start(subject=("worksheet", 4117), stages=["ingest", "rules"])
+        mock_q2_async.return_value = "q2-graph-1"
+        builder = graphs.Graph(subject=("worksheet", 4117))
+        builder.node(
+            "ingest", "tests.test_tasks._module_level_task", recovery="transactional"
+        )
+        builder.node(
+            "rules",
+            "tests.test_tasks._module_level_task",
+            after=("ingest",),
+            recovery="transactional",
+        )
+        graph_id = builder.start()
 
         async_task(
             "tests.test_tasks._module_level_task",
-            qraft_options={"run": run_id, "stage": "ingest"},
+            qraft_options={"graph": graph_id, "node": "rules"},
         )
 
-        task = QraftTask.objects.get()
-        assert str(task.run_id) == run_id and task.stage == "ingest"
-        assert (task.subject_type, task.subject_id) == ("worksheet", "4117")
-        stage = QraftRunStage.objects.get(run_id=run_id, name="ingest")
-        assert (stage.status, stage.unit_type, stage.unit_id) == (
-            StageStatus.BOUND,
-            UnitType.TASK,
-            task.id,
-        )
+        correlated = QraftTask.objects.exclude(graph_node__isnull=False).get()
+        assert str(correlated.graph_id) == graph_id and correlated.node == "rules"
+        assert (correlated.subject_type, correlated.subject_id) == ("worksheet", "4117")
 
     @patch("qraft.tasks.q2_async_task")
     def test_each_edge_rule_raises_and_enqueues_nothing(self, mock_q2_async):
-        from qraft import runs
+        from qraft import graphs
 
-        mock_q2_async.return_value = "q2-run-2"
-        run_id = runs.start(subject=("worksheet", 1), stages=["ingest"])
+        mock_q2_async.return_value = "q2-graph-2"
+        builder = graphs.Graph(subject=("worksheet", 1))
+        builder.node(
+            "ingest", "tests.test_tasks._module_level_task", recovery="transactional"
+        )
+        graph_id = builder.start()
 
         def enqueue(**options):
             async_task("tests.test_tasks._module_level_task", qraft_options=options)
 
-        # Rule 3: a stage the run did not declare.
-        with pytest.raises(runs.RunError, match="no stage named"):
-            enqueue(run=run_id, stage="nope")
-        # A different subject from the run's.
-        with pytest.raises(runs.RunError, match="differs from run"):
-            enqueue(run=run_id, stage="ingest", subject=("report", 2))
-        # A stage with no run at all.
-        with pytest.raises(runs.RunError, match="without a run"):
-            enqueue(stage="ingest")
-        # An unknown run.
-        with pytest.raises(runs.RunError, match="unknown run"):
-            enqueue(run="00000000-0000-0000-0000-000000000000", stage="ingest")
-        assert QraftTask.objects.count() == 0
+        with pytest.raises(graphs.GraphError, match="no node named"):
+            enqueue(graph=graph_id, node="nope")
+        with pytest.raises(graphs.GraphError, match="differs from graph"):
+            enqueue(graph=graph_id, node="ingest", subject=("report", 2))
+        with pytest.raises(graphs.GraphError, match="without a graph"):
+            enqueue(node="ingest")
+        with pytest.raises(graphs.GraphError, match="unknown graph"):
+            enqueue(graph="00000000-0000-0000-0000-000000000000", node="ingest")
+        assert QraftTask.objects.exclude(graph_node__isnull=False).count() == 0
 
-        enqueue(run=run_id, stage="ingest")
-        # Rule 2: the stage already has a unit.
-        with pytest.raises(runs.RunError, match="a stage runs once per run"):
-            enqueue(run=run_id, stage="ingest")
-        # Rule 1: the run is terminal.
-        runs.cancel(run_id)
-        with pytest.raises(runs.RunError, match="cancelled"):
-            enqueue(run=run_id, stage="ingest")
-        assert QraftTask.objects.count() == 1
+        enqueue(graph=graph_id, node="ingest")
+        graphs.cancel(graph_id)
+        with pytest.raises(graphs.GraphError, match="settled graph"):
+            enqueue(graph=graph_id, node="ingest")
+        assert QraftTask.objects.exclude(graph_node__isnull=False).count() == 1
 
     @patch("qraft.tasks.q2_async_task")
-    def test_workflow_members_inherit_run_and_stage_without_binding(
-        self, mock_q2_async
-    ):
-        from qraft import runs
+    def test_workflow_members_inherit_graph_and_node(self, mock_q2_async):
+        from qraft import graphs
         from qraft.iter import QraftIter
-        from qraft.models.runs import QraftRunStage, StageStatus, UnitType
 
         mock_q2_async.side_effect = [f"q2-m-{n}" for n in range(3)]
-        run_id = runs.start(subject=("worksheet", 5), stages=["rules"])
+        builder = graphs.Graph(subject=("worksheet", 5))
+        builder.node(
+            "rules", "tests.test_tasks._module_level_task", recovery="transactional"
+        )
+        graph_id = builder.start()
         workflow = QraftIter(
-            "tests.test_tasks._module_level_task", run=run_id, stage="rules"
+            "tests.test_tasks._module_level_task", graph=graph_id, node="rules"
         )
         for n in range(2):
             workflow.append(n)
@@ -939,14 +941,7 @@ class TestRunOptions:
 
         members = QraftTask.objects.filter(qraft_iter_id=workflow.id)
         assert members.count() == 2
-        assert {(str(m.run_id), m.stage) for m in members} == {(run_id, "rules")}
-        # The workflow is the unit; no member ever becomes one.
-        stage = QraftRunStage.objects.get(run_id=run_id, name="rules")
-        assert (stage.status, stage.unit_type, stage.unit_id) == (
-            StageStatus.BOUND,
-            UnitType.ITER,
-            workflow.id,
-        )
+        assert {(str(m.graph_id), m.node) for m in members} == {(graph_id, "rules")}
 
 
 @pytest.mark.django_db

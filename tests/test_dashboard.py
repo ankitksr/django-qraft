@@ -419,7 +419,9 @@ def test_state_payload_is_json_serializable_roundtrip(db, client, public):
 class TestSubjectFilterAndProgress:
     def test_filters_progress_age_and_metrics_health(self, db, client):
         now = timezone.now()
-        mine = _task(status=TaskStatus.RUNNING, subject_type="worksheet", subject_id="1")
+        mine = _task(
+            status=TaskStatus.RUNNING, subject_type="worksheet", subject_id="1"
+        )
         _attempt(
             mine,
             date_started=now - timedelta(seconds=30),
@@ -456,63 +458,74 @@ class TestSubjectFilterAndProgress:
 
 
 @pytest.mark.usefixtures("public")
-class TestRunsPanel:
-    def test_run_rows_carry_stages_badges_and_the_previous_run_link(self, db, client):
-        from qraft import runs
-        from qraft.models.runs import QraftRun, RunStatus, StageStatus
+class TestGraphsPanel:
+    def test_graph_rows_carry_nodes_badges_and_the_previous_graph_link(
+        self, db, client
+    ):
+        from qraft import graphs
+        from qraft.models.graphs import GraphStatus, NodeStatus, QraftGraph
 
-        first = runs.start(subject=("worksheet", "1"), stages=["ingest"])
-        runs.abandon(first, reason="never enqueued")
-        second = runs.start(
-            subject=("worksheet", "1"),
-            stages=["ingest", "rules"],
+        def start_graph(subject, nodes, **kwargs):
+            builder = graphs.Graph(subject=subject, **kwargs)
+            for key in nodes:
+                builder.node(
+                    key,
+                    "app.tasks.ingest",
+                    after=() if key == nodes[0] else (nodes[0],),
+                    recovery="transactional",
+                )
+            return builder.start()
+
+        first = start_graph(("worksheet", "1"), ["ingest"])
+        graphs.cancel(first)
+        second = start_graph(
+            ("worksheet", "1"),
+            ["ingest", "rules"],
             kind="shadow",
-            previous_run=first,
+            previous_graph=first,
         )
-        runs.skip(second, "rules", reason="nothing undecided")
-        QraftRun.objects.filter(id=second).update(overdue_flagged_at=timezone.now())
-        runs.start(subject=("worksheet", "2"), stages=["ingest"])
+        graphs.skip(second, "rules", reason="nothing undecided")
+        QraftGraph.objects.filter(id=second).update(overdue_flagged_at=timezone.now())
+        start_graph(("worksheet", "2"), ["ingest"])
 
         state = client.get("/qraft/api/state/").json()
-        assert len(state["runs"]) == 3
-        row = next(r for r in state["runs"] if r["id"] == second)
+        assert len(state["graphs"]) == 3
+        row = next(r for r in state["graphs"] if r["id"] == second)
         assert row["kind"] == "shadow"
-        assert row["status"] == RunStatus.OPEN
+        assert row["status"] == GraphStatus.RUNNING
         assert row["overdue"] is True
-        assert row["can_settle"] is True
-        assert row["previous_run_id"] == first
+        assert row["can_cancel"] is True
+        assert row["previous_graph_id"] == first
         assert row["elapsed"] >= 0
-        assert [(s["name"], s["status"]) for s in row["stages"]] == [
-            ("ingest", StageStatus.PENDING),
-            ("rules", StageStatus.SKIPPED),
+        assert [(n["key"], n["status"]) for n in row["nodes"]] == [
+            ("ingest", NodeStatus.RUNNING),
+            ("rules", NodeStatus.SKIPPED),
         ]
 
         filtered = client.get(
             "/qraft/api/state/?subject_type=worksheet&subject_id=1"
         ).json()
-        assert {r["id"] for r in filtered["runs"]} == {first, second}
-        by_run = client.get(f"/qraft/api/state/?run={second}").json()
-        assert [r["id"] for r in by_run["runs"]] == [second]
+        assert {r["id"] for r in filtered["graphs"]} == {first, second}
+        by_graph = client.get(f"/qraft/api/state/?graph={second}").json()
+        assert [r["id"] for r in by_graph["graphs"]] == [second]
 
-    def test_cancel_and_abandon_actions(self, db, client):
-        from qraft import runs
-        from qraft.models.runs import QraftRun, RunStatus
+    def test_cancel_action(self, db, client):
+        from qraft import graphs
+        from qraft.models.graphs import GraphStatus, QraftGraph
 
-        run_id = runs.start(subject=("worksheet", "1"), stages=["ingest"])
+        builder = graphs.Graph(subject=("worksheet", "1"))
+        builder.node("ingest", "app.tasks.ingest", recovery="transactional")
+        graph_id = builder.start()
 
-        assert client.post(f"/qraft/runs/cancel/{run_id}/").status_code == 200
-        assert QraftRun.objects.get(id=run_id).status == RunStatus.CANCELLED
+        assert client.post(f"/qraft/graphs/{graph_id}/cancel/").status_code == 200
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.CANCELLED
         # Repeating it is a conflict, not a silent second settlement.
-        assert client.post(f"/qraft/runs/cancel/{run_id}/").status_code == 409
-        assert client.get(f"/qraft/runs/cancel/{run_id}/").status_code == 405
-
-        other = runs.start(subject=("worksheet", "2"), stages=["ingest"])
-        assert client.post(f"/qraft/runs/abandon/{other}/").status_code == 200
-        assert QraftRun.objects.get(id=other).status == RunStatus.ABANDONED
+        assert client.post(f"/qraft/graphs/{graph_id}/cancel/").status_code == 409
+        assert client.get(f"/qraft/graphs/{graph_id}/cancel/").status_code == 405
 
         unknown = "00000000-0000-0000-0000-000000000000"
-        assert client.post(f"/qraft/runs/cancel/{unknown}/").status_code == 404
-        assert client.post(f"/qraft/runs/nope/{run_id}/").status_code == 404
+        assert client.post(f"/qraft/graphs/{unknown}/cancel/").status_code == 404
+        assert client.post(f"/qraft/graphs/nope/{graph_id}/").status_code == 404
 
 
 @pytest.mark.usefixtures("public")
@@ -536,8 +549,13 @@ class TestStallBadge:
         healthy = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
         _attempt(healthy, date_started=now - timedelta(minutes=1))
 
-        rows = {row["id"]: row for row in client.get("/qraft/api/state/").json()["tasks"]}
-        assert (rows[str(stalled.id)]["stalled"], rows[str(stalled.id)]["stall_recovered"]) == (
+        rows = {
+            row["id"]: row for row in client.get("/qraft/api/state/").json()["tasks"]
+        }
+        assert (
+            rows[str(stalled.id)]["stalled"],
+            rows[str(stalled.id)]["stall_recovered"],
+        ) == (
             True,
             False,
         )
@@ -587,42 +605,46 @@ class TestProgressOwnership:
 
 
 @pytest.mark.usefixtures("public")
-class TestRunStageLinks:
-    """A stage failure is one click from the run row, and named on it."""
+class TestGraphNodeLinks:
+    """A node failure is one click from the graph row, and named on it."""
 
-    def test_a_task_stage_carries_its_unit_link_and_exception(self, db, client):
-        from qraft import runs
-        from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+    def test_a_task_node_carries_its_task_link_and_exception(self, db, client):
+        from qraft import graphs
+        from qraft.models.graphs import NodeStatus, QraftGraphNode
 
-        run_id = runs.start(subject=("worksheet", "7"), stages=["ingest", "rules"])
-        task = QraftTask.objects.create(
-            func="revenue.tasks.ingest",
-            task_args=[],
-            task_kwargs={},
-            status=TaskStatus.EXHAUSTED,
-            run_id=run_id,
-            stage="ingest",
+        builder = graphs.Graph(subject=("worksheet", "7"))
+        builder.node("ingest", "revenue.tasks.ingest", recovery="transactional")
+        builder.node(
+            "rules", "revenue.tasks.rules", after=("ingest",), recovery="transactional"
         )
-        QraftTaskAttempt.objects.create(
-            qraft_task=task,
-            attempt_number=1,
-            q2_task_id="q2-stage-link",
-            success=False,
-            exception_class="IngestError",
+        graph_id = builder.start()
+
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="ingest")
+        task = node.task
+        from qraft.models import TaskStatus
+
+        task.status = TaskStatus.EXHAUSTED
+        task.save(update_fields=["status"])
+        from qraft.models import QraftTaskAttempt
+
+        QraftTaskAttempt.objects.filter(qraft_task=task).update(
+            success=False, exception_class="IngestError"
         )
-        runs.bind(run_id, "ingest", task)
+        QraftGraphNode.objects.filter(pk=node.pk).update(status=NodeStatus.FAILED)
 
         row = next(
-            r for r in client.get("/qraft/api/state/").json()["runs"] if r["id"] == run_id
+            r
+            for r in client.get("/qraft/api/state/").json()["graphs"]
+            if r["id"] == graph_id
         )
-        ingest = next(s for s in row["stages"] if s["name"] == "ingest")
-        assert ingest["unit_id"] == str(task.id)
+        ingest = next(n for n in row["nodes"] if n["key"] == "ingest")
+        assert ingest["task_id"] == str(task.id)
         assert ingest["error"] == "IngestError"
         # The admin is deliberately not installed in the test project, so the
         # link degrades to None rather than raising.
-        assert ingest["unit_url"] is None
+        assert ingest["task_url"] is None
 
-        unbound = next(s for s in row["stages"] if s["name"] == "rules")
-        assert unbound["unit_id"] == ""
-        assert unbound["unit_url"] is None
-        assert unbound["error"] == ""
+        pending = next(n for n in row["nodes"] if n["key"] == "rules")
+        assert pending["task_id"] == ""
+        assert pending["task_url"] is None
+        assert pending["error"] == ""

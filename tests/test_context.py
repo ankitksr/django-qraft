@@ -276,60 +276,62 @@ class TestDecimalUsage:
 
 @pytest.mark.django_db
 class TestConsumeBudget:
-    """A run's provider allowance, spent one request at a time."""
+    """A graph's provider allowance, spent one request at a time."""
 
-    def _run(self, budgets=None):
-        from qraft import runs
+    def _graph(self, budgets=None):
+        from qraft import graphs
 
-        return runs.start(
-            ("worksheet", 1), ["ai"], budgets=budgets or {"openai_requests": 2}
+        builder = graphs.Graph(
+            subject=("worksheet", 1), budgets=budgets or {"openai_requests": 2}
         )
+        builder.node("ai", "tests.e2e_tasks.succeed", recovery="transactional")
+        return builder.start()
 
     def test_each_call_decrements_and_the_last_one_raises(self):
         from qraft.context import BudgetExhausted, consume_budget, remaining_budget
 
-        run_id = self._run()
+        graph_id = self._graph()
 
-        assert consume_budget("openai_requests", run_id=run_id) == 1
-        assert consume_budget("openai_requests", run_id=run_id) == 0
-        assert remaining_budget("openai_requests", run_id=run_id) == 0
+        assert consume_budget("openai_requests", graph_id=graph_id) == 1
+        assert consume_budget("openai_requests", graph_id=graph_id) == 0
+        assert remaining_budget("openai_requests", graph_id=graph_id) == 0
         with pytest.raises(BudgetExhausted):
-            consume_budget("openai_requests", run_id=run_id)
+            consume_budget("openai_requests", graph_id=graph_id)
         # The refusal spends nothing: the balance never goes negative.
-        assert remaining_budget("openai_requests", run_id=run_id) == 0
+        assert remaining_budget("openai_requests", graph_id=graph_id) == 0
 
     def test_a_spend_larger_than_the_balance_is_refused_whole(self):
         from qraft.context import BudgetExhausted, consume_budget, remaining_budget
 
-        run_id = self._run()
+        graph_id = self._graph()
 
         with pytest.raises(BudgetExhausted):
-            consume_budget("openai_requests", 3, run_id=run_id)
-        assert remaining_budget("openai_requests", run_id=run_id) == 2
-        assert consume_budget("openai_requests", 2, run_id=run_id) == 0
+            consume_budget("openai_requests", 3, graph_id=graph_id)
+        assert remaining_budget("openai_requests", graph_id=graph_id) == 2
+        assert consume_budget("openai_requests", 2, graph_id=graph_id) == 0
 
-    def test_an_undeclared_key_and_no_run_are_both_unmetered(self, db):
+    def test_an_undeclared_key_and_no_graph_are_both_unmetered(self, db):
         from qraft.context import consume_budget, remaining_budget
 
-        run_id = self._run()
+        graph_id = self._graph()
 
-        assert consume_budget("anthropic_requests", run_id=run_id) is None
-        assert remaining_budget("anthropic_requests", run_id=run_id) is None
+        assert consume_budget("anthropic_requests", graph_id=graph_id) is None
+        assert remaining_budget("anthropic_requests", graph_id=graph_id) is None
         assert consume_budget("openai_requests") is None
 
-    def test_it_charges_the_executing_attempts_run(self):
+    def test_it_charges_the_executing_attempts_graph(self):
         from qraft import context
         from qraft.context import consume_budget
         from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 
-        run_id = self._run()
+        graph_id = self._graph()
         task = QraftTask.objects.create(
             func="tests.e2e_tasks.succeed",
             task_args=[],
             task_kwargs={},
             status=TaskStatus.RUNNING,
-            run_id=run_id,
-            stage="ai",
+            graph_id=graph_id,
+            node="ai",
         )
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task, attempt_number=1, q2_task_id="q2-budget"
@@ -339,13 +341,17 @@ class TestConsumeBudget:
         assert consume_budget("openai_requests") == 1
 
     def test_a_fractional_budget_is_refused_at_start(self):
-        from qraft import runs
+        from qraft import graphs
 
-        with pytest.raises(runs.RunError, match="whole number"):
-            runs.start(("worksheet", 1), ["ai"], budgets={"openai_requests": 2.5})
+        builder = graphs.Graph(
+            subject=("worksheet", 1), budgets={"openai_requests": 2.5}
+        )
+        builder.node("ai", "tests.e2e_tasks.succeed", recovery="transactional")
+        with pytest.raises(graphs.GraphError, match="whole number"):
+            builder.start()
 
     def test_a_non_positive_spend_is_a_programming_error(self):
         from qraft.context import consume_budget
 
         with pytest.raises(ValueError):
-            consume_budget("openai_requests", 0, run_id=self._run())
+            consume_budget("openai_requests", 0, graph_id=self._graph())

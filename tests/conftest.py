@@ -192,8 +192,9 @@ def signal_log():
         "task_settled",
         "workflow_settled",
         "attempt_stall_suspected",
-        "run_settled",
-        "run_overdue",
+        "node_settled",
+        "graph_settled",
+        "graph_overdue",
     )
     log: dict[str, list] = {name: [] for name in names}
     receivers = []

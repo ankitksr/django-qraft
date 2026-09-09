@@ -117,78 +117,104 @@ class TestProgressRace:
         assert task.progress["attempt_id"] == str(attempt.id)
 
 
-class TestRunSettlementRace:
-    def test_two_units_settling_at_once_settle_the_run_exactly_once(self, signal_log):
+class TestGraphSettlementRace:
+    def test_two_nodes_settling_at_once_settle_the_graph_exactly_once(self, signal_log):
         """
-        The last two stages of a run finish on different workers at the same
-        moment. Without the run's row lock both derivations read "one stage
-        still BOUND" and neither settles, or both do; with it, exactly one
+        The last two nodes of a graph finish on different workers at the same
+        moment. Without the graph's row lock both derivations read "one node
+        still RUNNING" and neither settles, or both do; with it, exactly one
         wins the settled_at compare-and-swap.
         """
-        from qraft import runs
-        from qraft.models.runs import QraftRun, QraftRunStage, RunStatus, StageStatus
+        from qraft import graphs
+        from qraft.models.graphs import (
+            GraphStatus,
+            NodeStatus,
+            QraftGraph,
+            QraftGraphNode,
+        )
 
-        run_id = runs.start(subject=("worksheet", "race"), stages=["rules", "ai"])
-        units = {}
-        for stage in ("rules", "ai"):
-            task = QraftTask.objects.create(
-                func=f"app.tasks.{stage}",
-                status=TaskStatus.SUCCEEDED,
-                run_id=run_id,
-                stage=stage,
-                subject_type="worksheet",
-                subject_id="race",
+        builder = graphs.Graph(subject=("worksheet", "race"))
+        builder.node("root", "app.tasks.root", recovery="transactional")
+        builder.node(
+            "rules", "app.tasks.rules", after=("root",), recovery="transactional"
+        )
+        builder.node("ai", "app.tasks.ai", after=("root",), recovery="transactional")
+        graph_id = builder.start()
+
+        root = QraftGraphNode.objects.get(graph_id=graph_id, key="root")
+        root_task = root.task
+        root_task.status = TaskStatus.SUCCEEDED
+        root_task.save(update_fields=["status"])
+        root_attempt = root_task.attempts.order_by("-attempt_number").first()
+        QraftTaskAttempt.objects.filter(pk=root_attempt.pk).update(
+            success=True, date_completed=timezone.now()
+        )
+        graphs.handle_node_completion(root_task, root_attempt)
+        nodes = {
+            key: QraftGraphNode.objects.get(graph_id=graph_id, key=key)
+            for key in ("rules", "ai")
+        }
+        for node in nodes.values():
+            node.refresh_from_db()
+            task = node.task
+            task.status = TaskStatus.SUCCEEDED
+            task.save(update_fields=["status"])
+            attempt = task.attempts.order_by("-attempt_number").first()
+            QraftTaskAttempt.objects.filter(pk=attempt.pk).update(
+                success=True, date_completed=timezone.now()
             )
-            runs.bind(run_id, stage, task)
-            units[stage] = task
 
         run_concurrently(
-            *(lambda task=task: runs.note_unit_settled(task) for task in units.values())
+            *(
+                lambda node=node: graphs.handle_node_completion(
+                    node.task, node.task.attempts.latest("attempt_number")
+                )
+                for node in nodes.values()
+            )
         )
 
-        run = QraftRun.objects.get(id=run_id)
-        assert run.status == RunStatus.SUCCEEDED
-        assert run.summary["outcome"] == RunStatus.SUCCEEDED
+        graph = QraftGraph.objects.get(id=graph_id)
+        assert graph.status == GraphStatus.SUCCEEDED
+        assert graph.summary["outcome"] == GraphStatus.SUCCEEDED
         assert set(
-            QraftRunStage.objects.filter(run_id=run_id).values_list("status", flat=True)
-        ) == {StageStatus.SUCCEEDED}
-        assert len(signal_log["run_settled"]) == 1
+            QraftGraphNode.objects.filter(graph_id=graph_id).values_list(
+                "status", flat=True
+            )
+        ) == {NodeStatus.SUCCEEDED}
+        assert len(signal_log["graph_settled"]) == 1
 
-    def test_a_bind_racing_a_cancel_leaves_no_orphan_binding(self):
+    def test_a_skip_racing_a_cancel_leaves_a_consistent_outcome(self):
         """
-        The bind takes the run's row lock before it checks the status, so a
-        cancel either commits first (the bind raises) or second (the bind is
-        recorded and the run settles CANCELLED). A stage bound to a task under
-        a run that never saw it is the outcome the lock rules out.
+        Skip and cancel both take the graph's row lock. One commits first and
+        the other either raises or records a consistent terminal state.
         """
-        from qraft import runs
-        from qraft.models.runs import QraftRun, QraftRunStage, RunStatus, StageStatus
+        from qraft import graphs
+        from qraft.models.graphs import GraphStatus, NodeStatus, QraftGraphNode
 
-        run_id = runs.start(subject=("worksheet", "race2"), stages=["ingest"])
-        task = QraftTask.objects.create(
-            func="app.tasks.ingest",
-            status=TaskStatus.RUNNING,
-            run_id=run_id,
-            stage="ingest",
-            subject_type="worksheet",
-            subject_id="race2",
+        builder = graphs.Graph(subject=("worksheet", "race2"))
+        builder.node("ingest", "app.tasks.ingest", recovery="transactional")
+        builder.node(
+            "rules", "app.tasks.rules", after=("ingest",), recovery="transactional"
         )
+        graph_id = builder.start()
         refused = []
 
-        def bind():
+        def skip_rules():
             try:
-                runs.bind(run_id, "ingest", task)
-            except runs.RunError:
+                graphs.skip(graph_id, "rules", reason="race")
+            except graphs.GraphError:
                 refused.append(True)
 
-        run_concurrently(bind, lambda: runs.cancel(run_id))
+        run_concurrently(skip_rules, lambda: graphs.cancel(graph_id))
 
-        assert QraftRun.objects.get(id=run_id).status == RunStatus.CANCELLED
-        stage = QraftRunStage.objects.get(run_id=run_id, name="ingest")
+        from qraft.models.graphs import QraftGraph
+
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.CANCELLED
+        rules = QraftGraphNode.objects.get(graph_id=graph_id, key="rules")
         if refused:
-            assert (stage.status, stage.unit_id) == (StageStatus.PENDING, None)
+            assert rules.status in (NodeStatus.PENDING, NodeStatus.SKIPPED)
         else:
-            assert (stage.status, stage.unit_id) == (StageStatus.BOUND, task.id)
+            assert rules.status == NodeStatus.SKIPPED
 
 
 class TestStallFlagRace:
@@ -387,7 +413,7 @@ class TestBudgetRace:
         run_concurrently(spend, spend)
 
         assert sorted(outcomes, key=str) == [0, "exhausted"]
-        assert remaining_budget("openai_requests", run_id=run_id) == 0
+        assert remaining_budget("openai_requests", graph_id=graph_id) == 0
 
 
 class TestParallelCounterRace:

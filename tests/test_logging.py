@@ -28,8 +28,9 @@ class TestQraftContextFilter:
         assert record.qraft_task_id == ""
         assert record.qraft_attempt_id == ""
         assert record.qraft_attempt_number == ""
-        assert record.qraft_run_id == ""
-        assert record.qraft_stage == ""
+        assert record.qraft_graph_id == ""
+        assert record.qraft_node_key == ""
+        assert record.qraft_generation == ""
         assert record.qraft_subject_type == ""
         assert record.qraft_subject_id == ""
 

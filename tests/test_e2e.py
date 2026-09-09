@@ -463,56 +463,51 @@ class TestObservabilityEndToEnd:
         assert first.enqueued_at is not None and retry.enqueued_at is not None
         assert retry.enqueued_at >= first.enqueued_at
 
-    def test_a_two_stage_run_settles_from_its_own_success_path(self, clean_queue):
+    def test_a_two_node_graph_settles_with_duration_and_on_settled(self, clean_queue):
         """
-        The shape the run primitive exists for: stage two is enqueued by stage
-        one's success hook, not by a static step list, and the run still
-        settles once with a duration and one durable `on_settled` dispatch.
+        A graph with two dependent nodes settles once with a duration and one
+        durable `on_settled` dispatch after both nodes complete.
         """
-        from qraft import runs
+        from qraft import graphs
         from qraft.models import WorkflowHookDispatch
-        from qraft.models.runs import QraftRun, RunStatus, StageStatus, UnitType
+        from qraft.models.graphs import GraphStatus, NodeStatus
 
         started = timezone.now() - timedelta(seconds=5)
-        run_id = runs.start(
+        builder = graphs.Graph(
             subject=("worksheet", 4117),
-            stages=["one", "two"],
             kind="shadow",
             started_at=started,
             on_settled="tests.e2e_tasks.run_is_ready",
         )
-        async_task(
+        builder.node("one", "tests.e2e_tasks.succeed", "one", recovery="transactional")
+        builder.node(
+            "two",
             "tests.e2e_tasks.succeed",
-            "kappa",
-            qraft_options={
-                "run": run_id,
-                "stage": "one",
-                "hook_context": True,
-                "success_hook": "tests.e2e_tasks.bind_second_stage",
-                "success_args": ["kappa"],
-            },
+            "two",
+            after=("one",),
+            recovery="transactional",
         )
+        graph_id = builder.start()
 
         settle()
 
-        run = QraftRun.objects.get(id=run_id)
-        assert run.status == RunStatus.SUCCEEDED
-        assert run.settled_at is not None
-        assert run.summary["duration_s"] >= 5
-        stages = {stage["name"]: stage for stage in run.summary["stages"]}
-        assert stages["one"]["unit_type"] == UnitType.TASK
-        assert stages["two"]["unit_type"] == UnitType.BATCH
-        assert {s["outcome"] for s in run.summary["stages"]} == {StageStatus.SUCCEEDED}
+        graph = graphs.get(graph_id)
+        assert graph.status == GraphStatus.SUCCEEDED
+        assert graph.settled_at is not None
+        assert graph.summary["duration_s"] >= 5
+        nodes = {node["key"]: node for node in graph.summary["nodes"]}
+        assert nodes["one"]["outcome"] == NodeStatus.SUCCEEDED
+        assert nodes["two"]["outcome"] == NodeStatus.SUCCEEDED
 
         assert (
             WorkflowHookDispatch.objects.filter(
-                workflow_type="run", workflow_id=run_id, hook_type="settled"
+                workflow_type="graph", workflow_id=graph_id, hook_type="settled"
             ).count()
             == 1
         )
         (context,) = e2e_tasks.CALLS["run_is_ready"]
-        assert context["outcome"] == RunStatus.SUCCEEDED
-        assert context["stages"] == {"one": "succeeded", "two": "succeeded"}
+        assert context["outcome"] == GraphStatus.SUCCEEDED
+        assert context["nodes"] == {"one": "succeeded", "two": "succeeded"}
         assert context["duration_s"] >= 5
 
     def test_a_stalled_attempt_is_flagged_and_still_finishes(self, clean_queue):
