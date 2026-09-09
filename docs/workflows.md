@@ -148,172 +148,158 @@ chain = QraftChain(
 )
 ```
 
-## Runs
+## Graphs
 
-A chain owns its steps up front. A pipeline whose stages enqueue each other from
-application code does not, and forcing it into a static step list means a chain per
-branch. A run is the lighter primitive for that shape: it declares the names of the
-stages it expects, and the application binds whatever it likes under them.
+A chain owns its steps up front. When the full pipeline topology is known at submission
+time, declare it as an execution graph: explicit `after` edges between nodes, qraft-owned
+dispatch, and quiescent settlement when nothing is running and nothing can start.
 
 ```python
-from qraft import runs
+from qraft import graphs
 
-run_id = runs.start(
+builder = graphs.Graph(
     subject=("worksheet", 4117),
-    stages=["ingest", "rules", "ai"],
-    kind="shadow",                           # a metric label; keep it bounded
-    revision="rules@v7",                     # never a label
-    started_at=report.received_at,           # optional; defaults to now
-    on_settled="revenue.hooks.run_settled",  # optional durable hook
+    kind="shadow",                             # a metric label; keep it bounded
+    revision="rules@v7",                       # never a label
+    started_at=report.received_at,             # optional; defaults to now
+    on_settled="revenue.hooks.graph_settled",  # optional durable hook
+    budgets={"openai_requests": 40},           # optional request budgets
+    cluster="io-workers",                      # default cluster for nodes
 )
-
-async_task("revenue.tasks.ingest", worksheet_id,
-           qraft_options={"run": run_id, "stage": "ingest"})
-
-batch = QraftBatch(run=run_id, stage="rules")   # the batch is the unit
-batch.append("revenue.tasks.revenue_pass", worksheet_id)
-batch.append("revenue.tasks.entity_pass", worksheet_id)
-batch.run()
+builder.node(
+    "ingest", "revenue.tasks.ingest", worksheet_id,
+    recovery="transactional",
+    qraft_options={"max_attempts": 3},
+)
+builder.node(
+    "rules", "revenue.tasks.rules_pass", worksheet_id,
+    after=("ingest",),
+    recovery="idempotent",
+)
+builder.node(
+    "ai", "revenue.tasks.ai_summary", worksheet_id,
+    after=("rules",),
+    recovery="manual",
+)
+graph_id = builder.start()
 ```
 
-`start()` returns the run id. A run implies its subject: a task or workflow that names
-the run and no subject inherits it, and one that names a different subject raises.
+`start()` validates the topology (unique keys, known dependencies, no cycles), writes
+`QraftGraph` and `QraftGraphNode` rows in one transaction, and dispatches every root
+node. Each dispatch creates a `QraftTask`, binds it to the node row, and enqueues the
+first attempt through `scheduler.schedule_attempt()` — the same path retries use.
+
+Every node must declare `recovery` (`transactional`, `idempotent`, or `manual`). The
+column exists for phase-2 resume; today it is recorded on the node and surfaced in
+`snapshot()`.
+
+`start()` returns the graph id. A graph implies its subject: correlated work that names
+the graph and no subject inherits it, and one that names a different subject raises.
 
 ### Binding the subject later
 
-The stage that creates the domain object a run is about is often the run's own first
-stage. Keying the run on whatever row existed beforehand splits one domain object across
-two subject types, and the dashboard's subject filter then answers half the question.
+The node that creates the domain object the graph is about may need to run before the
+subject exists. Keying the graph on whatever row existed beforehand splits one object
+across two subject types.
 
-`subject` may be omitted at `start()` and named once afterwards:
+`subject` may be omitted on the builder and named once afterwards:
 
 ```python
-run_id = runs.start(None, stages=["ingest", "rules", "ai"])
-async_task("revenue.tasks.ingest", event_log_id,
-           qraft_options={"run": run_id, "stage": "ingest"})
+builder = graphs.Graph()
+builder.node("ingest", "revenue.tasks.ingest", event_log_id, recovery="transactional")
+builder.node("rules", "revenue.tasks.rules", after=("ingest",), recovery="transactional")
+graph_id = builder.start()
 
 # ...inside the ingest task, once the worksheet exists:
-runs.bind_subject(run_id, ("worksheet", worksheet.pk))
+graphs.bind_subject(graph_id, ("worksheet", worksheet.pk))
 ```
 
-`runs.bind_subject(run_id, subject)` is allowed once, while the run is `OPEN` and its
-subject is unset; a second call and a settled run both raise `RunError`. It updates the
-run and every member already bound to it — tasks, chains, iters and batches — in one
-transaction under the run's row lock, so the dashboard and admin subject filters find
-the whole run, not the part enqueued after the bind. A member created at the same moment
-takes that same lock, so it either lands before the bind and is updated by it or waits
-and reads the bound subject. `QraftRun.bind_subject(subject_type, subject_id)` is the
-same call on the model instance.
+`graphs.bind_subject(graph_id, subject)` is allowed once, while the graph is `RUNNING`
+and the subject is unset; a second call and a settled graph both raise `GraphError`. It
+updates the graph and every member already bound to it — tasks, chains, iters and batches —
+in one transaction under the graph's row lock. `QraftGraph.bind_subject(subject_type,
+subject_id)` is the same call on the model instance.
 
-Until the bind, a member that names a subject of its own still raises: that is the case
-`bind_subject` exists for, and taking it silently would leave the run unlabelled.
+### Dispatch and settlement
 
-### One stage, one completion unit
+Qraft owns dispatch. When a node settles (`SUCCEEDED`, `FAILED`, `SKIPPED`, or
+`CANCELLED`), the frontier is re-evaluated and every pending node whose `after`
+dependencies are all `SUCCEEDED` or `SKIPPED` is dispatched. Nodes at the same depth
+with no dependency between them run in parallel.
 
-A stage is bound to exactly one unit — a `QraftTask` or one workflow — and settles when
-that unit does. A plain `async_task` with `run` and `stage` binds at enqueue; a workflow
-constructed with them binds at `run()`, the moment work is committed.
-
-A stage that needs several tasks uses an `Iter` or a `Batch`, whose membership closes at
-`run()` and whose completion the parallel dispatcher already tracks. Members inherit
-`run` and `stage` so they filter and log correctly, but a member's outcome never touches
-the stage row — only the unit's does.
-
-"Any successful task settles the stage" was the alternative and it is wrong the moment a
-stage has more than one task: a rules stage with three passes, one finished and two
-running, would settle, and a later failure could not reopen it.
-
-### Settlement
-
-When a unit settles, its outcome is recorded on its stage row under the run's lock, and
-two rules apply:
-
-- a `FAILED` or `CANCELLED` stage fails the run, immediately;
-- otherwise, once every stage is `SUCCEEDED` or `SKIPPED`, the run succeeds.
-
-Both are the `settled_at` compare-and-swap, so a run settles exactly once. A run whose
-remaining stages have no unit stays `OPEN` — that is correct and visible, not something
-Qraft times out on.
-
-Explicit close was rejected as the only mechanism: the code that knows the pipeline is
-done is the last stage's success path, the one place a crash loses the call. Deriving
-from "no live members" was rejected too, because between stage N committing and stage
-N+1's row existing the run has zero live members.
+The graph settles on quiescence — nothing `RUNNING`, nothing `PENDING` that could still
+be dispatched — not on the first failure. A failed node blocks its descendants; siblings
+already in flight finish. The graph outcome is `FAILED` if any node failed, `CANCELLED` if
+any was cancelled, otherwise `SUCCEEDED` when every node is `SUCCEEDED` or `SKIPPED`.
+Settlement is one compare-and-swap on `settled_at`, so it fires exactly once.
 
 ### Edge rules
 
-Each is enforced at the bind, where a mistake is cheap. All raise `runs.RunError`.
+Each is enforced where the mistake is cheap. All raise `graphs.GraphError`.
 
-1. Enqueueing into a terminal run raises.
-2. Binding a stage that already has a unit raises. A stage runs once per run.
-3. Binding a stage the run did not declare raises.
-4. `runs.skip(run_id, stage, reason)` marks an unbound stage `SKIPPED`; skipping a stage
-   that has a unit raises. A skipped stage still lets the run succeed — a skip is a
-   decision the application made, not a failure Qraft observed.
-5. `runs.cancel(run_id)` settles the run `CANCELLED`. Further binds raise. Units already
-   in flight are not revoked: they finish, and their outcomes are still recorded on their
-   stage rows. Only the run's own status and its `summary` are closed to them — the
-   snapshot is written at settlement and a settled run is never mutated (rule 9).
-6. `runs.abandon(run_id, reason)` settles an `OPEN` run `ABANDONED` — the operator's tool
-   for a stage that was never enqueued. Also a dashboard action and an admin action.
-7. `QraftChain.resume()` on a chain bound to a run proceeds only while the run is `OPEN`.
-   A bound chain fails its run the moment it fails, so in practice the expected path
-   after a failure is a new run.
-8. Stage order is display order. Qraft does not enforce that `rules` waits for `ingest`.
-9. A settled run is never mutated. A rerun is a new run with `previous_run` pointing at
-   the old one; the dashboard shows the link.
+1. `graphs.skip(graph_id, node_key, reason)` marks a `PENDING` node `SKIPPED`; skipping a
+   running or settled node raises. Skipped dependencies unblock descendants the same way
+   successful ones do.
+2. `graphs.cancel(graph_id)` settles the graph `CANCELLED`. A second call raises. Work
+   already in flight is not revoked; nodes still record their outcomes.
+3. Correlating work onto a terminal graph raises.
+4. A settled graph is never mutated. A rerun is a new graph with `previous_graph` pointing
+   at the old one.
+5. `start(request_key=...)` is idempotent: the same key and plan hash return the existing
+   graph; the same key with a different plan raises.
 
 ### The durable completion event
 
-`on_settled` is dispatched through the same idempotency the workflow hooks use, with a
-`WorkflowHookDispatch` row keyed `("run", run_id, "settled")`. Because a run settles once
-and is never reopened, that pair is a stable event identity the application can dedupe
-on. The hook receives one `context` dict: `run_id`, `subject_type`, `subject_id`, `kind`,
-`revision`, `metadata`, `outcome`, `stages` (name to outcome), `started_at`,
-`settled_at`, `duration_s`, `previous_run_id`.
+`on_settled` is dispatched through the same idempotency workflow hooks use, with a
+`WorkflowHookDispatch` row keyed `("graph", graph_id, "settled")`. The hook receives one
+`context` dict: `graph_id`, `subject_type`, `subject_id`, `kind`, `revision`, `metadata`,
+`outcome`, `generation`, `nodes` (key to outcome), `started_at`, `settled_at`,
+`duration_s`, `previous_graph_id`.
 
-The hook is queued after the settlement commits, so a crash in that window would lose it.
-Two things close that: a replayed unit settlement offers the hook again, and the reaper
-sweeps settled runs whose dispatch row is missing. The `WorkflowHookDispatch` row is what
-keeps either recovery to one dispatch.
+The hook is queued after settlement commits. `replay_settled_hooks()` re-offers it for
+settled graphs whose dispatch row is missing.
 
-The `run_settled` signal fires beside it for observers. The hook is what a "worksheet
-ready" transition hangs on — see [Signals](hooks.md#best-effort-by-design) for why.
+`graph_settled` and `node_settled` fire beside the hook for observers. Metrics:
+`qraft.graph.settled`, `qraft.graph.duration`, `qraft.graph.report_to_ready` (success
+only), `qraft.node.settled`, `qraft.node.duration`.
 
-### Summary, retention and overdue
+### Snapshot, budgets and overdue
 
-At settlement the run writes a `summary`: per stage the unit type and id, outcome,
-`bound_at`, `settled_at` and duration; the run's duration; and the usage aggregated over
-every member attempt. Retention may later prune the member rows; the run keeps the
-answer. Tasks and workflows under a run that is still `OPEN` are never pruned, in either
-pass. A terminal run is pruned after its members, with its stages cascading — and only
-once no member is still live, since a cancel does not revoke work in flight and that work
-still has an outcome to record.
+`graphs.snapshot(graph_id)` returns a JSON-safe view: graph metadata, `frontier` (pending
+nodes ready to dispatch), per-node status, `blocked_by`, attempts, usage, and recovery
+mode. It is the visibility contract for dashboards and consumers.
 
-`QRAFT_RUN_OVERDUE_AFTER` (seconds, default None) turns on a sweep in the reaper thread:
-an `OPEN` run older than the threshold gets `overdue_flagged_at` set once, `run_overdue`
-is sent, and the dashboard shows a badge. Nothing fails automatically — an unenqueued
-stage is an application defect, and `skip`, `cancel` and `abandon` are the tools for it.
+`budgets` on the builder declares request allowances; `qraft.context.consume_budget(key)`
+spends them atomically.
 
-### Why not nested workflows
+`QRAFT_GRAPH_OVERDUE_AFTER` (seconds, default None; falls back to `QRAFT_RUN_OVERDUE_AFTER`)
+turns on a reaper sweep: a `RUNNING` graph older than the threshold gets
+`overdue_flagged_at` set once and `graph_overdue` is sent. Nothing fails automatically —
+`skip` and `cancel` are the tools for it.
 
-A chain of chains would model this pipeline too, and it stays on the roadmap. It is the
-heavier fit here: a chain owns its steps' definitions before execution and enqueues each
-one itself, while the motivating pipeline decides what to enqueue next inside application
-code. A run whose stage is a chain already works under this design.
+At settlement the graph writes a `summary`: per-node task id, outcome, dispatch and settle
+times, duration, skip reason, and generation; the graph duration; and usage aggregated
+over every member attempt.
+
+### Correlation from inside a node task
+
+`qraft.context.current_node()` returns the executing node's identity — graph id, node key,
+generation, task and attempt ids, subject, and graph metadata — or `None` outside a graph
+node delivery.
 
 ## Correlation kwargs
 
-Every constructor takes `subject=`, `run=`, `stage=` and `hook_context=`:
+Every constructor takes `subject=`, `graph=`, `node=` and `hook_context=`:
 
 ```python
 batch = QraftBatch(subject=('worksheet', 4117), hook_context=True)
-batch = QraftBatch(run=run_id, stage='rules')   # subject inherited from the run
+batch = QraftBatch(graph=graph_id, node='rules')   # subject inherited from the graph
 ```
 
-`subject`, `run` and `stage` are copied onto every member the workflow creates, so a
-member filters and logs under the same entity; membership itself is still tracked through
-the workflow foreign keys, and a member never binds or settles a stage.
+`subject`, `graph` and `node` are copied onto every member the workflow creates, so a
+member filters and logs under the same entity; membership itself still rides on the
+workflow foreign keys. Graph node tasks are dispatched by qraft, not `async_task`; members
+correlated onto a graph node never settle it.
 `hook_context` gives the workflow-level hooks — `on_cancelled` included — one extra
 `context` keyword argument carrying the workflow's id, type, outcome and counters. See
 [Hooks](hooks.md#hook-context).
@@ -370,13 +356,13 @@ Workflow state is stored in the database:
 | `QraftChainStep` | Individual step definition + link to QraftTask |
 | `QraftIterModel` | Iter metadata, atomic counters |
 | `QraftBatchModel` | Batch metadata, atomic counters |
-| `WorkflowHookDispatch` | Idempotent workflow hook and run `on_settled` tracking |
-| `QraftRun` | Run metadata, status, `settled_at`, `summary` |
-| `QraftRunStage` | One declared stage and the unit bound to it |
+| `WorkflowHookDispatch` | Idempotent workflow hook and graph `on_settled` tracking |
+| `QraftGraph` | Graph metadata, status, `settled_at`, `summary` |
+| `QraftGraphNode` | One declared node, its task binding, and outcome |
 
-All three workflow models carry `subject_type`, `subject_id`, `run`, `stage` and
-`settled_at`; `QraftTask` carries the same four correlation columns. `run` is `SET_NULL`
-on both: deleting a run must never delete work.
+All three workflow models carry `subject_type`, `subject_id`, `graph`, `node` and
+`settled_at`; `QraftTask` carries the same four correlation columns. `graph` is `SET_NULL`
+on both: deleting a graph must never delete work.
 
 ## Status Lifecycle
 

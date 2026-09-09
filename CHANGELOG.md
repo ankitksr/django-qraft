@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Execution graphs (phase 1).** `QraftRun` / `QraftRunStage` evolve into `QraftGraph` /
+  `QraftGraphNode` with explicit `after` edges, scheduler-owned dispatch,
+  quiescent settlement, per-node hooks, `qraft.context.current_node()`,
+  `graphs.snapshot()`, dashboard cancel/skip, and signal/metric renames to
+  `graph_settled`, `node_settled`, and `qraft.graph.*` / `qraft.node.*`. Migration
+  `0016_graphs`. No resume yet (`generation` and `recovery` columns exist for phase 2/3).
+
+### Added
 - **A finished task stops heartbeating, and says when it finished.**
   `qraft.runner.run_task` stamps the new `QraftTaskAttempt.returned_at` and stops the
   lease heartbeat as soon as the target returns or raises, rather than at the monitor's
