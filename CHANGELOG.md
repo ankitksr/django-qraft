@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Approval gates on graph nodes.** `requires_approval=True` parks a node at
+  `WAITING_APPROVAL` once its dependencies are met, and `graphs.approve()` /
+  `graphs.reject()` release or refuse it. The gate stops its own node, never its siblings,
+  and a graph parked at one is neither settled nor swept as overdue. Migration `0018`
 - **Completion receipts for graph nodes.** `qraft.graphs.publish()` is a transaction in
   which the application's writes and the node's receipt commit together, so a crash
   between the two is impossible and a resume's kept set is a fact rather than a guess. The

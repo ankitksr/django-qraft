@@ -315,6 +315,28 @@ For a provider call no transaction can help: the call may be billed a moment bef
 worker dies. Declare such a node `idempotent`, key the application's own deduplication on
 the identity `current_node()` supplies, and do not expect exactly-once.
 
+### Approval gates
+
+A node can park for a person before it runs:
+
+```python
+g.node("publish", "app.tasks.publish", after=["rules"],
+       recovery="transactional", requires_approval=True)
+
+graphs.approve(graph_id, "publish")
+graphs.reject(graph_id, "publish", reason="numbers look wrong")
+```
+
+Once its dependencies are met the node goes to `WAITING_APPROVAL` instead of dispatching.
+The gate stops that node and nothing else: siblings on the same frontier still run. When
+no node is left running and one is parked, the graph itself reads `WAITING_APPROVAL` — it
+is not settled and not failed, and the overdue sweep leaves it alone, because waiting on a
+person is not running late.
+
+`approve()` dispatches the node under the graph's lock, so a cancel arriving afterwards
+finds either a parked node or a dispatched one and never the gap between them. `reject()`
+cancels the node with its reason and the graph settles cancelled.
+
 ### Edge rules
 
 Each is enforced where the mistake is cheap. All raise `graphs.GraphError`.

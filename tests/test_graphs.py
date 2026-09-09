@@ -795,3 +795,93 @@ class TestCommittedOutputSurvivesALostResult:
             QraftGraphNode.objects.get(pk=node.pk).status == NodeStatus.SUCCEEDED
         )
         assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.SUCCEEDED
+
+
+class TestApproval:
+    """A gated node parks for a person; its siblings carry on."""
+
+    def _gated_graph(self):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        builder.node(
+            "publish",
+            TASK,
+            after=("ingest",),
+            recovery=RECOVERY,
+            requires_approval=True,
+        )
+        add_node(builder, "audit", after=("ingest",))
+        graph_id = builder.start()
+        complete_node(graph_id, "ingest")
+        return graph_id
+
+    def test_a_gated_node_parks_while_its_siblings_dispatch(self):
+        graph_id = self._gated_graph()
+
+        nodes = {n.key: n for n in QraftGraphNode.objects.filter(graph_id=graph_id)}
+        assert nodes["publish"].status == NodeStatus.WAITING_APPROVAL
+        assert nodes["publish"].task_id is None
+        # The gate stops its own node, not the frontier.
+        assert nodes["audit"].status == NodeStatus.RUNNING
+
+    def test_the_graph_waits_rather_than_settling(
+        self, signal_log, django_capture_on_commit_callbacks
+    ):
+        graph_id = self._gated_graph()
+        with django_capture_on_commit_callbacks(execute=True):
+            complete_node(graph_id, "audit")
+
+        graph = QraftGraph.objects.get(id=graph_id)
+        assert graph.status == GraphStatus.WAITING_APPROVAL
+        assert graph.settled_at is None
+        assert signal_log["graph_settled"] == []
+
+    def test_approving_dispatches_the_node_and_resumes_the_graph(
+        self, django_capture_on_commit_callbacks
+    ):
+        graph_id = self._gated_graph()
+        complete_node(graph_id, "audit")
+
+        graphs.approve(graph_id, "publish")
+
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="publish")
+        assert node.status == NodeStatus.RUNNING
+        assert node.task_id is not None
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.RUNNING
+
+        with django_capture_on_commit_callbacks(execute=True):
+            complete_node(graph_id, "publish")
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.SUCCEEDED
+
+    def test_rejecting_cancels_the_graph_with_its_reason(
+        self, django_capture_on_commit_callbacks
+    ):
+        graph_id = self._gated_graph()
+        complete_node(graph_id, "audit")
+
+        with django_capture_on_commit_callbacks(execute=True):
+            graphs.reject(graph_id, "publish", reason="numbers look wrong")
+
+        node = QraftGraphNode.objects.get(graph_id=graph_id, key="publish")
+        assert node.status == NodeStatus.CANCELLED
+        assert node.skip_reason == "numbers look wrong"
+        assert QraftGraph.objects.get(id=graph_id).status == GraphStatus.CANCELLED
+
+    def test_approving_a_node_that_is_not_parked_is_refused(self):
+        graph_id = self._gated_graph()
+        with pytest.raises(graphs.GraphError, match="not\\s+waiting for approval"):
+            graphs.approve(graph_id, "audit")
+        with pytest.raises(graphs.GraphError, match="no node"):
+            graphs.approve(graph_id, "nope")
+
+    def test_an_overdue_sweep_leaves_a_parked_graph_alone(self, settings):
+        settings.QRAFT_GRAPH_OVERDUE_AFTER = 60
+        graph_id = self._gated_graph()
+        complete_node(graph_id, "audit")
+        QraftGraph.objects.filter(id=graph_id).update(
+            date_started=timezone.now() - timezone.timedelta(hours=1)
+        )
+
+        # Waiting on a person is not running late.
+        assert graphs.flag_overdue() == 0
+        assert QraftGraph.objects.get(id=graph_id).overdue_flagged_at is None

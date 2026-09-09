@@ -102,6 +102,7 @@ class Graph:
         *args,
         after=(),
         recovery: str,
+        requires_approval: bool = False,
         qraft_options: dict | None = None,
         **kwargs,
     ):
@@ -124,6 +125,7 @@ class Graph:
                 "task_kwargs": kwargs,
                 "after": list(after),
                 "recovery": recovery,
+                "requires_approval": requires_approval,
                 "options": options,
             }
         )
@@ -181,6 +183,7 @@ class Graph:
                         task_kwargs=spec["task_kwargs"],
                         options=spec["options"],
                         recovery=spec["recovery"],
+                        requires_approval=spec["requires_approval"],
                     )
                 )
             QraftGraphNode.objects.bulk_create(node_rows)
@@ -610,6 +613,59 @@ def _rerun_closure(graph: QraftGraph, nodes: list[str] | None) -> set[str]:
     return {key for key in closure if all_nodes[key].status != NodeStatus.PENDING}
 
 
+def approve(graph_id, node_key: str) -> None:
+    """Release a node parked at its gate and dispatch it."""
+    with transaction.atomic():
+        graph = _locked(graph_id)
+        node = _node(graph, node_key)
+        if node.status != NodeStatus.WAITING_APPROVAL:
+            raise GraphError(
+                f"node {node_key!r} of graph {graph_id} is {node.status}, not "
+                "waiting for approval"
+            )
+        QraftGraphNode.objects.filter(pk=node.pk).update(status=NodeStatus.PENDING)
+        node.refresh_from_db()
+        # Under the same lock: a cancel landing after the commit must find
+        # either a parked node or a dispatched one, never the gap.
+        _dispatch_node(graph, node)
+        if graph.status == GraphStatus.WAITING_APPROVAL:
+            QraftGraph.objects.filter(pk=graph.pk).update(
+                status=GraphStatus.RUNNING, date_updated=timezone.now()
+            )
+
+
+def reject(graph_id, node_key: str, reason: str | None = None) -> None:
+    """Refuse a node parked at its gate; the graph fails on quiescence."""
+    now = timezone.now()
+    settled = None
+    with transaction.atomic():
+        graph = _locked(graph_id)
+        node = _node(graph, node_key)
+        if node.status != NodeStatus.WAITING_APPROVAL:
+            raise GraphError(
+                f"node {node_key!r} of graph {graph_id} is {node.status}, not "
+                "waiting for approval"
+            )
+        QraftGraphNode.objects.filter(pk=node.pk).update(
+            status=NodeStatus.CANCELLED,
+            settled_at=now,
+            skip_reason=reason,
+        )
+        if graph.status == GraphStatus.WAITING_APPROVAL:
+            QraftGraph.objects.filter(pk=graph.pk).update(status=GraphStatus.RUNNING)
+            graph.refresh_from_db()
+        settled = _maybe_settle(graph, now)
+    if settled is not None:
+        _dispatch_settled_hook(settled)
+
+
+def _node(graph: QraftGraph, node_key: str) -> QraftGraphNode:
+    node = graph.nodes.filter(key=node_key).first()
+    if node is None:
+        raise GraphError(f"graph {graph.id} has no node {node_key!r}")
+    return node
+
+
 def _dispatch_frontier(graph_id) -> None:
     """Dispatch every pending node whose dependencies are met."""
     graph = _locked(graph_id)
@@ -617,6 +673,13 @@ def _dispatch_frontier(graph_id) -> None:
         return
     ready = _ready_nodes(graph)
     for node in ready:
+        if node.requires_approval:
+            # A gate stops its own node, never its siblings: the rest of the
+            # frontier still dispatches.
+            QraftGraphNode.objects.filter(pk=node.pk, status=NodeStatus.PENDING).update(
+                status=NodeStatus.WAITING_APPROVAL
+            )
+            continue
         _dispatch_node(graph, node)
 
 
@@ -757,6 +820,14 @@ def _maybe_settle(graph: QraftGraph, now):
         return _settle(graph, GraphStatus.FAILED, now)
     if NodeStatus.CANCELLED in statuses:
         return _settle(graph, GraphStatus.CANCELLED, now)
+    if NodeStatus.WAITING_APPROVAL in statuses:
+        # A graph parked at a gate is not settled and not failed. It waits for
+        # a person, and the overdue sweep leaves it alone because that sweep
+        # only looks at running graphs.
+        QraftGraph.objects.filter(pk=graph.pk, status=GraphStatus.RUNNING).update(
+            status=GraphStatus.WAITING_APPROVAL, date_updated=now
+        )
+        return None
     if statuses <= {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED}:
         return _settle(graph, GraphStatus.SUCCEEDED, now)
     return None

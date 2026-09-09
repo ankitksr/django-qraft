@@ -16,6 +16,7 @@ class GraphStatus(models.TextChoices):
     SUCCEEDED = "succeeded", "Succeeded"
     FAILED = "failed", "Failed"
     CANCELLED = "cancelled", "Cancelled"
+    WAITING_APPROVAL = "waiting_approval", "Waiting approval"
 
 
 TERMINAL_GRAPH_STATUSES = (
@@ -34,6 +35,7 @@ class NodeStatus(models.TextChoices):
     FAILED = "failed", "Failed"
     CANCELLED = "cancelled", "Cancelled"
     SKIPPED = "skipped", "Skipped"
+    WAITING_APPROVAL = "waiting_approval", "Waiting approval"
 
 
 SETTLED_NODE_STATUSES = (
@@ -270,6 +272,11 @@ class QraftGraphNode(models.Model):
         default=1,
         db_default=1,
         help_text="Bumped on resume; the task FK is the generation marker",
+    )
+    requires_approval = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Park the node for a person once its dependencies are met",
     )
     receipt = models.JSONField(
         null=True,
