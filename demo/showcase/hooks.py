@@ -25,6 +25,25 @@ def on_failure(run: str, label: str) -> None:
     _logger.info("failure hook %s/%s", run, label)
 
 
+async def on_success_async(run: str, label: str) -> None:
+    """
+    Coroutine hook; the Event after the await proves it was awaited.
+
+    Async ORM only: sync ORM raises SynchronousOnlyOperation inside a
+    running event loop, for hooks just as for tasks.
+    """
+    import asyncio
+
+    await asyncio.sleep(0.05)
+    await Event.objects.acreate(
+        run=run,
+        kind=Event.HOOK,
+        name=f"success:{label}",
+        payload={"pid": os.getpid(), "awaited": True},
+    )
+    _logger.info("async success hook %s/%s", run, label)
+
+
 def on_workflow_success(run: str, label: str) -> None:
     record(run, Event.HOOK, f"wf-success:{label}", pid=os.getpid())
     _logger.info("workflow success hook %s/%s", run, label)

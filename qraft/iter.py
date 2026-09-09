@@ -51,6 +51,10 @@ class QraftIter(ParallelWorkflow):
         failure_args: tuple = (),
         failure_kwargs: dict | None = None,
         iter_id: UUID | str | None = None,
+        subject: tuple | None = None,
+        run=None,
+        stage: str | None = None,
+        hook_context: bool = False,
     ):
         self._items = []
 
@@ -61,22 +65,34 @@ class QraftIter(ParallelWorkflow):
         if iter_id:
             self._model = QraftIterModel.objects.get(id=iter_id)
         else:
+            from qraft import runs
+            from qraft.tasks import parse_subject
+
             merged_options = qraft_options or {}
             if cluster is not None:
                 merged_options = {**merged_options, "cluster": cluster}
-
-            self._model = QraftIterModel.objects.create(
-                func=func,
-                default_qraft_options=merged_options,
-                success_hook=on_success,
-                success_args=list(success_args),
-                success_kwargs=success_kwargs or {},
-                failure_hook=on_failure,
-                failure_args=list(failure_args),
-                failure_kwargs=failure_kwargs or {},
-                on_cancelled=on_cancelled,
-                progress_hook=progress_hook,
-            )
+            subject_type, subject_id = parse_subject(subject)
+            # The run's row lock is held across the insert, so a
+            # concurrent runs.bind_subject() cannot leave this workflow with
+            # a null subject it never backfills.
+            with runs.correlating(run, stage, subject_type, subject_id) as correlation:
+                self._model = QraftIterModel.objects.create(
+                    func=func,
+                    default_qraft_options=merged_options,
+                    success_hook=on_success,
+                    success_args=list(success_args),
+                    success_kwargs=success_kwargs or {},
+                    failure_hook=on_failure,
+                    failure_args=list(failure_args),
+                    failure_kwargs=failure_kwargs or {},
+                    on_cancelled=on_cancelled,
+                    progress_hook=progress_hook,
+                    subject_type=correlation["subject_type"],
+                    subject_id=correlation["subject_id"],
+                    run_id=correlation["run_id"],
+                    stage=correlation["stage"],
+                    hook_context=hook_context,
+                )
 
         _logger.debug("Initialized QraftIter %s for func %s", self._model.id, func)
 
@@ -113,8 +129,9 @@ class QraftIter(ParallelWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError(f"Iter already run (status: {self._model.status})")
 
-        from qraft.tasks import _create_workflow_task
+        from qraft.tasks import _create_workflow_task, workflow_member_labels
 
+        labels = workflow_member_labels(self._model)
         # One transaction for the publish and the whole fan-out: a failure
         # creating any member rolls back total_count/RUNNING too, instead of
         # leaving an unfinishable workflow with a partial member set. The
@@ -128,6 +145,7 @@ class QraftIter(ParallelWorkflow):
                 self._model.save(
                     update_fields=["total_count", "status", "date_updated"]
                 )
+                self._bind_to_run()
 
                 for idx, item in enumerate(self._items):
                     _create_workflow_task(
@@ -136,6 +154,7 @@ class QraftIter(ParallelWorkflow):
                         kwargs=item["kwargs"],
                         qraft_options=self._model.default_qraft_options,
                         qraft_iter_id=self._model.id,
+                        labels=labels,
                     )
                     _logger.debug(
                         "Queued iter task %d/%d (iter=%s)",

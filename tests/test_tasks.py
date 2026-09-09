@@ -574,8 +574,16 @@ class TestWorkflowMemberOptKeyCollision:
             qraft_iter_id=iter_model.id,
         )
 
+        # The member's own kwargs ride inside run_task's arguments, not as
+        # Django-Q2 keywords, so an opt_key collision cannot reach them.
+        assert mock_q2_async.call_args[0] == (
+            "qraft.runner.run_task",
+            "test.function",
+            [],
+            {"payload": {"n": 1}},
+        )
         call_kwargs = mock_q2_async.call_args[1]
-        assert call_kwargs["payload"] == {"n": 1}
+        assert "payload" not in call_kwargs
         assert call_kwargs["save"] is True
         assert call_kwargs["hook"] == "qraft.hooks.qraft_hook_handler"
 
@@ -709,3 +717,268 @@ class TestCallableValidation:
         partial_func = functools.partial(_module_level_task)
         with pytest.raises(ValueError, match="__module__/__name__"):
             async_task(partial_func)
+
+
+async def _async_module_task(x, y=None):
+    """Importable coroutine target for the reroute tests."""
+    return (x, y)
+
+
+@pytest.mark.django_db
+class TestCoroutineDispatch:
+    """
+    Django-Q2's workers call the target directly, so a coroutine function
+    must be rerouted through qraft.runner.run_task (which awaits it) at
+    enqueue - the same path every retry already takes.
+    """
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_coroutine_callable_dispatches_through_run_task(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-async-1"
+
+        async_task(_async_module_task, 1, y="v")
+
+        dispatched = mock_q2_async.call_args
+        assert dispatched[0][0] == "qraft.runner.run_task"
+        assert dispatched[0][1:] == (
+            f"{__name__}._async_module_task",
+            [1],
+            {"y": "v"},
+        )
+        # The function's kwargs ride inside run_task's arguments, not as
+        # Django-Q2 keywords.
+        assert "y" not in dispatched[1]
+        # Metadata still records the real target for retries/observability.
+        qraft_task = QraftTask.objects.get()
+        assert qraft_task.func == f"{__name__}._async_module_task"
+        assert qraft_task.task_args == [1]
+        assert qraft_task.task_kwargs == {"y": "v"}
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_coroutine_dotted_path_dispatches_through_run_task(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-async-2"
+
+        async_task(f"{__name__}._async_module_task", 2)
+
+        assert mock_q2_async.call_args[0][0] == "qraft.runner.run_task"
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_a_sync_target_is_dispatched_through_run_task_too(self, mock_q2_async):
+        """
+        Every attempt goes through the wrapper, not only coroutines: the
+        wrapper is where a broker redelivery is refused.
+        """
+        mock_q2_async.return_value = "q2-sync-1"
+
+        async_task(_module_level_task)
+
+        assert mock_q2_async.call_args[0] == (
+            "qraft.runner.run_task",
+            f"{__name__}._module_level_task",
+            [],
+            {},
+        )
+        assert QraftTask.objects.get().func == f"{__name__}._module_level_task"
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_an_unimportable_path_still_rides_inside_run_task(self, mock_q2_async):
+        """The worker fails loudly on the path either way; the wrapper stays."""
+        mock_q2_async.return_value = "q2-unimportable"
+
+        async_task("test.module.function", 1)
+
+        assert mock_q2_async.call_args[0] == (
+            "qraft.runner.run_task",
+            "test.module.function",
+            [1],
+            {},
+        )
+
+    def test_run_task_awaits_a_coroutine_target(self):
+        from qraft.runner import run_task
+
+        assert run_task(f"{__name__}._async_module_task", [3], {"y": "z"}) == (3, "z")
+
+
+@pytest.mark.django_db
+class TestObservabilityOptions:
+    """subject / hook_context in qraft_options, enqueue stamps, inheritance."""
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_subject_and_hook_context_are_stored_and_enqueue_is_stamped(
+        self, mock_q2_async
+    ):
+        mock_q2_async.return_value = "q2-subject"
+        async_task(
+            "tests.test_tasks._module_level_task",
+            qraft_options={"subject": ("worksheet", 4117), "hook_context": True},
+        )
+        task = QraftTask.objects.get()
+        assert (task.subject_type, task.subject_id) == ("worksheet", "4117")
+        assert task.hook_context is True
+        attempt = task.attempts.get()
+        assert attempt.enqueued_at is not None
+        assert attempt.trace_context is None  # no span current at enqueue
+
+        # `subject` is a qraft option, never a function kwarg.
+        assert "subject" not in mock_q2_async.call_args.kwargs
+        assert task.task_kwargs == {}
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_defaults_are_the_1_3_behaviour(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-plain"
+        async_task("tests.test_tasks._module_level_task")
+        task = QraftTask.objects.get()
+        assert (task.subject_type, task.subject_id) == (None, None)
+        assert task.hook_context is False
+
+    def test_malformed_subject_raises(self):
+        for bad in ("worksheet", ("worksheet",), ("", 1), ("worksheet", None)):
+            with pytest.raises(ValueError, match="subject"):
+                async_task(
+                    "tests.test_tasks._module_level_task",
+                    qraft_options={"subject": bad},
+                )
+        assert QraftTask.objects.count() == 0
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_workflow_members_inherit_the_subject(self, mock_q2_async):
+        from qraft.iter import QraftIter
+
+        mock_q2_async.side_effect = [f"q2-member-{n}" for n in range(3)]
+        workflow = QraftIter(
+            "tests.test_tasks._module_level_task", subject=("worksheet", 7)
+        )
+        for n in range(3):
+            workflow.append(n)
+        workflow.run()
+
+        members = QraftTask.objects.filter(qraft_iter_id=workflow.id)
+        assert members.count() == 3
+        assert {(m.subject_type, m.subject_id) for m in members} == {("worksheet", "7")}
+        assert set(QraftTask.objects.for_subject("worksheet", 7)) == set(members)
+
+
+@pytest.mark.django_db
+class TestRunOptions:
+    """run / stage in qraft_options: binding, inheritance, and the edge rules."""
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_run_and_stage_bind_the_task_and_imply_the_subject(self, mock_q2_async):
+        from qraft import runs
+        from qraft.models.runs import QraftRunStage, StageStatus, UnitType
+
+        mock_q2_async.return_value = "q2-run-1"
+        run_id = runs.start(subject=("worksheet", 4117), stages=["ingest", "rules"])
+
+        async_task(
+            "tests.test_tasks._module_level_task",
+            qraft_options={"run": run_id, "stage": "ingest"},
+        )
+
+        task = QraftTask.objects.get()
+        assert str(task.run_id) == run_id and task.stage == "ingest"
+        assert (task.subject_type, task.subject_id) == ("worksheet", "4117")
+        stage = QraftRunStage.objects.get(run_id=run_id, name="ingest")
+        assert (stage.status, stage.unit_type, stage.unit_id) == (
+            StageStatus.BOUND,
+            UnitType.TASK,
+            task.id,
+        )
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_each_edge_rule_raises_and_enqueues_nothing(self, mock_q2_async):
+        from qraft import runs
+
+        mock_q2_async.return_value = "q2-run-2"
+        run_id = runs.start(subject=("worksheet", 1), stages=["ingest"])
+
+        def enqueue(**options):
+            async_task("tests.test_tasks._module_level_task", qraft_options=options)
+
+        # Rule 3: a stage the run did not declare.
+        with pytest.raises(runs.RunError, match="no stage named"):
+            enqueue(run=run_id, stage="nope")
+        # A different subject from the run's.
+        with pytest.raises(runs.RunError, match="differs from run"):
+            enqueue(run=run_id, stage="ingest", subject=("report", 2))
+        # A stage with no run at all.
+        with pytest.raises(runs.RunError, match="without a run"):
+            enqueue(stage="ingest")
+        # An unknown run.
+        with pytest.raises(runs.RunError, match="unknown run"):
+            enqueue(run="00000000-0000-0000-0000-000000000000", stage="ingest")
+        assert QraftTask.objects.count() == 0
+
+        enqueue(run=run_id, stage="ingest")
+        # Rule 2: the stage already has a unit.
+        with pytest.raises(runs.RunError, match="a stage runs once per run"):
+            enqueue(run=run_id, stage="ingest")
+        # Rule 1: the run is terminal.
+        runs.cancel(run_id)
+        with pytest.raises(runs.RunError, match="cancelled"):
+            enqueue(run=run_id, stage="ingest")
+        assert QraftTask.objects.count() == 1
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_workflow_members_inherit_run_and_stage_without_binding(
+        self, mock_q2_async
+    ):
+        from qraft import runs
+        from qraft.iter import QraftIter
+        from qraft.models.runs import QraftRunStage, StageStatus, UnitType
+
+        mock_q2_async.side_effect = [f"q2-m-{n}" for n in range(3)]
+        run_id = runs.start(subject=("worksheet", 5), stages=["rules"])
+        workflow = QraftIter(
+            "tests.test_tasks._module_level_task", run=run_id, stage="rules"
+        )
+        for n in range(2):
+            workflow.append(n)
+        workflow.run()
+
+        members = QraftTask.objects.filter(qraft_iter_id=workflow.id)
+        assert members.count() == 2
+        assert {(str(m.run_id), m.stage) for m in members} == {(run_id, "rules")}
+        # The workflow is the unit; no member ever becomes one.
+        stage = QraftRunStage.objects.get(run_id=run_id, name="rules")
+        assert (stage.status, stage.unit_type, stage.unit_id) == (
+            StageStatus.BOUND,
+            UnitType.ITER,
+            workflow.id,
+        )
+
+
+@pytest.mark.django_db
+class TestStallOption:
+    @patch("qraft.tasks.q2_async_task")
+    def test_stall_after_is_stored_on_the_task_and_inherited_by_members(
+        self, mock_q2_async
+    ):
+        from qraft.iter import QraftIter
+
+        mock_q2_async.return_value = "q2-stall"
+        async_task(
+            "tests.test_tasks._module_level_task", qraft_options={"stall_after": 120}
+        )
+        assert QraftTask.objects.get().stall_after == 120
+
+        mock_q2_async.side_effect = [f"q2-sm-{n}" for n in range(2)]
+        workflow = QraftIter(
+            "tests.test_tasks._module_level_task",
+            qraft_options={"stall_after": 45},
+        )
+        workflow.append(1)
+        workflow.run()
+        member = QraftTask.objects.get(qraft_iter_id=workflow.id)
+        assert member.stall_after == 45
+
+    @patch("qraft.tasks.q2_async_task")
+    def test_it_defaults_to_off_and_is_not_a_retry_policy_key(self, mock_q2_async):
+        mock_q2_async.return_value = "q2-no-stall"
+        async_task(
+            "tests.test_tasks._module_level_task", qraft_options={"max_attempts": 2}
+        )
+        task = QraftTask.objects.get()
+        assert task.stall_after is None
+        assert "stall_after" not in task.retry_policy

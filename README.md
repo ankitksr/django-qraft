@@ -124,7 +124,39 @@ async_task('myapp.tasks.summarize', doc_id,
 
 Provider throttling (429/503/529) retries with forced exponential backoff and honors `Retry-After`, separate from your hard-error budget.
 
+Set `stall_after` and the reaper distinguishes a task that is alive from one that is
+moving: an attempt whose heartbeat is fresh but whose progress has not advanced is flagged,
+signalled and marked on the dashboard. It is never retried automatically — the original
+attempt is still running and still writing.
+
+With an optional `QRAFT_PRICING` table, recorded tokens become money, priced per increment
+so an attempt that calls two models is not billed at one rate.
+
 [Learn more →](docs/ai-workloads.md)
+
+### 🔭 Subjects, Runs and Signals
+Every task can name the domain entity it is for, and a run gives a pipeline whose stages
+enqueue each other one row that spans them — with a durable completion hook and one number
+for end-to-end latency.
+
+```python
+from qraft import runs
+
+run_id = runs.start(subject=('worksheet', 4117), stages=['ingest', 'rules', 'ai'],
+                    on_settled='revenue.hooks.worksheet_ready')
+
+async_task('revenue.tasks.ingest', 4117,
+           qraft_options={'run': run_id, 'stage': 'ingest'})
+
+QraftTask.objects.for_subject('worksheet', 4117)   # every task for one entity
+```
+
+Qraft also emits signals about its own transitions (`task_settled`, `workflow_settled`,
+`run_settled`, …), all `send_robust` and all carrying ids rather than model instances, plus
+an optional OpenTelemetry metrics sink, a logging filter and W3C trace propagation across
+the enqueue boundary.
+
+[Learn more →](docs/workflows.md#runs)
 
 ### ⏱️ Exact-Delay Scheduling
 Delayed work (retries, requeues, `run_after` tasks) is a Qraft-owned row dispatched at its due time — a 2-second backoff fires in about 2 seconds, not on Django-Q2's 30-second scheduler cycle. Priority and target cluster survive the delay.
@@ -254,8 +286,8 @@ task_id = async_task(
 - [Dual-Phase Hooks](docs/hooks.md) - Success and failure hook system
 - [Retry Policies](docs/retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](docs/threading.md) - Concurrency for I/O-bound tasks
-- [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, and approval steps
-- [AI Workloads](docs/ai-workloads.md) - Rate limits, throttling, usage accounting, idempotency, reaper, priority lanes
+- [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, approval steps, and runs
+- [AI Workloads](docs/ai-workloads.md) - Subjects, rate limits, throttling, usage and cost, idempotency, reaper, stall observation, priority lanes
 - [Monitoring Dashboard](docs/dashboard.md) - Bundled staff dashboard with live metrics and JSON endpoints
 - [django.tasks Backend](docs/django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
 
@@ -281,7 +313,10 @@ QRAFT_CLUSTER = {
 }
 ```
 
-**Result**: 8-10x throughput improvement over standard workers for I/O-bound tasks.
+**Result**: in-flight concurrency scales with `workers × threads` rather than `workers`, so
+an I/O-bound workload spends its wait time on other tasks. Measure your own workload with
+`python manage.py demo perf` in the demo app — it runs the same tasks against a threaded
+and a non-threaded cluster side by side.
 
 [Threading Guide →](docs/threading.md)
 
@@ -412,19 +447,21 @@ python manage.py demo reaper
 
 **Threading speedup** (I/O-bound tasks):
 
-| Configuration | Concurrent Tasks | Speedup |
-|---------------|------------------|---------|
+| Configuration | Concurrent Tasks | Expected Throughput |
+|---------------|------------------|---------------------|
 | 2 workers, threads=1 | 2 | 1x (baseline) |
 | 2 workers, threads=4 | 8 | 3-4x |
 | 2 workers, threads=8 | 16 | 6-8x |
 
-**Note**: Threading provides no speedup for CPU-bound tasks due to Python's GIL.
+**Note**: These are modelled ceilings for tasks that are almost entirely I/O wait, not
+measured results — real speedup depends on how much of the task is wait. Threading provides
+no speedup at all for CPU-bound tasks, because of Python's GIL.
 
 [Threading Guide →](docs/threading.md)
 
 ## Testing
 
-Django-Qraft has a comprehensive test suite (75% coverage; the admin UI is excluded and verified manually via the demo app):
+Django-Qraft has a comprehensive test suite at 85% line coverage, with CI gated at 72%. `qraft/admin.py` is excluded and verified manually via the demo app, and `qraft/backend.py` only reports coverage on Django 6.0+, where its tests run. `tests/test_e2e.py` runs the whole path — real broker, real worker, real hook handler — with nothing stubbed.
 
 ```bash
 # Run all tests
@@ -467,7 +504,7 @@ ruff check qraft/
 Django-Qraft maintains full backward compatibility with Django-Q2:
 
 - ✅ All Django-Q2 broker types run Qraft tasks; the ORM broker on PostgreSQL is the only one with full guarantees — every other broker loses delivery receipts and priority lanes, halves the reaper, and makes an enqueue visible before its transaction commits ([what degrades](docs/configuration.md#broker-support))
-- ✅ Existing `Q_CLUSTER` settings work (with deprecation warning)
+- ✅ Existing `Q_CLUSTER` settings keep configuring Django-Q2; Qraft's own settings live in `QRAFT_CLUSTER` ([what Qraft reads from `Q_CLUSTER`](docs/configuration.md#q_cluster-still-belongs-to-django-q2))
 - ✅ Standard `qcluster` command continues to work
 - ✅ Tasks queued via Django-Q2's `async_task` work seamlessly
 - ✅ Drop-in replacement, no breaking changes
@@ -478,7 +515,11 @@ Django-Qraft maintains full backward compatibility with Django-Q2:
 - [x] **v1.2.0**: Orphan reaper, rate-limit-aware retries, idempotency keys, usage accounting, approval steps, cross-worker throttling, priority lanes, `django.tasks` backend
 - [x] **v1.2.1**: Execution lease with heartbeat, dead letter queue, `TaskContext` and deferred tasks on the `django.tasks` backend
 - [x] **v1.3.0**: Qraft-owned scheduling (exact delays, priority-preserving retries), monitoring dashboard, retention sweep, cluster routing
-- [ ] Coroutine tasks on the `django.tasks` backend
+- [ ] **Unreleased** (on `main`, not yet tagged): observability — subjects, signals, a
+  metrics sink, log context and trace propagation; runs and stages with derived
+  settlement and request budgets; cost from usage; stall observation; per-cluster
+  brokers; the redelivery guard; coroutine tasks
+  ([details](docs/roadmap.md#shipped-after-130-unreleased))
 - [ ] Nested workflow support
 
 [Future Plans →](docs/future/)

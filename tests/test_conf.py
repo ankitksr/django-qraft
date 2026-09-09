@@ -191,6 +191,30 @@ class TestDjangoSettingsIntegration:
             assert settings.threads == 1
 
     @patch("qraft.conf.django_settings")
+    def test_gauge_ownership_is_not_inherited_by_alt_clusters(
+        self, mock_django_settings
+    ):
+        """
+        One process reports the fleet-wide backlog. An alt cluster gets the
+        flag only by asking for it, or a base entry that names the default
+        cluster as the owner would make every other cluster an owner too.
+        """
+        mock_django_settings.QRAFT_CLUSTER = {
+            "metrics_gauges": True,
+            "ALT_CLUSTERS": {
+                "io-workers": {"threads": 8},
+                "gauge-owner": {"metrics_gauges": True},
+            },
+        }
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert QraftSettings().metrics_gauges is True
+        with patch.dict(os.environ, {"Q_CLUSTER_NAME": "io-workers"}):
+            assert QraftSettings().metrics_gauges is False
+        with patch.dict(os.environ, {"Q_CLUSTER_NAME": "gauge-owner"}):
+            assert QraftSettings().metrics_gauges is True
+
+    @patch("qraft.conf.django_settings")
     def test_alt_clusters_override_defaults(self, mock_django_settings):
         """Test that ALT_CLUSTERS override default settings."""
         mock_django_settings.QRAFT_CLUSTER = {
@@ -278,23 +302,6 @@ class TestGetConf:
         # LRU cache returns same instance for same cluster name
         assert conf1 is conf2
         assert conf1.threads == 2
-
-
-class TestRetryBackoff:
-    """Tests for RetryBackoff enum."""
-
-    def test_enum_values(self):
-        """Test retry backoff enum values."""
-        assert RetryBackoff.EXPONENTIAL.value == "exponential"
-        assert RetryBackoff.LINEAR.value == "linear"
-        assert RetryBackoff.FIXED.value == "fixed"
-
-    def test_enum_membership(self):
-        """Test checking enum membership."""
-        assert "exponential" in {strategy.value for strategy in RetryBackoff}
-        assert "linear" in {strategy.value for strategy in RetryBackoff}
-        assert "fixed" in {strategy.value for strategy in RetryBackoff}
-        assert "invalid" not in {strategy.value for strategy in RetryBackoff}
 
 
 class TestRetentionInheritance:

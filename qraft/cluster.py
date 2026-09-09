@@ -17,6 +17,7 @@ from django_q.conf import setproctitle
 from django_q.monitor import monitor
 from django_q.worker import worker
 
+from .brokers import delivering_broker
 from .conf import get_conf
 from .worker import threaded_worker
 
@@ -31,6 +32,7 @@ def _broker_supports_receipts(broker) -> bool:
     delivery (e.g. the ORM broker) override them. Checking for the override
     is more robust than hardcoding broker class names.
     """
+    broker = delivering_broker(broker)
     return (
         type(broker).acknowledge is not Broker.acknowledge
         or type(broker).fail is not Broker.fail
@@ -232,6 +234,7 @@ class QraftCluster(Cluster):
             setproctitle.setproctitle(f"qcluster {current_process().name} {self.name}")
 
         self._warn_if_broker_lacks_receipts()
+        self._warn_if_gauges_cannot_read_the_queue()
 
         from .retention import log_retention_policy
 
@@ -278,11 +281,39 @@ class QraftCluster(Cluster):
         except Exception:
             return
 
+        broker = delivering_broker(broker)
         if not _broker_supports_receipts(broker):
             _logger.warning(
                 "Broker '%s' does not support delivery acknowledgements: "
                 "in-flight tasks are lost if a worker crashes mid-task. "
                 "Use the ORM broker (django_q.brokers.orm.ORM) for at-least-once "
                 "delivery, or run the Qraft orphan reaper to reclaim stuck tasks.",
+                type(broker).__name__,
+            )
+
+    def _warn_if_gauges_cannot_read_the_queue(self) -> None:
+        """
+        Say so once when this cluster owns the gauges but cannot read a queue.
+
+        The queue gauges read `OrmQ` rows. A broker that holds its queue
+        elsewhere leaves them silently unpublished, which reads on a dashboard
+        as a queue that is always empty rather than as a queue nobody measured.
+        """
+        from django_q.brokers.orm import ORM
+
+        if not get_conf().metrics_gauges:
+            return
+        try:
+            broker = delivering_broker(self.broker or get_broker())
+        except Exception:
+            return
+
+        if not isinstance(broker, ORM):
+            _logger.warning(
+                "metrics_gauges is on for cluster '%s', but broker '%s' keeps "
+                "its queue outside the database: qraft.queue.depth and "
+                "qraft.queue.oldest_ready_age are not emitted. The other "
+                "gauges, which read Qraft's own tables, still are.",
+                self.name,
                 type(broker).__name__,
             )

@@ -19,21 +19,24 @@ from django.db.models import Q
 from django.utils import timezone
 from django_q.models import Task as Q2Task
 
+from . import metrics, signals
 from .conf import get_conf
-from .hooks import _owning_workflow_cancelled, qraft_hook_handler
+from .hooks import _owning_workflow_cancelled, announce_resolution, qraft_hook_handler
 from .models import QraftTask, QraftTaskAttempt, TaskStatus
 from .retry import handle_task_retry
 
 logger = logging.getLogger("qraft")
 
-# Floor on the heartbeat grace period, so a short heartbeat_interval can't make
-# the reaper trigger-happy under load or clock skew.
+# Default floor on the heartbeat grace period, so a short heartbeat_interval
+# can't make the reaper trigger-happy under load or clock skew. Lowerable per
+# cluster through the `min_heartbeat_grace` setting: for a sub-second task the
+# floor, not `heartbeat_interval`, is what detection latency costs.
 MIN_HEARTBEAT_GRACE = 90.0
 
 
 def _heartbeat_grace(heartbeat_interval: float) -> float:
     """Seconds a heartbeat may go unrefreshed before the worker counts as dead."""
-    return max(3 * heartbeat_interval, MIN_HEARTBEAT_GRACE)
+    return max(3 * heartbeat_interval, get_conf().min_heartbeat_grace)
 
 
 def _queued_q2_task_ids() -> set[str] | None:
@@ -48,11 +51,12 @@ def _queued_q2_task_ids() -> set[str] | None:
     orphaned and get duplicated.
     """
     try:
-        from django_q.brokers import get_broker
         from django_q.brokers.orm import ORM
         from django_q.models import OrmQ
 
-        if not isinstance(get_broker(), ORM):
+        from qraft.brokers import delivering_broker
+
+        if not isinstance(delivering_broker(), ORM):
             return None
 
         return {
@@ -99,6 +103,7 @@ def rearm_stuck_claims(grace: float | None = None) -> int:
 
     if rearmed:
         logger.warning("Re-armed %d attempt(s) claimed but never enqueued", rearmed)
+        metrics.counter("qraft.reaper.action", rearmed, action="rearmed")
     return rearmed
 
 
@@ -153,6 +158,8 @@ def reconcile_finished(grace: float | None = None) -> int:
         )
         qraft_hook_handler(q2_task)
         replayed += 1
+    if replayed:
+        metrics.counter("qraft.reaper.action", replayed, action="reconciled")
     return replayed
 
 
@@ -176,6 +183,7 @@ def replay_unrouted(grace: float | None = None) -> int:
     Returns:
         Number of attempts replayed.
     """
+    from . import runs
     from .dispatchers import route_workflow_completion
     from .hooks import HookDispatcher
 
@@ -203,9 +211,101 @@ def replay_unrouted(grace: float | None = None) -> int:
         )
         if not route_workflow_completion(attempt.qraft_task, attempt):
             HookDispatcher(attempt.qraft_task, attempt).dispatch(attempt.success)
+        runs.note_unit_settled(attempt.qraft_task)
         QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
         replayed += 1
+    if replayed:
+        metrics.counter("qraft.reaper.action", replayed, action="replayed")
     return replayed
+
+
+def flag_stalls(grace: float | None = None) -> int:
+    """
+    Flag attempts that are alive but not moving.
+
+    An attempt qualifies when its task declares `stall_after`, its heartbeat is
+    fresh (the worker is up), it has no outcome yet, it has not already been
+    flagged, and `coalesce(progress_advanced_at, date_started)` is older than
+    `stall_after` seconds. `progress_advanced_at`, not `progress_reported_at`:
+    a task that narrates its own hang every ten seconds must not defeat the
+    check.
+
+    Nothing is resolved and nothing is retried. The attempt keeps running, and
+    while the hook handler's compare-and-swap would drop its reported result,
+    nothing drops its database writes or its provider charges - a retry that
+    starts while attempt 1 is still writing produces two attempts writing the
+    same rows. Acting on the flag is the application's decision; see
+    `qraft.context.current_attempt_id()` for the ownership pattern that makes
+    its writes safe against an overlapping attempt.
+
+    The orphan sweep runs first, so an attempt is never both orphaned and
+    stalled. A `stall_after` below the heartbeat grace is not a mistake: it
+    measures a different condition, and no warning is emitted for it.
+
+    Args:
+        grace: Seconds a heartbeat may go unrefreshed and still count as alive
+            (default: the heartbeat grace).
+
+    Returns:
+        Number of attempts flagged.
+    """
+    conf = get_conf()
+    grace = grace if grace is not None else _heartbeat_grace(conf.heartbeat_interval)
+    now = timezone.now()
+    heartbeat_cutoff = now - timedelta(seconds=grace)
+
+    # The threshold is per task, so the age test happens in Python. The
+    # candidate set is only the running attempts of tasks that opted in.
+    candidates = QraftTaskAttempt.objects.filter(
+        success__isnull=True,
+        stall_suspected_at__isnull=True,
+        date_started__isnull=False,
+        heartbeat_at__gte=heartbeat_cutoff,
+        qraft_task__stall_after__isnull=False,
+        qraft_task__status=TaskStatus.RUNNING,
+    ).select_related("qraft_task")
+
+    flagged = 0
+    for attempt in candidates:
+        moved = attempt.progress_advanced_at or attempt.date_started
+        if (now - moved).total_seconds() < attempt.qraft_task.stall_after:
+            continue
+        # Re-check the candidate conditions on the write, not just the flag:
+        # the monitor can resolve this attempt between the query above and here,
+        # and a stall flagged on an attempt that already succeeded is a lie the
+        # dashboard and the signal would both repeat.
+        if not QraftTaskAttempt.objects.filter(
+            id=attempt.id,
+            stall_suspected_at__isnull=True,
+            success__isnull=True,
+            qraft_task__status=TaskStatus.RUNNING,
+        ).update(stall_suspected_at=now):
+            continue
+
+        attempt.stall_suspected_at = now
+        logger.warning(
+            "Attempt %d of QraftTask %s has not advanced for %.0fs (stall_after=%ds); "
+            "flagging, not resolving",
+            attempt.attempt_number,
+            attempt.qraft_task_id,
+            (now - moved).total_seconds(),
+            attempt.qraft_task.stall_after,
+        )
+        signals.send(
+            signals.attempt_stall_suspected,
+            QraftTaskAttempt,
+            signals.attempt_payload(attempt, attempt.qraft_task, outcome=None),
+        )
+        metrics.counter(
+            "qraft.attempt.stall_suspected",
+            func=attempt.qraft_task.func,
+            cluster=attempt.cluster,
+        )
+        flagged += 1
+
+    if flagged:
+        metrics.counter("qraft.reaper.action", flagged, action="stalled")
+    return flagged
 
 
 def reap_orphans(stale_after: float | None = None) -> int:
@@ -245,6 +345,16 @@ def reap_orphans(stale_after: float | None = None) -> int:
     # Same principle one step later in the pipeline: resolved attempts whose
     # post-commit routing/hook dispatch died get that work replayed.
     replay_unrouted(grace)
+
+    # Observation only: a run open past its threshold is flagged, never failed.
+    # An unenqueued stage is an application defect, and skip/cancel/abandon are
+    # the operator's tools for it.
+    from . import runs
+
+    runs.flag_overdue()
+    # The run's own equivalent of replay_unrouted(): a settlement that
+    # committed but never queued its durable hook.
+    runs.replay_settled_hooks(grace)
 
     now = timezone.now()
     heartbeat_cutoff = now - timedelta(seconds=grace)
@@ -287,7 +397,11 @@ def reap_orphans(stale_after: float | None = None) -> int:
                 if q2_task_id not in queued
             ]
 
-    return sum(_reap_one(attempt_id, heartbeat_cutoff) for attempt_id in orphan_ids)
+    reaped = sum(_reap_one(attempt_id, heartbeat_cutoff) for attempt_id in orphan_ids)
+
+    # After the orphan sweep, so an attempt is never both orphaned and stalled.
+    flag_stalls(grace)
+    return reaped
 
 
 def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
@@ -323,7 +437,14 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
             return False
 
         attempt.success = False
-        attempt.exception_class = "OrphanedTask"
+        # Two different failures reach this point and a retry policy should be
+        # allowed to treat them differently. `returned_at` set means the target
+        # ran to the end and only its result was lost, so the work is already
+        # done and a retry re-does it; unset means the worker died somewhere
+        # inside the function, with no way to know how far it got.
+        attempt.exception_class = (
+            "ResultLost" if attempt.returned_at is not None else "OrphanedTask"
+        )
         attempt.date_completed = timezone.now()
         # routed follows the same protocol as the hook handler: True when a
         # retry absorbs the failure (no post-commit work), set after routing
@@ -331,9 +452,10 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
         attempt.save(update_fields=["success", "exception_class", "date_completed"])
 
         logger.warning(
-            "Reaping orphaned attempt %d of QraftTask %s (q2_task_id=%s)",
+            "Reaping attempt %d of QraftTask %s as %s (q2_task_id=%s)",
             attempt.attempt_number,
             qraft_task.id,
+            attempt.exception_class,
             attempt.q2_task_id,
         )
 
@@ -351,10 +473,19 @@ def _reap_one(attempt_id, heartbeat_cutoff) -> bool:
                 qraft_task.save(update_fields=["status", "date_updated"])
             routable = (qraft_task, attempt)
 
-    if routable is not None:
-        from .dispatchers import route_workflow_completion
+        announce_resolution(
+            attempt, qraft_task, "orphaned", settled=not retry_scheduled
+        )
+        metrics.counter_on_commit("qraft.reaper.action", action="orphaned")
 
-        route_workflow_completion(*routable)
+    if routable is not None:
+        from . import runs
+        from .dispatchers import route_workflow_completion
+        from .hooks import HookDispatcher
+
+        if not route_workflow_completion(*routable):
+            HookDispatcher(*routable).dispatch(attempt.success)
+        runs.note_unit_settled(routable[0])
         QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
     return True

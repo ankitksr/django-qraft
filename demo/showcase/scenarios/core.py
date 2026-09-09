@@ -99,6 +99,57 @@ def hooks(ctx):
 
 
 @scenario(
+    "core.asyncdef",
+    group="core",
+    title="Coroutine tasks",
+    proves="An `async def` task is actually awaited in its worker slot, "
+    "retries through the same scheduled-attempt path as a sync task, and "
+    "an `async def` success hook is awaited too.",
+)
+def asyncdef(ctx):
+    run = ctx.run
+    task_id = async_task(
+        "showcase.tasks.async_flaky_task",
+        run,
+        "coro",
+        fail_times=1,
+        qraft_options={
+            "max_attempts": 3,
+            "base_delay": 1.0,
+            "backoff_strategy": "fixed",
+            "jitter": False,
+            "success_hook": "showcase.hooks.on_success_async",
+            "success_args": (run, "coro"),
+        },
+    )
+
+    task = ctx.wait(
+        "coroutine task settles", lambda: probe.settled(task_id), timeout=90
+    )
+    if not task:
+        return
+
+    ctx.equals("status", task.status, TaskStatus.SUCCEEDED)
+    ctx.equals("attempts", len(probe.attempts(task)), 2)
+
+    # The task only records its Event after a real await, so these rows
+    # existing at all means the worker ran the coroutine to completion
+    # instead of dropping it unawaited.
+    events = ctx.events(kind=Event.TASK, name="coro")
+    ctx.equals("both attempts awaited", len(events), 2)
+    ctx.check(
+        "events recorded post-await",
+        all(event.payload.get("awaited") for event in events),
+    )
+
+    ctx.wait(
+        "async success hook awaited",
+        lambda: ctx.count(kind=Event.HOOK, name="success:coro"),
+        timeout=45,
+    )
+
+
+@scenario(
     "core.backoff",
     group="core",
     title="Retry backoff: exponential, linear, fixed",

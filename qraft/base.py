@@ -4,9 +4,11 @@ import logging
 import time
 from uuid import UUID
 
+from django.db import transaction
 from django.utils import timezone
 from django.utils.module_loading import import_string
 
+from qraft import metrics, signals
 from qraft.models import InvalidStatusTransition, WorkflowStatus
 from qraft.results import TaskResult, WorkflowResult
 
@@ -100,37 +102,88 @@ class BaseWorkflow:
                 its current state (including when a race already committed a
                 terminal status).
         """
-        updated = self._model.__class__.objects.filter(
-            pk=self._model.pk,
-            status__in=_CANCELLABLE_STATUSES,
-        ).update(
-            status=WorkflowStatus.CANCELLED,
-            date_updated=timezone.now(),
-        )
-        if updated:
-            self._model.status = WorkflowStatus.CANCELLED
-            _logger.info(
-                "%s %s cancelled",
-                self._workflow_type.capitalize(),
-                self._model.id,
+        # The same settlement compare-and-swap the dispatchers use, so a cancel
+        # racing a completion produces exactly one settlement. The announcement
+        # shares the transaction: nothing here replays a workflow cancel, so a
+        # crash between the two would leave the run's stage row believing this
+        # unit is still running.
+        now = timezone.now()
+        with transaction.atomic():
+            updated = self._model.__class__.objects.filter(
+                pk=self._model.pk,
+                status__in=_CANCELLABLE_STATUSES,
+                settled_at__isnull=True,
+            ).update(
+                status=WorkflowStatus.CANCELLED,
+                settled_at=now,
+                date_updated=now,
             )
-            if self._model.on_cancelled:
-                from qraft.dispatchers import _dispatch_workflow_hook
-
-                _dispatch_workflow_hook(
-                    workflow_type=self._workflow_type,
-                    workflow_id=self._model.id,
-                    hook_type="cancelled",
-                    hook_path=self._model.on_cancelled,
-                    hook_args=[],
-                    hook_kwargs={},
+            if updated:
+                self._model.status = WorkflowStatus.CANCELLED
+                self._model.settled_at = now
+                _logger.info(
+                    "%s %s cancelled",
+                    self._workflow_type.capitalize(),
+                    self._model.id,
                 )
+                self._announce_cancelled()
+        if updated:
             return True
 
         self._model.refresh_from_db()
         raise InvalidStatusTransition(
             f"Cannot transition from {self._model.status} to {WorkflowStatus.CANCELLED}"
         )
+
+    def _bind_to_run(self) -> None:
+        """
+        Bind this workflow as its stage's one completion unit.
+
+        Called from inside run()'s transaction, so a refused bind (the run
+        settled, the stage already has a unit) rolls the whole fan-out back
+        rather than leaving members queued under a stage nothing owns.
+        """
+        if self._model.run_id and self._model.stage:
+            from qraft import runs
+
+            runs.bind(self._model.run_id, self._model.stage, self._model)
+
+    def _announce_cancelled(self) -> None:
+        """Signal, count and hook a cancellation that just took effect."""
+        from qraft import runs
+
+        runs.note_unit_settled(self._model)
+        signals.send(
+            signals.workflow_settled,
+            self._model.__class__,
+            signals.workflow_payload(
+                self._model, self._workflow_type, WorkflowStatus.CANCELLED
+            ),
+        )
+        metrics.counter_on_commit(
+            "qraft.workflow.settled",
+            workflow_type=self._workflow_type,
+            outcome=WorkflowStatus.CANCELLED,
+        )
+        if self._model.on_cancelled:
+            from qraft.dispatchers import _dispatch_workflow_hook, workflow_hook_context
+
+            context = None
+            if self._model.hook_context:
+                # Re-read first: the counters this instance holds were read
+                # before the members ran, and how much had finished when the
+                # cancel landed is the whole point of the context.
+                self._model.refresh_from_db()
+                context = workflow_hook_context(self._model, self._workflow_type)
+            _dispatch_workflow_hook(
+                workflow_type=self._workflow_type,
+                workflow_id=self._model.id,
+                hook_type="cancelled",
+                hook_path=self._model.on_cancelled,
+                hook_args=[],
+                hook_kwargs={},
+                context=context,
+            )
 
     def _poll_until_terminal(self, timeout_ms: int | None) -> None:
         """

@@ -3,6 +3,8 @@
 import uuid
 from unittest.mock import Mock, patch
 
+import pytest
+from django_q.brokers import Broker
 from django_q.worker import worker as q2_worker
 
 from qraft.cluster import QraftCluster, QraftSentinel
@@ -142,3 +144,121 @@ class TestQraftClusterStart:
         assert kwargs["target"] is QraftSentinel
         fake_process.start.assert_called_once()
         assert pid == 4242
+
+
+class TestGaugeOwnerWarning:
+    """The gauge owner says so when its broker keeps the queue out of reach."""
+
+    def _warnings(self, broker, metrics_gauges):
+        cluster = QraftCluster()
+        cluster.broker = broker
+        with (
+            patch(
+                "qraft.cluster.get_conf",
+                return_value=Mock(metrics_gauges=metrics_gauges),
+            ),
+            patch("qraft.cluster._logger.warning") as warning,
+        ):
+            cluster._warn_if_gauges_cannot_read_the_queue()
+        return warning.call_args_list
+
+    def test_warns_only_for_a_gauge_owner_that_cannot_read_the_queue(self):
+        from django_q.brokers.orm import ORM
+
+        (call,) = self._warnings(Mock(), metrics_gauges=True)
+        assert "qraft.queue.depth" in call.args[0]
+        assert self._warnings(Mock(spec=ORM), metrics_gauges=True) == []
+        assert self._warnings(Mock(), metrics_gauges=False) == []
+
+
+class ReceiptlessBroker(Broker):
+    """A broker that drops in-flight work silently, like Redis or SQS."""
+
+    def __init__(self, list_key=None):
+        self.list_key = list_key
+        self._info = None
+        self.cache = None
+
+
+@pytest.mark.django_db
+class TestRoutedClusterWarnings:
+    """A routed cluster's warnings describe its delegate, not the router."""
+
+    def test_the_receipts_warning_follows_the_delegate(self, settings):
+        from qraft.brokers import RoutingBroker, reset_broker_cache
+        from qraft.cluster import QraftCluster
+
+        settings.Q_CLUSTER = {
+            "name": "test",
+            "broker_class": "qraft.brokers.RoutingBroker",
+            "ALT_CLUSTERS": {
+                "receiptless": {"broker_class": "tests.test_cluster.ReceiptlessBroker"},
+                "orm-cluster": {"orm": "default"},
+            },
+        }
+        reset_broker_cache()
+
+        cluster = QraftCluster()
+        # The router forwards acknowledge/fail, so its own class always looks
+        # like an override; the question has to reach the delegate.
+        cluster.broker = RoutingBroker(list_key="receiptless")
+        with patch("qraft.cluster._logger.warning") as warning:
+            cluster._warn_if_broker_lacks_receipts()
+        assert warning.call_count == 1
+        assert warning.call_args.args[1] == "ReceiptlessBroker"
+
+        cluster.broker = RoutingBroker(list_key="orm-cluster")
+        with patch("qraft.cluster._logger.warning") as warning:
+            cluster._warn_if_broker_lacks_receipts()
+        assert warning.call_count == 0
+
+
+class TestMonitorBackgroundLoops:
+    """
+    `_monitor_with_reaper` is where Qraft's recovery actors are started.
+
+    Nothing else starts them. A refactor that drops one of these threads costs
+    the cluster its scheduler (no delayed attempt ever dispatches) or its
+    reaper (no orphan is ever reclaimed), and every other test still passes
+    because they all call the loops directly.
+    """
+
+    def _started_targets(self, retention_enabled):
+        from qraft.cluster import _monitor_with_reaper
+
+        conf = Mock()
+        conf.retention_enabled.return_value = retention_enabled
+        started = []
+
+        class FakeThread:
+            def __init__(self, target, daemon=False):
+                started.append((target, daemon))
+
+            def start(self):
+                pass
+
+        with (
+            patch("qraft.cluster.threading.Thread", FakeThread),
+            patch("qraft.cluster.get_conf", return_value=conf),
+            patch("qraft.cluster.monitor") as monitor,
+        ):
+            _monitor_with_reaper("queue", broker="broker")
+
+        monitor.assert_called_once_with("queue", "broker")
+        return started
+
+    def test_the_scheduler_and_reaper_always_start_as_daemons(self):
+        from qraft.cluster import _reap_loop, _scheduler_loop
+
+        started = self._started_targets(retention_enabled=False)
+
+        assert [target for target, _ in started] == [_scheduler_loop, _reap_loop]
+        # Daemon matters: the monitor process must not be held open by them.
+        assert all(daemon for _, daemon in started)
+
+    def test_retention_starts_only_when_it_is_configured(self):
+        from qraft.cluster import _retention_loop
+
+        started = self._started_targets(retention_enabled=True)
+
+        assert [target for target, _ in started][-1] is _retention_loop

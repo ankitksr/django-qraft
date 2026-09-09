@@ -51,6 +51,10 @@ class QraftBatch(ParallelWorkflow):
         failure_args: tuple = (),
         failure_kwargs: dict | None = None,
         batch_id: UUID | str | None = None,
+        subject: tuple | None = None,
+        run=None,
+        stage: str | None = None,
+        hook_context: bool = False,
     ):
         self._tasks = []
 
@@ -61,16 +65,29 @@ class QraftBatch(ParallelWorkflow):
         if batch_id:
             self._model = QraftBatchModel.objects.get(id=batch_id)
         else:
-            self._model = QraftBatchModel.objects.create(
-                success_hook=on_success,
-                success_args=list(success_args),
-                success_kwargs=success_kwargs or {},
-                failure_hook=on_failure,
-                failure_args=list(failure_args),
-                failure_kwargs=failure_kwargs or {},
-                on_cancelled=on_cancelled,
-                progress_hook=progress_hook,
-            )
+            from qraft import runs
+            from qraft.tasks import parse_subject
+
+            subject_type, subject_id = parse_subject(subject)
+            # The run's row lock is held across the insert, so a
+            # concurrent runs.bind_subject() cannot leave this workflow with
+            # a null subject it never backfills.
+            with runs.correlating(run, stage, subject_type, subject_id) as correlation:
+                self._model = QraftBatchModel.objects.create(
+                    success_hook=on_success,
+                    success_args=list(success_args),
+                    success_kwargs=success_kwargs or {},
+                    failure_hook=on_failure,
+                    failure_args=list(failure_args),
+                    failure_kwargs=failure_kwargs or {},
+                    on_cancelled=on_cancelled,
+                    progress_hook=progress_hook,
+                    subject_type=correlation["subject_type"],
+                    subject_id=correlation["subject_id"],
+                    run_id=correlation["run_id"],
+                    stage=correlation["stage"],
+                    hook_context=hook_context,
+                )
 
         _logger.debug("Initialized QraftBatch %s", self._model.id)
 
@@ -145,8 +162,9 @@ class QraftBatch(ParallelWorkflow):
         if self._model.status != WorkflowStatus.PENDING:
             raise ValueError(f"Batch already run (status: {self._model.status})")
 
-        from qraft.tasks import _create_workflow_task
+        from qraft.tasks import _create_workflow_task, workflow_member_labels
 
+        labels = workflow_member_labels(self._model)
         # One transaction for the publish and the whole fan-out: a failure
         # creating any member rolls back total_count/RUNNING too, instead of
         # leaving an unfinishable workflow with a partial member set. The
@@ -160,6 +178,7 @@ class QraftBatch(ParallelWorkflow):
                 self._model.save(
                     update_fields=["total_count", "status", "date_updated"]
                 )
+                self._bind_to_run()
 
                 for idx, task_data in enumerate(self._tasks):
                     _create_workflow_task(
@@ -168,6 +187,7 @@ class QraftBatch(ParallelWorkflow):
                         kwargs=task_data["kwargs"],
                         qraft_options=task_data["qraft_options"],
                         qraft_batch_id=self._model.id,
+                        labels=labels,
                     )
                     _logger.debug(
                         "Queued batch task %d/%d (batch=%s, func=%s)",

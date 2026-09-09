@@ -221,3 +221,6 @@ secrets.yaml
 
 # AI
 CLAUDE.md
+
+# playwright-cli scratch output
+.playwright-cli/

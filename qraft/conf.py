@@ -39,13 +39,34 @@ class RetryDefaultsSettings(BaseModel):
     )
 
 
+# Settings a cluster owns rather than inherits. `metrics_gauges` names the one
+# process that reports the fleet-wide backlog; inheriting it from the base
+# entry would make every ALT_CLUSTERS cluster a second reporter of the same
+# numbers, which is what a consumer would sum.
+NOT_INHERITED_BY_ALT_CLUSTERS = {"metrics_gauges": False}
+
+
 def _merge_alt_cluster(config: dict[str, Any], cluster_name: str | None) -> dict:
-    """Overlay the ALT_CLUSTERS entry for `cluster_name` onto a settings dict."""
+    """
+    Overlay the ALT_CLUSTERS entry for `cluster_name` onto a settings dict.
+
+    Keys in `NOT_INHERITED_BY_ALT_CLUSTERS` fall back to their stated default
+    for an alt cluster that does not set them itself.
+    """
     merged = config.copy()
     alt_clusters = merged.pop("ALT_CLUSTERS", None)
     if cluster_name and isinstance(alt_clusters, dict):
         alt_conf = alt_clusters.get(cluster_name)
         if isinstance(alt_conf, dict):
+            declared = {key.lower() for key in alt_conf}
+            for key, default in NOT_INHERITED_BY_ALT_CLUSTERS.items():
+                if key not in declared:
+                    merged = {
+                        name: value
+                        for name, value in merged.items()
+                        if name.lower() != key
+                    }
+                    merged[key] = default
             merged.update(alt_conf)
     return merged
 
@@ -156,7 +177,25 @@ class QraftSettings(BaseSettings):
         30.0,
         gt=0,
         description="Seconds between execution-lease heartbeats from a running "
-        "worker; the reaper treats a heartbeat older than 3x this as dead",
+        "worker; the reaper reaps on a heartbeat older than "
+        "max(3 * heartbeat_interval, min_heartbeat_grace)",
+    )
+    min_heartbeat_grace: float = Field(
+        90.0,
+        gt=0,
+        description="Floor on the heartbeat grace period, so a short "
+        "heartbeat_interval cannot make the reaper trigger-happy on a "
+        "briefly-paused worker. Lower it deliberately when the tasks are "
+        "short enough that 90s of lost work costs more than a rare "
+        "false reap",
+    )
+    max_executions_per_attempt: int = Field(
+        1,
+        ge=1,
+        description="How many times one attempt may be handed to a worker. "
+        "The default 1 means a broker redelivery of an attempt that already "
+        "started is refused and resolved as RedeliveredAttempt, so the retry "
+        "policy decides the next attempt instead of the delivery loop",
     )
 
     # Scheduler dispatcher settings
@@ -201,6 +240,24 @@ class QraftSettings(BaseSettings):
         ge=1,
         description="Rows deleted per transaction, so a first sweep over a "
         "large table does not hold one long lock",
+    )
+
+    # Observability
+    metrics_sink: str = Field(
+        "qraft.metrics.NullSink",
+        description="Dotted path to the metrics Sink class; resolved once per process",
+    )
+    metrics_gauges: bool = Field(
+        False,
+        description="Emit queue/backlog gauges from this cluster's dispatcher loop. "
+        "Set on exactly one cluster, or every replica reports the same backlog",
+    )
+    progress_min_interval: float = Field(
+        0.0,
+        ge=0,
+        description="Seconds between progress writes from one attempt; a call "
+        "inside the interval is skipped unless current/total changed or "
+        "force=True. 0 writes every call",
     )
 
     def retention_enabled(self) -> bool:

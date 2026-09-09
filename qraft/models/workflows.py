@@ -5,10 +5,18 @@ from uuid import uuid4
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
-from .mixins import WorkflowHookMixin, WorkflowStatus, WorkflowStatusMixin
+from .mixins import (
+    RunMemberMixin,
+    SubjectMixin,
+    WorkflowHookMixin,
+    WorkflowStatus,
+    WorkflowStatusMixin,
+)
 
 
-class QraftChainModel(WorkflowHookMixin, WorkflowStatusMixin, models.Model):
+class QraftChainModel(
+    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+):
     """Database model for chain workflow state (sequential execution)."""
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
@@ -110,7 +118,9 @@ class QraftChainStep(models.Model):
         ]
 
 
-class QraftIterModel(WorkflowHookMixin, WorkflowStatusMixin, models.Model):
+class QraftIterModel(
+    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+):
     """Database model for iter workflow state (same function, many inputs)."""
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
@@ -166,7 +176,9 @@ class QraftIterModel(WorkflowHookMixin, WorkflowStatusMixin, models.Model):
         ordering = ["-date_created"]
 
 
-class QraftBatchModel(WorkflowHookMixin, WorkflowStatusMixin, models.Model):
+class QraftBatchModel(
+    SubjectMixin, RunMemberMixin, WorkflowHookMixin, WorkflowStatusMixin, models.Model
+):
     """Database model for batch workflow state (different functions, parallel)."""
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)

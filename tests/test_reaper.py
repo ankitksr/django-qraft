@@ -7,7 +7,7 @@ import pytest
 from django.utils import timezone
 from django_q.models import Task as Q2Task
 
-from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.reaper import reap_orphans, reconcile_finished, replay_unrouted
 
 STALE_AFTER = 60
@@ -80,6 +80,26 @@ class TestReapOrphans:
 
         task.refresh_from_db()
         assert task.status == TaskStatus.PENDING  # retry scheduled
+
+    def test_a_lost_result_is_named_apart_from_a_dead_worker(self):
+        """`returned_at` splits "the work ran" from "the worker died in it".
+
+        A wedged monitor leaves the function finished and its result stranded;
+        a SIGKILL leaves it half-done. A retry policy is entitled to treat the
+        two differently, so they cannot share one exception class.
+        """
+        task = _running_task(retry_policy=RETRY_POLICY)
+        attempt = _attempt(task, "monitor-wedged-task")
+        QraftTaskAttempt.objects.filter(id=attempt.id).update(
+            returned_at=timezone.now()
+        )
+        _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
+
+        assert reap_orphans(stale_after=STALE_AFTER) == 1
+
+        attempt.refresh_from_db()
+        assert attempt.success is False
+        assert attempt.exception_class == "ResultLost"
 
     def test_reaps_dead_heartbeat_and_fails_task_when_no_policy(self):
         task = _running_task(retry_policy={})
@@ -275,7 +295,7 @@ class TestReplayUnrouted:
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task,
             attempt_number=1,
-            q2_task_id=f"q2-unrouted-{task.id}",
+            q2_task_id=f"q2-unrouted-{task.id.hex[:16]}",
             success=success,
             routed=routed,
             date_completed=timezone.now() - timedelta(seconds=age),
@@ -324,3 +344,221 @@ class TestReplayUnrouted:
         attempt.refresh_from_db()
         assert attempt.routed is True
         assert attempt.counted is True
+
+
+@pytest.mark.django_db
+class TestFlagStalls:
+    """
+    A stalled attempt is alive and not moving. The reaper says so and stops
+    there: the attempt keeps running, so resolving it would let a retry write
+    the same rows the original is still writing.
+    """
+
+    def _started(self, task, *, advanced_age=None, heartbeat_age=1, started_age=600):
+        now = timezone.now()
+        attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=1, q2_task_id=f"q2-{task.id.hex[:24]}"
+        )
+        QraftTaskAttempt.objects.filter(id=attempt.id).update(
+            date_started=now - timedelta(seconds=started_age),
+            heartbeat_at=now - timedelta(seconds=heartbeat_age),
+            progress_advanced_at=(
+                None if advanced_age is None else now - timedelta(seconds=advanced_age)
+            ),
+            progress_reported_at=now,
+        )
+        attempt.refresh_from_db()
+        return attempt
+
+    def test_flags_a_live_attempt_that_stopped_advancing_exactly_once(
+        self, signal_log, django_capture_on_commit_callbacks, recording_sink
+    ):
+        from qraft.reaper import flag_stalls
+
+        task = _running_task(stall_after=60)
+        attempt = self._started(task, advanced_age=300)
+
+        with django_capture_on_commit_callbacks(execute=True):
+            assert flag_stalls() == 1
+        attempt.refresh_from_db()
+        assert attempt.stall_suspected_at is not None
+        # Observed, never acted on: no outcome, no retry, task still RUNNING.
+        assert attempt.success is None
+        assert QraftTask.objects.get(id=task.id).status == TaskStatus.RUNNING
+        assert task.attempts.count() == 1
+
+        assert len(signal_log["attempt_stall_suspected"]) == 1
+        payload = signal_log["attempt_stall_suspected"][0]
+        assert payload["attempt_id"] == str(attempt.id)
+        assert payload["outcome"] is None
+        assert "qraft.attempt.stall_suspected" in recording_sink.names()
+
+        # Already flagged: the compare-and-swap makes a second sweep a no-op.
+        with django_capture_on_commit_callbacks(execute=True):
+            assert flag_stalls() == 0
+        assert len(signal_log["attempt_stall_suspected"]) == 1
+
+    def test_ignores_fresh_progress_stale_heartbeats_and_opted_out_tasks(self):
+        from qraft.reaper import flag_stalls
+
+        # Advancing inside the threshold.
+        self._started(_running_task(stall_after=60), advanced_age=5)
+        # Not advancing, but the worker is gone - that is the orphan sweep's
+        # business, and running it first is what keeps the two disjoint.
+        self._started(
+            _running_task(stall_after=60),
+            advanced_age=300,
+            heartbeat_age=DEAD_HEARTBEAT_AGE,
+        )
+        # No stall_after: opted out.
+        self._started(_running_task(), advanced_age=300)
+        # Resolved already.
+        resolved = self._started(_running_task(stall_after=60), advanced_age=300)
+        QraftTaskAttempt.objects.filter(id=resolved.id).update(success=True)
+
+        assert flag_stalls() == 0
+        assert QraftTaskAttempt.objects.filter(
+            stall_suspected_at__isnull=False
+        ).exists() is False
+
+    def test_an_attempt_that_never_reported_is_measured_from_its_start(self):
+        from qraft.reaper import flag_stalls
+
+        young = self._started(_running_task(stall_after=600), started_age=60)
+        old = self._started(_running_task(stall_after=30), started_age=300)
+
+        assert flag_stalls() == 1
+        young.refresh_from_db()
+        old.refresh_from_db()
+        assert young.stall_suspected_at is None
+        assert old.stall_suspected_at is not None
+
+    def test_reap_orphans_runs_the_stall_sweep_after_the_orphan_sweep(self):
+        task = _running_task(stall_after=60)
+        attempt = self._started(task, advanced_age=300)
+
+        reap_orphans(stale_after=STALE_AFTER)
+
+        attempt.refresh_from_db()
+        # Flagged as stalled, not reaped as an orphan: the heartbeat is fresh.
+        assert attempt.stall_suspected_at is not None
+        assert attempt.success is None
+
+    def test_an_attempt_resolved_mid_sweep_is_not_flagged(self, signal_log):
+        """
+        The candidate query and the flag write are separate statements. Freeze
+        the candidates, let the monitor resolve one exactly as it would in the
+        gap, and the write must refuse it: observation never fires on an
+        attempt that already finished.
+        """
+        from qraft import reaper
+
+        task = _running_task(stall_after=60)
+        attempt = self._started(task, advanced_age=300)
+        original = reaper.QraftTaskAttempt.objects.filter
+
+        class Frozen(list):
+            """A candidate list read before the resolution, as the loop sees it."""
+
+            def select_related(self, *args):
+                return self
+
+        def stale_candidates(*args, **kwargs):
+            queryset = original(*args, **kwargs)
+            if "qraft_task__stall_after__isnull" not in kwargs:
+                return queryset
+            candidates = Frozen(queryset.select_related("qraft_task"))
+            original(id=attempt.id).update(success=True)
+            QraftTask.objects.filter(id=task.id).update(status=TaskStatus.SUCCEEDED)
+            return candidates
+
+        reaper.QraftTaskAttempt.objects.filter = stale_candidates
+        try:
+            flagged = reaper.flag_stalls()
+        finally:
+            reaper.QraftTaskAttempt.objects.filter = original
+
+        assert flagged == 0
+        attempt.refresh_from_db()
+        assert attempt.stall_suspected_at is None
+        assert signal_log["attempt_stall_suspected"] == []
+
+
+class TestHeartbeatGrace:
+    """The grace period is a formula, and its floor is a setting."""
+
+    def test_the_grace_is_the_larger_of_three_intervals_and_the_floor(
+        self, settings, monkeypatch
+    ):
+        from qraft import conf
+        from qraft.reaper import MIN_HEARTBEAT_GRACE, _heartbeat_grace
+
+        assert MIN_HEARTBEAT_GRACE == 90.0
+        # Floor wins for a short interval, 3x wins for a long one.
+        assert _heartbeat_grace(2.0) == 90.0
+        assert _heartbeat_grace(60.0) == 180.0
+
+        monkeypatch.setitem(settings.QRAFT_CLUSTER, "min_heartbeat_grace", 5.0)
+        conf._cached_conf.cache_clear()
+        try:
+            assert _heartbeat_grace(1.0) == 5.0
+            assert _heartbeat_grace(60.0) == 180.0
+        finally:
+            conf._cached_conf.cache_clear()
+
+
+class TestReapedTaskFiresItsFailureHook:
+    """
+    A reaped task is a failed task, so its failure hook has to run.
+
+    The reaper is the only path that settles an attempt whose worker died, and
+    it is the only settlement path a task with a `failure_hook` and no
+    workflow can reach after an OOM kill. It also sets `routed=True`, which
+    takes the attempt out of `replay_unrouted()`'s query, so a hook missed
+    here is missed permanently.
+    """
+
+    def test_an_orphan_reap_dispatches_the_failure_hook(self, db):
+        task = _running_task(retry_policy={}, failure_hook="test.module.on_failure")
+        attempt = _attempt(task, "orphan-with-failure-hook")
+        _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
+
+        with patch("qraft.hooks.q2_async_task", return_value="q2-hook") as enqueue:
+            assert reap_orphans(stale_after=STALE_AFTER) == 1
+
+        task.refresh_from_db()
+        assert task.status == TaskStatus.FAILED
+        assert enqueue.call_args.args[0] == "test.module.on_failure"
+        assert HookDispatch.objects.filter(
+            qraft_task=task, hook_type="failure"
+        ).exists()
+
+    def test_an_exhausted_retry_policy_still_reaches_the_hook(self, db):
+        task = _running_task(
+            retry_policy={"max_attempts": 1}, failure_hook="test.module.on_failure"
+        )
+        attempt = _attempt(task, "exhausted-with-failure-hook")
+        _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
+
+        with patch("qraft.hooks.q2_async_task", return_value="q2-hook"):
+            assert reap_orphans(stale_after=STALE_AFTER) == 1
+
+        task.refresh_from_db()
+        assert task.status == TaskStatus.EXHAUSTED
+        assert HookDispatch.objects.filter(
+            qraft_task=task, hook_type="failure"
+        ).exists()
+
+    def test_a_reap_that_schedules_a_retry_fires_no_hook(self, db):
+        task = _running_task(
+            retry_policy={"max_attempts": 3}, failure_hook="test.module.on_failure"
+        )
+        attempt = _attempt(task, "retried-with-failure-hook")
+        _heartbeat(attempt, DEAD_HEARTBEAT_AGE)
+
+        with patch("qraft.hooks.q2_async_task", return_value="q2-hook"):
+            assert reap_orphans(stale_after=STALE_AFTER) == 1
+
+        task.refresh_from_db()
+        assert task.status == TaskStatus.PENDING
+        assert not HookDispatch.objects.filter(qraft_task=task).exists()

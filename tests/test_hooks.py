@@ -191,69 +191,40 @@ class TestQraftHookHandler:
 class TestHookDispatcher:
     """Tests for HookDispatcher class."""
 
-    def test_dispatch_success_hook(
-        self, qraft_task, qraft_task_attempt, mock_q2_task_success
+    @pytest.mark.parametrize(
+        "success, hook_field, hook_type",
+        [
+            (True, "success_hook", "success"),
+            (False, "failure_hook", "failure"),
+        ],
+    )
+    @patch("qraft.hooks.q2_async_task")
+    def test_dispatch_records_a_hook_dispatch_for_the_outcome(
+        self,
+        mock_q2_async,
+        success,
+        hook_field,
+        hook_type,
+        qraft_task,
+        qraft_task_attempt,
     ):
-        """Test dispatching success hook."""
-        qraft_task.success_hook = "test.hooks.on_success"
+        """dispatch() queues the hook matching the outcome and records it,
+        regardless of retry policy - dispatch() assumes retry was already
+        handled by the caller."""
+        mock_q2_async.return_value = "hook-task-123"
+        setattr(qraft_task, hook_field, f"test.hooks.on_{hook_type}")
         qraft_task.save()
 
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-
-        with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(success=True)
-
-            mock_call.assert_called_once_with(
-                hook_path="test.hooks.on_success",
-                args=[],
-                kwargs={},
-                hook_type="success",
-            )
-
-    def test_dispatch_failure_hook_without_retry(
-        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
-    ):
-        """Test dispatching failure hook when no retry is needed."""
-        qraft_task.failure_hook = "test.hooks.on_failure"
-        qraft_task.retry_policy = {}  # No retry policy
-        qraft_task.save()
-
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
-
-        with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(success=False)
-
-            mock_call.assert_called_once_with(
-                hook_path="test.hooks.on_failure",
-                args=[],
-                kwargs={},
-                hook_type="failure",
-            )
-
-    def test_dispatch_failure_always_dispatches_hook(
-        self, qraft_task, qraft_task_attempt, mock_q2_task_failure
-    ):
-        """dispatch() always fires the failure hook; retry is handled separately."""
-        qraft_task.failure_hook = "test.hooks.on_failure"
-        qraft_task.save()
-
-        qraft_task_attempt.success = False
-        qraft_task_attempt.exception_class = "ValueError"
+        qraft_task_attempt.success = success
+        if not success:
+            qraft_task_attempt.exception_class = "ValueError"
         qraft_task_attempt.save()
 
-        dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
+        HookDispatcher(qraft_task, qraft_task_attempt).dispatch(success=success)
 
-        with patch.object(dispatcher, "_call_hook") as mock_call:
-            # dispatch() now assumes retry logic was handled by caller
-            dispatcher.dispatch(success=False)
-
-            # Failure hook SHOULD be called (dispatch no longer handles retry)
-            mock_call.assert_called_once_with(
-                hook_path="test.hooks.on_failure",
-                args=[],
-                kwargs={},
-                hook_type="failure",
-            )
+        dispatch = HookDispatch.objects.get(qraft_task=qraft_task)
+        assert dispatch.hook_type == hook_type
+        assert dispatch.hook_path == f"test.hooks.on_{hook_type}"
 
     def test_dispatch_no_hook_configured(
         self, qraft_task, qraft_task_attempt, mock_q2_task_success
@@ -264,12 +235,9 @@ class TestHookDispatcher:
         qraft_task.save()
 
         dispatcher = HookDispatcher(qraft_task, qraft_task_attempt)
+        dispatcher.dispatch(success=True)
 
-        with patch.object(dispatcher, "_call_hook") as mock_call:
-            dispatcher.dispatch(success=True)
-
-            # No hooks should be called
-            mock_call.assert_not_called()
+        assert not HookDispatch.objects.filter(qraft_task=qraft_task).exists()
 
     @patch("qraft.hooks.q2_async_task")
     def test_call_hook_async(
@@ -431,7 +399,11 @@ class TestLateResultDropped:
         mock_route.assert_not_called()
         mock_dispatcher.assert_not_called()
         mock_warn.assert_called_once()
-        assert "already resolved" in mock_warn.call_args[0][0]
+        assert mock_warn.call_args[0][1:] == (
+            qraft_task_attempt.attempt_number,
+            qraft_task.id,
+            mock_q2_task_failure.id,
+        )
 
         qraft_task_attempt.refresh_from_db()
         assert qraft_task_attempt.success is True
@@ -462,7 +434,7 @@ class TestDispatchHookOnce:
 
         assert not HookDispatch.objects.exists()
         mock_log.assert_called_once()
-        assert "Failed to dispatch hook" in mock_log.call_args[0][0]
+        assert mock_log.call_args[0][1:] == ("test.hooks.success", "HookDispatch")
 
     def test_claim_and_enqueue_roll_back_together(self, qraft_task):
         """

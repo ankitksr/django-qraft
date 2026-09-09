@@ -266,6 +266,26 @@ class TestRoutingSurvivesTheDelay:
         # dispatcher routes the work to itself rather than leaving it null.
         assert _pack()["cluster"] == Conf.CLUSTER_NAME
         assert OrmQ.objects.get().key == Conf.CLUSTER_NAME
+        # Recorded too, or the start and pickup metrics carry an empty cluster
+        # label and the active gauge, which counts per cluster, misses it.
+        assert QraftTaskAttempt.objects.get().cluster == Conf.CLUSTER_NAME
+
+    def test_each_attempt_is_stamped_when_it_is_claimed_not_when_the_pass_began(self):
+        """
+        One pass-level timestamp reused across a slow batch would backdate
+        every attempt after the first and inflate its measured queue wait.
+        """
+        for _ in range(3):
+            _due(_task(), seconds_ago=5)
+        pass_started = timezone.now()
+
+        assert scheduler.dispatch_due() == 3
+
+        stamps = sorted(
+            QraftTaskAttempt.objects.values_list("enqueued_at", flat=True)
+        )
+        assert all(stamp >= pass_started for stamp in stamps)
+        assert len(set(stamps)) == 3
 
 
 class TestCrashRecovery:

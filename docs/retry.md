@@ -8,6 +8,7 @@ Django-Qraft provides rich retry policies with multiple backoff strategies, exce
 - [Basic Usage](#basic-usage)
 - [Backoff Strategies](#backoff-strategies)
 - [Exception Filtering](#exception-filtering)
+- [Rate Limits](#rate-limits)
 - [Jitter](#jitter)
 - [Default Retry Policy](#default-retry-policy)
 - [Retry Scheduling](#retry-scheduling)
@@ -25,7 +26,8 @@ Django-Qraft's retry system provides:
 - **Jitter support**: Random variation to prevent thundering herd
 - **Exception filtering**: Retry only specific exceptions
 - **Hook integration**: Failure hooks called only after exhaustion
-- **Transparent scheduling**: Retries use Django-Q2's Schedule model
+- **Exact scheduling**: A retry is a Qraft-owned attempt row dispatched at its due time,
+  so the computed backoff is the delay served
 
 **Key concepts:**
 
@@ -382,6 +384,58 @@ task_id = async_task(
 )
 ```
 
+## Rate Limits
+
+A 429 is not an ordinary failure. Backing off linearly against a provider that is already
+refusing you wastes attempts, and a provider that tells you when to come back should be
+believed. Qraft treats rate-limit errors as their own case.
+
+### Which exceptions count
+
+`RetryPolicy.is_rate_limit(exception)` decides, taking either an exception instance or a
+class name. By default it matches the `RATE_LIMIT_EXCEPTIONS` set — the names provider
+SDKs commonly raise, `RateLimited`, `RateLimitError`, `TooManyRequests`,
+`ThrottlingException` among them. Name your own to replace the set entirely:
+
+```python
+RetryPolicy(
+    max_attempts=5,
+    rate_limit_exceptions=['MyProviderQuotaError'],
+    rate_limit_max_delay=600.0,
+)
+```
+
+`rate_limit_max_delay` (default 300 seconds) caps every rate-limit-driven delay.
+
+### What changes
+
+A rate-limited retry backs off exponentially whatever `backoff_strategy` says, so a
+`fixed` or `linear` policy does not keep hammering a 429. The delay is then capped at
+`rate_limit_max_delay`.
+
+### Honouring Retry-After
+
+`parse_retry_after(text)` pulls a delay hint out of a provider's error string — it reads
+`Retry-After: 12`, `retry_after=12` and `try again in 12 seconds`, and returns the raw
+seconds or `None`. It applies no cap; the caller does.
+
+`calculate_delay()`, `next_eta()` and `schedule_retry()` all take `retry_after` and
+`is_rate_limit`. A `retry_after` hint wins over everything else, including the backoff
+strategy and `is_rate_limit`. It is treated as a floor: Qraft adds a small positive
+jitter and never returns less than the provider asked for, then applies
+`rate_limit_max_delay`.
+
+```python
+delay = policy.calculate_delay(
+    attempt_number=2,
+    retry_after=parse_retry_after(str(exc)),
+    is_rate_limit=policy.is_rate_limit(exc),
+)
+```
+
+For limiting your own request rate before a provider has to, see
+[AI workloads](ai-workloads.md) and `qraft.throttle`.
+
 ## Jitter
 
 Jitter adds random variation to retry delays to prevent thundering herd problems.
@@ -556,7 +610,10 @@ qraft_options={'jitter_max': 1.5}  # Max is 1.0
 
 ## Retry Scheduling
 
-Retries are scheduled using Django-Q2's Schedule model.
+A retry is a `QraftTaskAttempt` row in the `SCHEDULED` state, carrying the exact time it
+becomes due. Qraft's own dispatcher claims it at that time and hands it to the broker.
+Django-Q2's scheduler is not involved, so a 2-second backoff arrives in about 2 seconds
+instead of waiting for the next 30-second scheduler cycle.
 
 ### How It Works
 
@@ -569,43 +626,48 @@ Task fails (Attempt 1)
   │
   ├─► Calculate next delay: 30s (exponential, attempt 1)
   │
-  ├─► Create Schedule record:
-  │     - name: qraft_retry:{task_id}:2
-  │     - func: original task function
-  │     - next_run: now + 30s
+  ├─► Create the attempt row for attempt 2:
+  │     - state: scheduled
+  │     - not_before: now + 30s
+  │     - cluster: inherited from the attempt that just failed
   │
   └─► Set QraftTask status to PENDING
+      (row and status commit together — a crash loses neither)
 
 30 seconds later...
   │
-  ├─► Django-Q2 scheduler picks up Schedule
-  │
-  ├─► Queues task for execution (Attempt 2)
+  ├─► The dispatcher claims the row (state → queued) and enqueues it,
+  │     stamping the Django-Q2 task id on the same row
   │
   └─► Worker executes → Success or retry again
 ```
 
-### Schedule Records
+### Scheduled Attempt Rows
 
 Query scheduled retries:
 
 ```python
-from django_q.models import Schedule
+from qraft.models import QraftTaskAttempt
+from qraft.models.tasks import AttemptState
 
-# Find retries for a specific task
-retries = Schedule.objects.filter(
-    name__startswith=f'qraft_retry:{task_id}'
+retries = QraftTaskAttempt.objects.filter(
+    qraft_task_id=task_id,
+    state=AttemptState.SCHEDULED,
 )
 
 for retry in retries:
-    print(f"Next run: {retry.next_run}")
-    print(f"Function: {retry.func}")
-    print(f"Attempt: {retry.name.split(':')[-1]}")
+    print(f"Due at: {retry.not_before}")
+    print(f"Attempt: {retry.attempt_number}")
+    print(f"Cluster: {retry.cluster or 'any'}")
 ```
+
+`dispatch_batch` and `dispatch_interval` control how many due attempts one dispatcher pass
+enqueues and how long it sleeps when nothing is due. See
+[configuration.md](configuration.md).
 
 ### Task Naming
 
-Retry tasks use a special naming convention:
+A dispatched attempt is queued under a marker name:
 
 ```
 Initial task: user-provided task_name or auto-generated
@@ -616,7 +678,10 @@ Examples:
 - qraft:123e4567-e89b-12d3-a456-426614174000:3
 ```
 
-This allows the hook handler to identify retry tasks and create attempt records.
+Linkage no longer depends on this name — the dispatcher stamps the Django-Q2 task id on
+the attempt row before enqueueing, and the hook handler resolves completion by that id.
+The name stays because it reads identically in the Django-Q2 admin, and because it is the
+only way to resolve a pre-1.3 `Schedule` delivery still in flight across an upgrade.
 
 ## Exhaustion Handling
 
@@ -1022,12 +1087,19 @@ print(f"Skip exceptions: {task.retry_policy['skip_exceptions']}")
 **Check scheduled retries:**
 
 ```python
-from django_q.models import Schedule
+from qraft.models import QraftTaskAttempt
+from qraft.models.tasks import AttemptState
 
-retries = Schedule.objects.filter(name__startswith=f'qraft_retry:{task_id}')
+retries = QraftTaskAttempt.objects.filter(
+    qraft_task_id=task_id,
+    state=AttemptState.SCHEDULED,
+)
 for retry in retries:
-    print(f"Scheduled for {retry.next_run}")
+    print(f"Due at {retry.not_before}")
 ```
+
+A row stuck in `scheduled` with `not_before` in the past means no dispatcher is running:
+the dispatcher runs beside the monitor in `qraftcluster`.
 
 ### Retries Happening Too Quickly
 

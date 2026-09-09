@@ -21,12 +21,14 @@ first, with `attempts` prefetched.
 ```python
 from qraft.dlq import requeue
 
-requeue(task)  # -> Django-Q2 Schedule ID (str)
+requeue(task)  # -> QraftTaskAttempt id (str)
 ```
 
 `requeue()` re-enqueues the task's stored `func`/`task_args`/`task_kwargs` for immediate
-execution, using the same Schedule+marker mechanism as a scheduled retry
-(`RetryPolicy.schedule_retry`). This means:
+execution. It goes through `qraft.scheduler.schedule_attempt()`, the same path a
+scheduled retry takes: a SCHEDULED `QraftTaskAttempt` row with an immediate ETA, which
+the dispatcher then claims and enqueues. No Django-Q2 `Schedule` row and no marker name
+are involved. This means:
 
 - It runs as the **next attempt on the same `QraftTask`**, not a new one — attempt history,
   hooks, and idempotency key are all preserved.

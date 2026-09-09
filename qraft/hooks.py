@@ -14,6 +14,8 @@ from django.db import transaction
 from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
+from . import metrics, signals
+from .brokers import broker_for_cluster
 from .conf import executing_cluster, get_conf
 from .retry import QRAFT_MARKER_PREFIX, handle_task_retry
 
@@ -97,6 +99,57 @@ def dispatch_hook_once(dispatch_model, lookup: dict, hook_path: str, enqueue) ->
         )
 
 
+def hook_context(attempt, qraft_task, outcome: str) -> dict:
+    """
+    The `context` keyword hooks receive under `hook_context=True`.
+
+    Assembled from rows the handler already holds and frozen into the hook
+    task's arguments, so it survives the same crashes the HookDispatch row
+    does. `result_ref` is the Django-Q2 task id whose `result` holds the
+    return value.
+    """
+    payload = signals.attempt_payload(attempt, qraft_task, outcome)
+    return {
+        "task_id": payload["task_id"],
+        "attempt_id": payload["attempt_id"],
+        "attempt_number": payload["attempt_number"],
+        "outcome": outcome,
+        "exception_class": payload["exception_class"],
+        "run_id": payload["run_id"],
+        "stage": payload["stage"],
+        "subject_type": payload["subject_type"],
+        "subject_id": payload["subject_id"],
+        "result_ref": attempt.q2_task_id,
+        "traceparent": attempt.trace_context,
+        "date_started": payload["date_started"],
+        "date_completed": payload["date_completed"],
+    }
+
+
+def announce_resolution(attempt, qraft_task, outcome: str, settled: bool) -> None:
+    """
+    Send `attempt_finished` (and `task_settled` when no retry follows) and count
+    the resolution. Called from inside the resolving transaction, so both the
+    signals and the counts ride `on_commit`.
+    """
+    from .models import QraftTask, QraftTaskAttempt
+
+    payload = signals.attempt_payload(attempt, qraft_task, outcome)
+    signals.send(signals.attempt_finished, QraftTaskAttempt, payload)
+    if settled:
+        signals.send(signals.task_settled, QraftTask, payload)
+
+    labels = {"func": qraft_task.func, "cluster": attempt.cluster, "outcome": outcome}
+    metrics.counter_on_commit(
+        "qraft.attempt.finished",
+        exception_class=attempt.exception_class or "",
+        **labels,
+    )
+    duration = metrics.seconds_between(attempt.date_started, attempt.date_completed)
+    if duration is not None:
+        metrics.histogram_on_commit("qraft.attempt.duration", duration, **labels)
+
+
 def _parse_qraft_marker(marker: str) -> tuple[str, int] | None:
     """
     Parse a Qraft marker string into (task_id, attempt_number).
@@ -124,7 +177,7 @@ def attempt_from_marker(task_name: str | None, q2_task_id: str):
     Compatibility path, kept for one release. Qraft's own dispatcher stamps
     the q2 task id on the attempt row before enqueueing, so every delivery it
     makes resolves through the fast lookup and never reaches here. What still
-    does is a pre-2.0 Django-Q2 `Schedule` row written by the previous version
+    does is a Django-Q2 `Schedule` row written by a pre-1.3 release
     and fired after the upgrade: that run has no attempt row of its own, and
     the marker in its task_name is the only link back to the QraftTask.
 
@@ -266,6 +319,7 @@ def qraft_hook_handler(q2_task):
     Args:
         q2_task: Django-Q2 Task object passed by the monitor process
     """
+    from . import runs
     from .dispatchers import route_workflow_completion
     from .models import QraftTask, QraftTaskAttempt, TaskStatus
 
@@ -332,6 +386,13 @@ def qraft_hook_handler(q2_task):
         if retry_scheduled:
             QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
+        announce_resolution(
+            attempt,
+            qraft_task,
+            "succeeded" if q2_task.success else "failed",
+            settled=not retry_scheduled,
+        )
+
     # A scheduled retry means the task is not terminal yet
     if retry_scheduled:
         return
@@ -341,9 +402,13 @@ def qraft_hook_handler(q2_task):
     # the membership question, and membership is immutable after creation.
     if not route_workflow_completion(attempt.qraft_task, attempt):
         HookDispatcher(qraft_task, attempt).dispatch(q2_task.success)
-    # Routing and hook dispatch are idempotent (counted flag, step-index CAS,
-    # HookDispatch unique rows), so the flag needs setting only after they
-    # finish; a crash above leaves it False for the reaper to replay.
+    # A no-op unless this task is a run stage's bound unit; a workflow member
+    # carries the same run and stage but never settles one.
+    runs.note_unit_settled(qraft_task)
+    # Routing, run settlement and hook dispatch are all idempotent (counted
+    # flag, step-index CAS, stage settled_at CAS, HookDispatch unique rows), so
+    # the flag needs setting only after they finish; a crash above leaves it
+    # False for the reaper to replay.
     QraftTaskAttempt.objects.filter(id=attempt.id).update(routed=True)
 
 
@@ -381,7 +446,7 @@ class HookDispatcher:
         self._call_hook(
             hook_path=self.qraft_task.success_hook,
             args=self.qraft_task.success_args or [],
-            kwargs=self.qraft_task.success_kwargs or {},
+            kwargs=self._hook_kwargs(self.qraft_task.success_kwargs, "succeeded"),
             hook_type="success",
         )
 
@@ -393,9 +458,16 @@ class HookDispatcher:
         self._call_hook(
             hook_path=self.qraft_task.failure_hook,
             args=self.qraft_task.failure_args or [],
-            kwargs=self.qraft_task.failure_kwargs or {},
+            kwargs=self._hook_kwargs(self.qraft_task.failure_kwargs, "failed"),
             hook_type="failure",
         )
+
+    def _hook_kwargs(self, configured: dict | None, outcome: str) -> dict:
+        """The caller's kwargs, plus `context` when the task opted in."""
+        kwargs = dict(configured or {})
+        if self.qraft_task.hook_context:
+            kwargs["context"] = hook_context(self.attempt, self.qraft_task, outcome)
+        return kwargs
 
     def _call_hook(self, hook_path, args, kwargs, hook_type):
         """
@@ -423,18 +495,23 @@ class HookDispatcher:
         Creates a HookDispatch record for idempotency and tracking.
         """
         from .models import HookDispatch
+        from .runner import dispatch_spec
 
+        func, args, kwargs = dispatch_spec(hook_path, args, kwargs)
         dispatch_hook_once(
             HookDispatch,
             {"qraft_task": self.qraft_task, "hook_type": hook_type},
             hook_path,
             lambda: q2_async_task(
-                hook_path,
+                func,
                 *args,
                 **kwargs,
                 task_name=f"hook:{hook_type}:{self.qraft_task.id}",
                 hook=None,  # No hook on hook tasks - prevents recursion
                 cluster=executing_cluster(),
+                # Named explicitly: `cluster=` alone would resolve the broker
+                # against this process's Conf, not the target cluster's.
+                broker=broker_for_cluster(executing_cluster()),
                 # A hook that keeps failing must not be redelivered forever;
                 # nothing above this layer retries it.
                 ack_failure=True,
@@ -449,9 +526,11 @@ class HookDispatcher:
         with no HookDispatch record, so the idempotency/duplicate-delivery
         protection _call_hook_async gets from that record does not apply here.
         """
+        from .runner import call_target
+
         try:
             hook_func = import_string(hook_path)
-            hook_func(*args, **kwargs)
+            call_target(hook_func, *args, **kwargs)
 
             _logger.debug(
                 "Successfully called %s hook '%s' for QraftTask %s",

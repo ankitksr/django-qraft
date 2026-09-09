@@ -13,19 +13,24 @@ Welcome to the Django-Qraft documentation! This guide will help you understand, 
 - [Retry Policies](retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](threading.md) - Concurrency for I/O-bound tasks
 - [Workflow Primitives](workflows.md) - Chain, Iter, Batch, and approval steps
+- [Runs](runs.md) - Stages, settlement, request budgets for a pipeline that enqueues itself
 - [AI Workloads](ai-workloads.md) - Rate limits, throttling, usage accounting, idempotency, reaper, priority lanes
 - [Monitoring Dashboard](dashboard.md) - Bundled staff dashboard with live metrics and JSON endpoints
+- [Dead Letter Queue](dlq.md) - Listing and requeuing exhausted attempts
 
 ### Advanced Topics
 - [django.tasks Backend](django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
 - [Roadmap](roadmap.md) - Positioning and planned features
 - [Architecture](architecture.md) - System design and extension patterns
 - [Development Guide](development.md) - Contributing and local development
+- [Test Drive](test-drive.md) - A guided walkthrough of the demo app
+- [Lifecycle Map](lifecycle-map.html) - Visual map of task and workflow state transitions
 
 ### Additional Resources
 - [Testing Guide](../tests/README.md) - Running and writing tests
 - [Demo Application](../demo/README.md) - Interactive feature demonstrations
-- [Future Features](future/) - Planned enhancements
+- [Future Features](future/) - Planned enhancements: [execution graphs](future/graphs.md),
+  [asyncio worker](future/asyncio-worker.md), [Django-Q2 absorption plan](future/q2-absorption.md)
 
 ## Documentation Overview
 
@@ -225,6 +230,8 @@ QRAFT_CLUSTER = {
     "reap_interval": 60.0,     # Seconds between sweeps
     "reap_stale_after": 3600.0,  # Unresolved seconds before a never-started attempt is orphaned
     "heartbeat_interval": 30.0,  # Seconds between execution-lease heartbeats
+    "min_heartbeat_grace": 90.0,  # Floor on the grace period; detection latency is max(3x, this)
+    "max_executions_per_attempt": 1,  # Deliveries of one attempt a worker may begin
 }
 ```
 

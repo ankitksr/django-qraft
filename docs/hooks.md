@@ -12,6 +12,7 @@ Django-Qraft provides a dual-phase hook system with separate success and failure
 - [Hook Arguments](#hook-arguments)
 - [Retry Integration](#retry-integration)
 - [Use Cases and Patterns](#use-cases-and-patterns)
+- [Signals](#signals)
 - [Advanced Topics](#advanced-topics)
 - [Troubleshooting](#troubleshooting)
 
@@ -38,8 +39,8 @@ Django-Qraft extends Django-Q2's single hook with a dual-phase system:
 from qraft.tasks import async_task
 
 # Define hook function
-def on_success(result, **kwargs):
-    print(f"Task completed with result: {result}")
+def on_success(**kwargs):
+    print("Task completed")
 
 # Queue task with success hook
 task_id = async_task(
@@ -54,14 +55,15 @@ task_id = async_task(
 ### Failure Hook Only
 
 ```python
-def on_failure(task_id, exception_class, **kwargs):
-    print(f"Task {task_id} failed with {exception_class}")
+def on_failure(context=None, **kwargs):
+    print(f"Task {context['task_id']} failed with {context['exception_class']}")
     # Send alert, log to monitoring service, etc.
 
 task_id = async_task(
     'myapp.tasks.risky_operation',
     qraft_options={
         'failure_hook': 'myapp.hooks.on_failure',
+        'hook_context': True,
     }
 )
 ```
@@ -69,11 +71,11 @@ task_id = async_task(
 ### Both Hooks
 
 ```python
-def on_success(result, **kwargs):
-    print(f"Success: {result}")
+def on_success(**kwargs):
+    print("Success")
 
-def on_failure(task_id, exception_class, **kwargs):
-    print(f"Failure: {exception_class}")
+def on_failure(context=None, **kwargs):
+    print(f"Failure: {context['exception_class']}")
 
 task_id = async_task(
     'myapp.tasks.important_task',
@@ -81,61 +83,63 @@ task_id = async_task(
     qraft_options={
         'success_hook': 'myapp.hooks.on_success',
         'failure_hook': 'myapp.hooks.on_failure',
+        'hook_context': True,
     }
 )
 ```
 
 ## Hook Function Signatures
 
+Qraft injects nothing into a hook. A hook receives exactly what you configured:
+`success_args`/`failure_args` as positional arguments, `success_kwargs`/`failure_kwargs`
+as keyword arguments, and — only when the task sets `hook_context=True` — one extra
+`context` keyword. The task's return value is not passed; reach it through
+`context['result_ref']`, described in [Hook context](#hook-context).
+
+Write every hook with `**kwargs` so a later Qraft release that adds a keyword does not
+break it.
+
 ### Success Hook
 
 Called when a task completes successfully.
 
-**Required parameters:**
-
 ```python
-def on_success(result, **kwargs):
-    """
-    Args:
-        result: The return value from the task function
-        **kwargs: Additional arguments (from success_kwargs)
-    """
-    pass
-```
+def on_success(user_id, notify=True, **kwargs):
+    if notify:
+        send_notification(user_id, "Task completed")
 
-**Example with custom arguments:**
-
-```python
-def on_success(result, user_id=None, notify=True, **kwargs):
-    if notify and user_id:
-        send_notification(user_id, f"Task completed: {result}")
+async_task(
+    'myapp.tasks.process_data',
+    qraft_options={
+        'success_hook': 'myapp.hooks.on_success',
+        'success_args': [42],            # -> user_id
+        'success_kwargs': {'notify': True},
+    },
+)
 ```
 
 ### Failure Hook
 
-Called when a task fails and retries are exhausted (or no retry policy configured).
+Called when a task fails and retries are exhausted, or when the task has no retry policy.
 
-**Required parameters:**
-
-```python
-def on_failure(task_id, exception_class, **kwargs):
-    """
-    Args:
-        task_id: UUID of the QraftTask
-        exception_class: Name of exception that caused failure (str)
-        **kwargs: Additional arguments (from failure_kwargs)
-    """
-    pass
-```
-
-**Example with custom arguments:**
+The failing task's id and exception class are not injected either. Opt into `context` to
+get them:
 
 ```python
-def on_failure(task_id, exception_class, alert_level='warning', **kwargs):
-    if alert_level == 'critical':
-        send_pager_alert(f"Task {task_id} failed: {exception_class}")
-    else:
-        log_warning(f"Task {task_id} failed: {exception_class}")
+def on_failure(alert_level='warning', context=None, **kwargs):
+    if context and alert_level == 'critical':
+        send_pager_alert(
+            f"Task {context['task_id']} failed: {context['exception_class']}"
+        )
+
+async_task(
+    'myapp.tasks.process_data',
+    qraft_options={
+        'failure_hook': 'myapp.hooks.on_failure',
+        'failure_kwargs': {'alert_level': 'critical'},
+        'hook_context': True,
+    },
+)
 ```
 
 ### Complete Example
@@ -143,38 +147,34 @@ def on_failure(task_id, exception_class, alert_level='warning', **kwargs):
 ```python
 # myapp/hooks.py
 
-def on_task_success(result, pipeline_id=None, **kwargs):
-    """
-    Called when task completes successfully.
+def on_task_success(pipeline_id=None, context=None, **kwargs):
+    """Called when task completes successfully.
 
     Args:
-        result: Task return value
-        pipeline_id: Optional pipeline identifier
+        pipeline_id: Custom argument
+        context: task_id, result_ref and the rest of the attempt's outcome
     """
     if pipeline_id:
-        update_pipeline_status(pipeline_id, 'completed', result)
+        update_pipeline_status(pipeline_id, 'completed')
 
-    # Log to monitoring
-    logger.info(f"Task completed successfully: {result}")
+    logger.info("Task %s completed successfully", context['task_id'])
 
 
-def on_task_failure(task_id, exception_class, notify_admin=False, **kwargs):
-    """
-    Called when task fails after all retries exhausted.
+def on_task_failure(notify_admin=False, context=None, **kwargs):
+    """Called when task fails after all retries exhausted.
 
     Args:
-        task_id: QraftTask UUID
-        exception_class: Exception class name (str)
         notify_admin: Whether to send admin alert
+        context: task_id, exception_class and the rest of the attempt's outcome
     """
-    # Log failure
-    logger.error(f"Task {task_id} failed permanently: {exception_class}")
+    logger.error(
+        "Task %s failed permanently: %s", context['task_id'], context['exception_class']
+    )
 
-    # Conditional admin notification
     if notify_admin:
         send_admin_alert(
-            subject=f"Task {task_id} Failed",
-            body=f"Exception: {exception_class}",
+            subject=f"Task {context['task_id']} Failed",
+            body=f"Exception: {context['exception_class']}",
         )
 
 # myapp/tasks.py
@@ -188,6 +188,7 @@ task_id = async_task(
         'success_kwargs': {'pipeline_id': 'pipe-123'},
         'failure_hook': 'myapp.hooks.on_task_failure',
         'failure_kwargs': {'notify_admin': True},
+        'hook_context': True,
     }
 )
 ```
@@ -316,9 +317,9 @@ from qraft.models import HookDispatch
 class HookDispatch(models.Model):
     qraft_task = models.ForeignKey(QraftTask, on_delete=models.CASCADE)
     hook_type = models.CharField(max_length=10)  # 'success' or 'failure'
-    hook_path = models.CharField(max_length=255)  # Dotted path
+    hook_path = models.CharField(max_length=256)  # Dotted path
     q2_task_id = models.CharField(max_length=32, unique=True)  # Hook task ID
-    dispatched_at = models.DateTimeField(auto_now_add=True)
+    date_created = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = [('qraft_task', 'hook_type')]
@@ -368,7 +369,7 @@ hooks = HookDispatch.objects.filter(qraft_task=qraft_task)
 for hook in hooks:
     print(f"Hook: {hook.hook_type}")
     print(f"Path: {hook.hook_path}")
-    print(f"Dispatched: {hook.dispatched_at}")
+    print(f"Created: {hook.date_created}")
 
     # Check if hook completed
     q2_task = Task.objects.get(id=hook.q2_task_id)
@@ -425,24 +426,65 @@ task_hooks = Task.objects.filter(name__startswith=f'hook:{hook_type}:{task_id}')
 
 Hooks can receive custom arguments via `success_kwargs` and `failure_kwargs`.
 
+### Hook context
+
+A hook receives the arguments the caller froze at enqueue. It does not know which
+attempt produced it or how that attempt ended. Set `hook_context` and it does:
+
+```python
+async_task(
+    'myapp.tasks.ingest', worksheet_id,
+    qraft_options={
+        'success_hook': 'myapp.hooks.on_ingested',
+        'failure_hook': 'myapp.hooks.on_ingest_failed',
+        'hook_context': True,
+    },
+)
+
+def on_ingested(context=None, **kwargs):
+    logger.info("attempt %s of %s ended %s",
+                context['attempt_number'], context['task_id'], context['outcome'])
+```
+
+`context` is a plain dict with `task_id`, `attempt_id`, `attempt_number`, `outcome`
+(`succeeded`, `failed` or `orphaned`), `exception_class`, `run_id`, `stage`,
+`subject_type`, `subject_id`, `result_ref` (the Django-Q2 task id whose `result` holds
+the return value), `traceparent`, `date_started` and `date_completed`. It is assembled in
+the hook handler from rows it already holds and frozen into the hook task's arguments, so
+it survives the same crashes the `HookDispatch` row does.
+
+The flag is opt-in because `context` is a plausible name for a caller's own keyword
+argument — an existing hook signature never changes underneath you. A task that opts in
+and also passes `context` in `success_kwargs` loses the caller's value.
+
+Workflow constructors take the same flag, and their hooks receive the workflow's id,
+type, outcome and counters — `current_step_index` for a chain, `completed_count`,
+`total_count`, `success_count` and `failure_count` for an iter or a batch:
+
+```python
+QraftBatch(on_success='myapp.hooks.batch_done', hook_context=True)
+```
+
+`on_cancelled` receives the same shape as `on_success` and `on_failure`, read at the
+moment the cancel took effect. How much of a fan-out had already finished is the
+question that hook exists to answer.
+
+A run's `on_settled` hook always receives a `context` — it has no caller-frozen arguments
+to protect — carrying the run's ids, outcome and per-stage outcomes. See
+[Runs](workflows.md#the-durable-completion-event).
+
 ### Success Hook Arguments
 
 ```python
-def on_success(result, user_id=None, notify=True, context=None, **kwargs):
+def on_success(user_id=None, notify=True, **kwargs):
     """
     Args:
-        result: Task return value (always provided)
-        user_id: Custom argument
-        notify: Custom argument
-        context: Custom argument
+        user_id: Custom argument, bound from success_kwargs
+        notify: Custom argument, bound from success_kwargs
         **kwargs: Catch-all for future arguments
     """
     if notify and user_id:
-        User.objects.get(id=user_id).notify(f"Task completed: {result}")
-
-    if context:
-        context['status'] = 'completed'
-        context['result'] = result
+        User.objects.get(id=user_id).notify("Task completed")
 
 task_id = async_task(
     'myapp.tasks.process_data',
@@ -452,7 +494,6 @@ task_id = async_task(
         'success_kwargs': {
             'user_id': 123,
             'notify': True,
-            'context': {'pipeline': 'data-import'},
         },
     }
 )
@@ -461,16 +502,15 @@ task_id = async_task(
 ### Failure Hook Arguments
 
 ```python
-def on_failure(task_id, exception_class, alert_level='warning', owner=None, **kwargs):
+def on_failure(alert_level='warning', owner=None, context=None, **kwargs):
     """
     Args:
-        task_id: QraftTask UUID (always provided)
-        exception_class: Exception class name (always provided)
-        alert_level: Custom argument
-        owner: Custom argument
+        alert_level: Custom argument, bound from failure_kwargs
+        owner: Custom argument, bound from failure_kwargs
+        context: task_id and exception_class, present because hook_context is set
         **kwargs: Catch-all
     """
-    message = f"Task {task_id} failed: {exception_class}"
+    message = f"Task {context['task_id']} failed: {context['exception_class']}"
 
     if alert_level == 'critical':
         send_pagerduty_alert(message)
@@ -488,6 +528,7 @@ task_id = async_task(
             'alert_level': 'critical',
             'owner': 'admin@example.com',
         },
+        'hook_context': True,
     }
 )
 ```
@@ -500,7 +541,7 @@ You can pass computed values:
 import uuid
 
 pipeline_id = str(uuid.uuid4())
-context = {
+pipeline_meta = {
     'pipeline_id': pipeline_id,
     'started_at': datetime.now().isoformat(),
     'user': request.user.id,
@@ -511,12 +552,14 @@ task_id = async_task(
     data,
     qraft_options={
         'success_hook': 'myapp.hooks.on_pipeline_success',
-        'success_kwargs': {'context': context},
+        'success_kwargs': {'pipeline_meta': pipeline_meta},
         'failure_hook': 'myapp.hooks.on_pipeline_failure',
-        'failure_kwargs': {'context': context},
+        'failure_kwargs': {'pipeline_meta': pipeline_meta},
     }
 )
 ```
+
+Note the kwarg name here is `pipeline_meta`, not `context` — `context` is reserved for the dict Qraft assembles when `hook_context` is set (see [Hook context](#hook-context)).
 
 ## Retry Integration
 
@@ -579,32 +622,33 @@ Attempt 3: Fails (ConnectionError)
 ### Checking Retry Status in Hooks
 
 ```python
-def on_failure(task_id, exception_class, **kwargs):
+def on_failure(context=None, **kwargs):
     from qraft.models import QraftTask, TaskStatus
 
-    task = QraftTask.objects.get(id=task_id)
+    task = QraftTask.objects.get(id=context['task_id'])
 
     if task.status == TaskStatus.EXHAUSTED:
-        # All retries exhausted
         logger.error(
-            f"Task {task_id} exhausted after {task.attempt_count} attempts: {exception_class}"
+            "Task %s exhausted after %s attempts: %s",
+            task.id, task.attempt_count, context['exception_class'],
         )
     else:
-        # Single failure without retry
-        logger.warning(f"Task {task_id} failed: {exception_class}")
+        logger.warning("Task %s failed: %s", task.id, context['exception_class'])
 ```
+
+Pass `'hook_context': True` in `qraft_options` for this hook to receive `context`.
 
 ## Use Cases and Patterns
 
 ### Pattern 1: Notification on Completion
 
 ```python
-def notify_user(result, user_id=None, **kwargs):
+def notify_user(user_id=None, **kwargs):
     if user_id:
         user = User.objects.get(id=user_id)
         user.email_user(
             subject='Task Completed',
-            message=f'Your task completed successfully: {result}',
+            message='Your task completed successfully.',
         )
 
 async_task(
@@ -620,22 +664,25 @@ async_task(
 ### Pattern 2: Task Chaining
 
 ```python
-def on_extract_success(result, pipeline_id=None, **kwargs):
-    # Chain to next task
+from django_q.models import Task
+
+def on_extract_success(pipeline_id=None, context=None, **kwargs):
+    extracted = Task.objects.get(id=context['result_ref']).result
     async_task(
         'myapp.tasks.transform_data',
-        result,
+        extracted,
         qraft_options={
             'success_hook': 'myapp.hooks.on_transform_success',
             'success_kwargs': {'pipeline_id': pipeline_id},
+            'hook_context': True,
         }
     )
 
-def on_transform_success(result, pipeline_id=None, **kwargs):
-    # Chain to final task
+def on_transform_success(pipeline_id=None, context=None, **kwargs):
+    transformed = Task.objects.get(id=context['result_ref']).result
     async_task(
         'myapp.tasks.load_data',
-        result,
+        transformed,
         qraft_options={
             'success_hook': 'myapp.hooks.on_load_success',
             'success_kwargs': {'pipeline_id': pipeline_id},
@@ -649,26 +696,32 @@ async_task(
     qraft_options={
         'success_hook': 'myapp.hooks.on_extract_success',
         'success_kwargs': {'pipeline_id': 'pipe-123'},
+        'hook_context': True,
     }
 )
 ```
 
+For task orchestration like this, prefer [`QraftChain`](workflows.md) — it is built for exactly this case and does not need the hook to fetch its own predecessor's result.
+
 ### Pattern 3: Status Updates
 
 ```python
-def update_job_status(result, job_id=None, **kwargs):
+from django_q.models import Task
+
+def update_job_status(job_id=None, context=None, **kwargs):
     if job_id:
+        result = Task.objects.get(id=context['result_ref']).result
         Job.objects.filter(id=job_id).update(
             status='completed',
             completed_at=timezone.now(),
             result=result,
         )
 
-def mark_job_failed(task_id, exception_class, job_id=None, **kwargs):
+def mark_job_failed(job_id=None, context=None, **kwargs):
     if job_id:
         Job.objects.filter(id=job_id).update(
             status='failed',
-            error=exception_class,
+            error=context['exception_class'],
             failed_at=timezone.now(),
         )
 
@@ -682,6 +735,7 @@ async_task(
         'success_kwargs': {'job_id': job.id},
         'failure_hook': 'myapp.hooks.mark_job_failed',
         'failure_kwargs': {'job_id': job.id},
+        'hook_context': True,
     }
 )
 ```
@@ -689,7 +743,7 @@ async_task(
 ### Pattern 4: Cleanup on Failure
 
 ```python
-def cleanup_temp_files(task_id, exception_class, temp_dir=None, **kwargs):
+def cleanup_temp_files(temp_dir=None, **kwargs):
     if temp_dir and os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
         logger.info(f"Cleaned up temporary directory: {temp_dir}")
@@ -709,15 +763,14 @@ async_task(
 ### Pattern 5: Metrics Collection
 
 ```python
-def record_success_metric(result, metric_name=None, **kwargs):
+def record_success_metric(metric_name=None, **kwargs):
     if metric_name:
         statsd.increment(f'{metric_name}.success')
-        statsd.timing(f'{metric_name}.duration', result.get('duration', 0))
 
-def record_failure_metric(task_id, exception_class, metric_name=None, **kwargs):
+def record_failure_metric(metric_name=None, context=None, **kwargs):
     if metric_name:
         statsd.increment(f'{metric_name}.failure')
-        statsd.increment(f'{metric_name}.failure.{exception_class}')
+        statsd.increment(f'{metric_name}.failure.{context["exception_class"]}')
 
 async_task(
     'myapp.tasks.api_call',
@@ -727,9 +780,78 @@ async_task(
         'success_kwargs': {'metric_name': 'api.external'},
         'failure_hook': 'myapp.hooks.record_failure_metric',
         'failure_kwargs': {'metric_name': 'api.external'},
+        'hook_context': True,
     }
 )
 ```
+
+## Signals
+
+A hook is one callback per task. When an application wants to react to every
+transition from one place — write a domain event, invalidate a cache, log a line —
+`qraft.signals` is the cheaper surface.
+
+```python
+from django.dispatch import receiver
+from qraft import signals
+
+@receiver(signals.task_settled)
+def on_task_settled(sender, payload, **kwargs):
+    Event.objects.create(
+        subject_type=payload['subject_type'],
+        subject_id=payload['subject_id'],
+        kind=payload['outcome'],
+    )
+```
+
+| Signal | Fires when | Process |
+|---|---|---|
+| `task_started` | the lease opens on an attempt for the first time | worker |
+| `attempt_finished` | an attempt resolves, whatever the outcome | monitor, or the process that reaped |
+| `task_settled` | a task reaches SUCCEEDED, FAILED or EXHAUSTED | monitor |
+| `workflow_settled` | a chain, iter or batch settles | monitor, or the web process that cancelled |
+| `attempt_stall_suspected` | the reaper flags an attempt | monitor |
+| `run_settled`, `run_overdue` | a run settles or is flagged overdue | monitor |
+
+There is no `attempt_failed`: a receiver that only wants failures reads `outcome` on
+`attempt_finished`.
+
+### Payloads are ids, not instances
+
+Every signal sends `sender=` the model class and one `payload` keyword argument: an
+immutable mapping holding `task_id`, `attempt_id`, `attempt_number`, `func`, `status`,
+`outcome`, `exception_class`, `run_id`, `stage`, `subject_type`, `subject_id`, `cluster`,
+and the attempt's timestamps as ISO strings. A model instance captured before commit and
+handed to a receiver after it is a snapshot that may already be stale; ids are what a
+receiver looks up when it needs more.
+
+Sends are registered with `transaction.on_commit` from inside the transaction that
+performs the transition, so a receiver that reads rows sees the committed resolution.
+Outside a transaction `on_commit` runs the callback immediately.
+
+### Best effort, by design
+
+**Signals are best-effort observers for logs, caches and in-process reactions; anything
+the application must not miss goes through a hook, whose dispatch row survives a crash.**
+
+Every send uses `send_robust()`: a receiver that raises is logged at warning with its
+name and never reaches the caller, which is the hook handler in the monitor. A broken
+observer must not break completion routing.
+
+Each signal fires at most once per transition, guarded by the same compare-and-swaps the
+transitions use: the attempt resolution's `success__isnull=True` update, the workflow's
+`settled_at` column, the lease's `date_started__isnull=True` update. What that does not
+cover is a crash between commit and the `on_commit` callback — that window loses the
+signal, and `on_commit` callbacks are not durable. The row still records the transition.
+
+### Receivers must be cheap
+
+Every signal except `task_started` fires on the thread that runs the hook handler, in the
+monitor process, or in the reaper thread beside it. That is the thread Qraft moved hooks
+off so the monitor would not bottleneck. A row insert, a cache write or a log line is
+fine. A receiver that calls a provider or runs a report belongs in a hook.
+
+`task_started` fires in the worker process, beside the task itself.
 
 ## Advanced Topics
 
@@ -783,29 +905,29 @@ except Exception as e:
 
 ### Accessing Task Metadata in Hooks
 
+Set `hook_context` to get the task's id and the rest of its outcome, then look up the
+`QraftTask` row for anything not already in `context`:
+
 ```python
-def on_success(result, **kwargs):
+def on_success(context=None, **kwargs):
     from qraft.models import QraftTask
 
-    # Get task ID from kwargs if passed
-    task_id = kwargs.get('task_id')
-    if task_id:
-        task = QraftTask.objects.get(id=task_id)
-        print(f"Task function: {task.func}")
-        print(f"Attempts: {task.attempt_count}")
-        print(f"Created: {task.created_at}")
+    task = QraftTask.objects.get(id=context['task_id'])
+    print(f"Task function: {task.func}")
+    print(f"Attempts: {task.attempt_count}")
+    print(f"Created: {task.created_at}")
 
 async_task(
     'myapp.tasks.process_data',
     data,
     qraft_options={
         'success_hook': 'myapp.hooks.on_success',
-        'success_kwargs': {'task_id': '{{TASK_ID}}'},  # Placeholder replaced
+        'hook_context': True,
     }
 )
 ```
 
-**Note:** Direct task ID access is not currently supported. Use `task_id` parameter for failure hooks.
+See [Hook context](#hook-context) for the full set of fields `context` carries.
 
 ## Troubleshooting
 
@@ -880,7 +1002,7 @@ python manage.py shell
 **Check kwargs are being passed:**
 
 ```python
-def on_success(result, custom_arg=None, **kwargs):
+def on_success(custom_arg=None, **kwargs):
     print(f"Received custom_arg: {custom_arg}")
     print(f"All kwargs: {kwargs}")
 
@@ -900,7 +1022,7 @@ async_task(
 'success_kwargs': {'cusom_arg': 'value'}  # Typo!
 
 # In hook function
-def on_success(result, custom_arg=None, **kwargs):  # Won't match
+def on_success(custom_arg=None, **kwargs):  # Won't match
 ```
 
 ## Related Documentation

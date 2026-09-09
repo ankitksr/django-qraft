@@ -5,16 +5,26 @@ from uuid import uuid4
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
-from .mixins import get_q2_task
+from .mixins import RunMemberMixin, SubjectMixin, get_q2_task
 
 
-class QraftTask(models.Model):
+class QraftTaskQuerySet(models.QuerySet):
+    def for_subject(self, subject_type: str, subject_id) -> "QraftTaskQuerySet":
+        """Every task for one domain entity, newest first."""
+        return self.filter(
+            subject_type=subject_type, subject_id=str(subject_id)
+        ).order_by("-date_created")
+
+
+class QraftTask(SubjectMixin, RunMemberMixin, models.Model):
     """
     Extension model for Django-Q2 Task with enhanced Qraft functionality.
 
     Stores Qraft-specific metadata (hooks, retry policy). Individual execution
     attempts are tracked via QraftTaskAttempt, each linked to a Django-Q2 task.
     """
+
+    objects = QraftTaskQuerySet.as_manager()
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
 
@@ -97,12 +107,32 @@ class QraftTask(models.Model):
         help_text="Failure hook keyword arguments",
     )
 
+    # db_default: a rolling deploy's previous release still inserts rows
+    # without this column (same reasoning as QraftTaskAttempt.state).
+    hook_context = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Whether success/failure hooks receive a `context` keyword argument",
+    )
+
     # Retry metadata
     retry_policy = models.JSONField(
         default=dict,
         blank=True,
         encoder=DjangoJSONEncoder,
         help_text="Retry policy configuration",
+    )
+
+    # A column rather than a retry_policy key: RetryPolicy.from_options copies
+    # a whitelist and would drop an unknown key silently, and stalling is not
+    # retry semantics. It coexists with the heartbeat grace rather than
+    # competing with it - a task can heartbeat every 30s while advancing
+    # nothing for 60.
+    stall_after = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Seconds without progress advancing before an attempt is "
+        "flagged as a suspected stall; null disables the check",
     )
 
     idempotency_key = models.CharField(
@@ -126,11 +156,15 @@ class QraftTask(models.Model):
         help_text="Priority lane within the consuming cluster",
     )
 
+    # Denormalised snapshot of the latest attempt's progress, for dashboard
+    # task rows. The attempt owns progress (see QraftTaskAttempt.progress);
+    # the writer stamps its `attempt_id` here and only the task's latest
+    # attempt may overwrite it.
     progress = models.JSONField(
         null=True,
         blank=True,
         encoder=DjangoJSONEncoder,
-        help_text="Task-reported progress payload (current/total/message)",
+        help_text="Snapshot of the latest attempt's progress (current/total/message)",
     )
 
     # Workflow linkage (only one will be set, if any)
@@ -171,6 +205,11 @@ class QraftTask(models.Model):
         verbose_name = "Qraft Task"
         verbose_name_plural = "Qraft Tasks"
         ordering = ["-date_created"]
+        indexes = [
+            models.Index(
+                fields=["subject_type", "subject_id"], name="qraft_task_subject_idx"
+            ),
+        ]
 
 
 class QraftTaskAttempt(models.Model):
@@ -277,6 +316,18 @@ class QraftTaskAttempt(models.Model):
         help_text="Exception class name if failed",
     )
 
+    # How many deliveries of this attempt a worker has begun. Django-Q2
+    # redelivers an unacknowledged message after a monitor crash, and every
+    # re-run refreshed the lease heartbeat, so the reaper's liveness test
+    # answered "alive" for a task stuck in a redelivery loop. The counter is
+    # the compare-and-swap that stops the second run (see qraft.lease
+    # .claim_delivery and `max_executions_per_attempt`).
+    execution_count = models.PositiveIntegerField(
+        default=0,
+        db_default=0,
+        help_text="Deliveries of this attempt a worker has begun executing",
+    )
+
     # Dispatcher idempotency flag (prevents double-counting in parallel workflows)
     counted = models.BooleanField(
         default=False,
@@ -301,8 +352,55 @@ class QraftTaskAttempt(models.Model):
         help_text="Task-reported usage (model, input_tokens, output_tokens, cost)",
     )
 
+    # Progress belongs to the attempt that produced it: a retry starts from
+    # zero rather than inheriting its predecessor's 90%, and a still-running
+    # superseded attempt cannot overwrite the current one's numbers.
+    progress = models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Attempt-reported progress payload (current/total/message)",
+    )
+    progress_reported_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last report_progress() call from this attempt",
+    )
+    # Moves only when current/total change, so a task narrating its own hang
+    # cannot defeat stall detection by reporting often.
+    progress_advanced_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last time current/total changed",
+    )
+
+    # Observation only. The attempt keeps running: nothing here resolves it,
+    # schedules a retry, or stops the worker - a retry starting while attempt 1
+    # is still writing would produce two attempts writing the same rows.
+    stall_suspected_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the reaper first flagged this attempt as a suspected stall",
+    )
+
+    trace_context = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text="W3C traceparent captured at enqueue, when a span was current",
+    )
+
     # Timing
     date_created = models.DateTimeField(auto_now_add=True)
+    # Distinct from date_created (a scheduled attempt's row is created long
+    # before it is queued) and from claimed_at (attempt 1 is never claimed):
+    # this is the moment the broker received the attempt, which is what queue
+    # wait is measured from.
+    enqueued_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the attempt was handed to the broker",
+    )
     date_started = models.DateTimeField(
         null=True,
         blank=True,
@@ -313,6 +411,15 @@ class QraftTaskAttempt(models.Model):
         blank=True,
         db_index=True,
         help_text="Last execution-lease heartbeat from the running worker",
+    )
+    returned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the target function returned or raised, stamped by "
+            "qraft.runner.run_task inside the worker. Set with success still "
+            "NULL means the work ran and its result never reached the monitor"
+        ),
     )
     date_completed = models.DateTimeField(
         null=True,

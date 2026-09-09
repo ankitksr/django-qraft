@@ -3,8 +3,11 @@
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 from django_q.tasks import async_task as q2_async_task
 
+from qraft import metrics, signals
+from qraft.brokers import broker_for_cluster
 from qraft.conf import executing_cluster
 from qraft.hooks import dispatch_hook_once
 from qraft.models import (
@@ -32,6 +35,51 @@ TERMINAL_FAILURE_STATUSES = (TaskStatus.EXHAUSTED, TaskStatus.FAILED)
 INCREMENT_NOOP = "noop"
 INCREMENT_PARTIAL = "partial"
 INCREMENT_COMPLETE = "complete"
+
+TERMINAL_WORKFLOW_STATUSES = (
+    WorkflowStatus.SUCCEEDED,
+    WorkflowStatus.FAILED,
+    WorkflowStatus.CANCELLED,
+)
+
+
+def settle_workflow(model, workflow_id, status: str, workflow_type: str):
+    """
+    Move a workflow to a terminal status exactly once.
+
+    One conditional update on `settled_at`: a final-step redelivery, an
+    already-terminal `_complete_chain`, a cancel racing a completion and a
+    replay against a pre-1.4 row (terminal status, null `settled_at`) all
+    match zero rows. `workflow_settled` and the `workflow.settled` counter
+    fire only when the update matched; the caller dispatches the workflow
+    hook on the same condition, with `WorkflowHookDispatch` as the second
+    line of defence.
+
+    Returns the refreshed workflow when this call settled it, else None.
+    """
+    now = timezone.now()
+    updated = (
+        model.objects.filter(pk=workflow_id, settled_at__isnull=True)
+        .exclude(status__in=TERMINAL_WORKFLOW_STATUSES)
+        .update(status=status, settled_at=now, date_updated=now)
+    )
+    if not updated:
+        return None
+    workflow = model.objects.get(pk=workflow_id)
+    signals.send(
+        signals.workflow_settled,
+        model,
+        signals.workflow_payload(workflow, workflow_type, status),
+    )
+    metrics.counter_on_commit(
+        "qraft.workflow.settled", workflow_type=workflow_type, outcome=status
+    )
+    # Immediately after the workflow's own compare-and-swap, so the window
+    # between the two is the one replay_unrouted() already covers.
+    from qraft import runs
+
+    runs.note_unit_settled(workflow)
+    return workflow
 
 
 class ChainDispatcher:
@@ -124,9 +172,14 @@ class ChainDispatcher:
             self.chain = chain
 
             if not next_step:
-                chain.status = WorkflowStatus.SUCCEEDED
-                chain.save(update_fields=["status", "date_updated"])
-                completed = True
+                # The final step never advances current_step_index, so the
+                # index check above passes on a replayed completion; the
+                # settlement compare-and-swap is what makes this fire once.
+                settled = settle_workflow(
+                    QraftChainModel, chain.id, WorkflowStatus.SUCCEEDED, "chain"
+                )
+                completed = settled is not None
+                self.chain = settled or chain
             elif next_step.requires_approval:
                 chain.current_step_index = next_step.step_index
                 chain.transition_to(WorkflowStatus.WAITING_APPROVAL)
@@ -145,13 +198,19 @@ class ChainDispatcher:
                 chain.save(update_fields=["current_step_index", "date_updated"])
                 _queue_chain_step(chain, next_step)
 
-        if completed:
-            self._dispatch_chain_hook(success=True)
-            _logger.info(
-                "Chain %s: final step %d succeeded, chain complete",
-                self.chain.id,
-                self.step.step_index,
-            )
+        if not next_step:
+            if completed:
+                self._dispatch_chain_hook(success=True)
+                _logger.info(
+                    "Chain %s: final step %d succeeded, chain complete",
+                    self.chain.id,
+                    self.step.step_index,
+                )
+            else:
+                _logger.debug(
+                    "Chain %s: already settled, skipping replayed final completion",
+                    self.chain.id,
+                )
             return
 
         _logger.info(
@@ -189,12 +248,17 @@ class ChainDispatcher:
                     "Chain %s: cancelled under lock, skipping completion", chain.id
                 )
                 return
-            chain.status = (
-                WorkflowStatus.SUCCEEDED if success else WorkflowStatus.FAILED
+            settled = settle_workflow(
+                QraftChainModel,
+                chain.id,
+                WorkflowStatus.SUCCEEDED if success else WorkflowStatus.FAILED,
+                "chain",
             )
-            chain.save(update_fields=["status", "date_updated"])
-            self.chain = chain
+            self.chain = settled or chain
 
+        if settled is None:
+            _logger.debug("Chain %s: already settled, skipping completion", chain.id)
+            return
         self._dispatch_chain_hook(success)
 
     def _dispatch_chain_hook(self, success: bool):
@@ -211,6 +275,11 @@ class ChainDispatcher:
                 ),
                 hook_kwargs=(
                     self.chain.success_kwargs if success else self.chain.failure_kwargs
+                ),
+                context=(
+                    workflow_hook_context(self.chain, "chain")
+                    if self.chain.hook_context
+                    else None
                 ),
             )
 
@@ -347,16 +416,28 @@ class ParallelDispatcher:
                 "date_updated",
             ]
 
-            if is_complete:
-                workflow.status = (
-                    WorkflowStatus.SUCCEEDED
-                    if workflow.failure_count == 0
-                    else WorkflowStatus.FAILED
-                )
-                update_fields.append("status")
-
             workflow.save(update_fields=update_fields)
             self.workflow = workflow
+
+            if is_complete:
+                settled = settle_workflow(
+                    type(workflow),
+                    workflow.id,
+                    (
+                        WorkflowStatus.SUCCEEDED
+                        if workflow.failure_count == 0
+                        else WorkflowStatus.FAILED
+                    ),
+                    self.workflow_type,
+                )
+                if settled is None:
+                    _logger.debug(
+                        "%s %s: already settled, not completing again",
+                        self.workflow_type,
+                        workflow.id,
+                    )
+                    return INCREMENT_NOOP
+                self.workflow = settled
 
             _logger.debug(
                 "%s %s: task completed (%s), counters: %d/%d (success=%d, failure=%d)",
@@ -374,24 +455,35 @@ class ParallelDispatcher:
                     "%s %s: all tasks complete, status=%s",
                     self.workflow_type.capitalize(),
                     workflow.id,
-                    workflow.status,
+                    self.workflow.status,
                 )
 
         return INCREMENT_COMPLETE if is_complete else INCREMENT_PARTIAL
 
     def _dispatch_progress_hook(self):
         """Dispatch progress hook after each task completion (non-terminal)."""
+        from qraft.runner import dispatch_spec
+
+        func, hook_args, hook_kwargs = dispatch_spec(
+            self.workflow.progress_hook,
+            (),
+            {
+                "workflow_id": str(self.workflow.id),
+                "workflow_type": self.workflow_type,
+                "completed_count": self.workflow.completed_count,
+                "total_count": self.workflow.total_count,
+                "success_count": self.workflow.success_count,
+                "failure_count": self.workflow.failure_count,
+            },
+        )
         try:
             q2_async_task(
-                self.workflow.progress_hook,
-                workflow_id=str(self.workflow.id),
-                workflow_type=self.workflow_type,
-                completed_count=self.workflow.completed_count,
-                total_count=self.workflow.total_count,
-                success_count=self.workflow.success_count,
-                failure_count=self.workflow.failure_count,
+                func,
+                *hook_args,
+                **hook_kwargs,
                 hook=None,
                 cluster=executing_cluster(),
+                broker=broker_for_cluster(executing_cluster()),
                 ack_failure=True,
             )
         except Exception as e:
@@ -423,7 +515,38 @@ class ParallelDispatcher:
                     if success
                     else self.workflow.failure_kwargs
                 ),
+                context=(
+                    workflow_hook_context(self.workflow, self.workflow_type)
+                    if self.workflow.hook_context
+                    else None
+                ),
             )
+
+
+def workflow_hook_context(workflow, workflow_type: str) -> dict:
+    """
+    The `context` a workflow hook receives under `hook_context=True`.
+
+    The same shape whatever settled the workflow. A cancelled fan-out is
+    exactly where the counters are worth reading - they say how much of the
+    work had already finished when the cancel landed - so they are not
+    dropped for it.
+    """
+    context = {
+        "workflow_id": str(workflow.id),
+        "workflow_type": workflow_type,
+        "outcome": workflow.status,
+    }
+    if workflow_type == "chain":
+        context["current_step_index"] = workflow.current_step_index
+    else:
+        context.update(
+            completed_count=workflow.completed_count,
+            total_count=workflow.total_count,
+            success_count=workflow.success_count,
+            failure_count=workflow.failure_count,
+        )
+    return context
 
 
 def _queue_chain_step(chain: QraftChainModel, step: QraftChainStep):
@@ -439,7 +562,7 @@ def _queue_chain_step(chain: QraftChainModel, step: QraftChainStep):
     forever. With the ORM broker the queue row is in the same database, so
     the commit makes the enqueue and the link visible together.
     """
-    from qraft.tasks import _create_workflow_task
+    from qraft.tasks import _create_workflow_task, workflow_member_labels
 
     with transaction.atomic():
         qraft_task = _create_workflow_task(
@@ -447,6 +570,7 @@ def _queue_chain_step(chain: QraftChainModel, step: QraftChainStep):
             args=step.task_args,
             kwargs=step.task_kwargs,
             qraft_options=step.qraft_options,
+            labels=workflow_member_labels(chain),
         )
         step.qraft_task = qraft_task
         step.save(update_fields=["qraft_task"])
@@ -466,18 +590,25 @@ def _dispatch_workflow_hook(
     hook_path: str,
     hook_args: list,
     hook_kwargs: dict,
+    context: dict | None = None,
 ):
     """
     Dispatch workflow-level hook with idempotency.
 
     Args:
-        workflow_type: 'chain', 'iter', or 'batch'
+        workflow_type: 'chain', 'iter', 'batch' or 'run'
         workflow_id: UUID of the workflow
-        hook_type: 'success' or 'failure'
+        hook_type: 'success', 'failure', 'cancelled' or 'settled'
         hook_path: Dotted path to hook function
         hook_args: Positional args for hook
         hook_kwargs: Keyword args for hook
+        context: Extra `context` keyword argument, when the workflow opted in
     """
+    from qraft.runner import dispatch_spec
+
+    if context is not None:
+        hook_kwargs = {**(hook_kwargs or {}), "context": context}
+    func, hook_args, hook_kwargs = dispatch_spec(hook_path, hook_args, hook_kwargs)
     dispatch_hook_once(
         WorkflowHookDispatch,
         {
@@ -487,10 +618,13 @@ def _dispatch_workflow_hook(
         },
         hook_path,
         lambda: q2_async_task(
-            hook_path,
+            func,
             *hook_args,
             hook=None,  # Prevent recursion
             cluster=executing_cluster(),
+            # Named explicitly: `cluster=` alone would resolve the broker
+            # against this process's Conf, not the target cluster's.
+            broker=broker_for_cluster(executing_cluster()),
             # Nothing above this layer retries a workflow hook, so an
             # unacknowledged failure would be redelivered indefinitely.
             ack_failure=True,
@@ -517,6 +651,27 @@ def route_workflow_completion(qraft_task, attempt) -> bool:
         step = None
 
     if step is not None:
+        # The task a step is bound to is the chain's generation marker.
+        # Callers route with a task they joined the step onto earlier (the
+        # hook handler's select_related, the reaper's replay batch) and
+        # resume() rebinds the step to a fresh task in between, so the
+        # binding is re-read rather than trusted: a completion from the
+        # generation before a resume must not settle the one after it.
+        bound = (
+            QraftChainStep.objects.filter(pk=step.pk)
+            .values_list("qraft_task_id", flat=True)
+            .first()
+        )
+        if bound != qraft_task.id:
+            _logger.info(
+                "Chain %s step %d is bound to task %s, not %s; dropping the "
+                "completion of a superseded generation",
+                step.chain_id,
+                step.step_index,
+                bound,
+                qraft_task.id,
+            )
+            return True
         ChainDispatcher(step.chain, step, attempt).handle()
         return True
 

@@ -1,12 +1,13 @@
 """Tests for QraftIter parallel workflow primitive."""
 
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 import pytest
 
 # Disable hook path validation for tests with fake module paths
 pytestmark = pytest.mark.usefixtures("_disable_hook_validation")
 
+from qraft.dispatchers import ParallelDispatcher  # noqa: E402
 from qraft.iter import QraftIter  # noqa: E402
 from qraft.models import (  # noqa: E402
     QraftIterModel,
@@ -221,21 +222,45 @@ class TestIterCounters:
         assert simple_iter.success_count == 0
         assert simple_iter.failure_count == 0
 
-    def test_counters_update_on_completion(self, db, simple_iter):
-        """Test that counters update when tasks complete."""
-        simple_iter.run()
+    def test_dispatcher_tallies_real_completions_and_fires_hook_once(self, db):
+        """The dispatcher, not the model, owns the counters - drive it
+        through real member completions instead of writing the fields by
+        hand, and check its workflow hook fires exactly once."""
+        iter_task = QraftIter(
+            "demo.showcase.tasks.noop_task",
+            on_success="showcase.tasks.on_success",
+            on_failure="showcase.tasks.on_failure",
+        )
+        for i in range(1, 6):
+            iter_task.append(i)
+        iter_task.run()
 
-        # Manually increment counters (normally done by ParallelDispatcher)
-        model = simple_iter._model
-        model.completed_count = 3
-        model.success_count = 2
-        model.failure_count = 1
-        model.save()
+        model = iter_task._model
+        tasks = list(QraftTask.objects.filter(qraft_iter=model))
+        outcomes = [True, True, False, True, False]  # 3 success, 2 failure
 
-        simple_iter._model.refresh_from_db()
-        assert simple_iter.completed_count == 3
-        assert simple_iter.success_count == 2
-        assert simple_iter.failure_count == 1
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook"
+            for task, success in zip(tasks, outcomes):
+                task.status = TaskStatus.SUCCEEDED if success else TaskStatus.EXHAUSTED
+                task.save(update_fields=["status"])
+                attempt = task.attempts.get(attempt_number=1)
+                attempt.success = success
+                attempt.save(update_fields=["success"])
+                ParallelDispatcher(model, attempt).handle()
+
+            mock_async.assert_called_once()
+
+        model.refresh_from_db()
+        assert model.completed_count == 5
+        assert model.success_count == 3
+        assert model.failure_count == 2
+        assert (
+            WorkflowHookDispatch.objects.filter(
+                workflow_type="iter", workflow_id=model.id, hook_type="failure"
+            ).count()
+            == 1
+        )
 
 
 class TestIterQueries:
@@ -401,3 +426,41 @@ class TestCancelHook:
             workflow_id=it.id,
             hook_type="cancelled",
         ).exists()
+
+    def test_the_cancel_hook_context_carries_the_counts_at_the_cancel(self, db):
+        """
+        How much of the fan-out had already finished is the question a cancel
+        hook exists to answer, so it gets the same counters a completion does.
+        """
+        it = QraftIter(
+            func="demo.showcase.tasks.noop_task",
+            on_cancelled="showcase.tasks.on_cancelled",
+            hook_context=True,
+        )
+        it.append(1)
+        it.append(2)
+        QraftIterModel.objects.filter(id=it.id).update(
+            total_count=2, completed_count=1, success_count=1
+        )
+
+        with patch(
+            "qraft.dispatchers.q2_async_task", return_value="q2-ctx-cancel"
+        ) as mock_async:
+            assert it.cancel() is True
+
+        context = mock_async.call_args.kwargs["context"]
+        assert context["outcome"] == WorkflowStatus.CANCELLED
+        assert context["workflow_type"] == "iter"
+        assert (context["completed_count"], context["total_count"]) == (1, 2)
+        assert (context["success_count"], context["failure_count"]) == (1, 0)
+
+
+class TestIterObservability:
+    def test_constructor_labels_are_stored_and_members_do_not_bind(self, db):
+        workflow = QraftIter(
+            "demo.showcase.tasks.noop_task", subject=("report", 9), hook_context=True
+        )
+        model = QraftIterModel.objects.get(id=workflow.id)
+        assert (model.subject_type, model.subject_id) == ("report", "9")
+        assert model.hook_context is True
+        assert model.settled_at is None

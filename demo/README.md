@@ -33,7 +33,7 @@ in `IMMEDIATE` mode; heavier parallel runs can still contend.
 make demo             # or: uv run python manage.py demo all
 ```
 
-One command. It resets the database, starts the clusters, runs all 32
+One command. It resets the database, starts the clusters, runs all 33
 scenarios, stops the clusters, and prints the matrix:
 
 ```
@@ -45,7 +45,7 @@ core.backoff            PASS     24/24   87.8s
 [durability]
 dur.reaper-kill         PASS     11/11   23.9s
 ...
-32/32 scenarios passed, 260/260 checks passed
+33/33 scenarios passed, 285/285 checks passed
 ```
 
 A full run takes several minutes. The long poles are deliberate: the
@@ -101,6 +101,7 @@ two are separate apps.
 | `core.rate-limit-retry` | A provider `Retry-After` hint overrides the configured backoff, and `rate_limit_max_delay` caps a hint that is too large. |
 | `core.threading` | On an I/O-bound load the threaded cluster clears the same queue measurably faster than an equal process cluster. |
 | `core.hook-modes` | Async hooks run as their own queued task with a dispatch row; `sync_hooks=True` runs the hook in the monitor with neither. |
+| `core.asyncdef` | An `async def` task is awaited in its worker slot, retries through the same scheduled-attempt path as a sync task, and an `async def` success hook is awaited too. |
 
 **workflows**
 
@@ -190,10 +191,9 @@ Q_CLUSTER_NAME=threaded uv run python manage.py qraftcluster
 ## Known limits
 
 - The two reaper scenarios kill a real worker process, then push its last
-  heartbeat 300 seconds into the past. qraft floors the heartbeat grace period
-  at 90 seconds (`qraft.reaper.MIN_HEARTBEAT_GRACE`) and does not expose it as
-  a setting, so the alternative is 90 seconds of idling per scenario. The kill
-  and the reclaim are real; only the clock is moved.
+  heartbeat 300 seconds into the past. The demo leaves `min_heartbeat_grace` at
+  its 90-second default, so the alternative is 90 seconds of idling per
+  scenario. The kill and the reclaim are real; only the clock is moved.
 - `core.jitter` and `dt.priority` are in-process checks against the library,
   not end-to-end runs. Each says so in its own output.
 - `wf.approval` counts `on_cancelled` dispatches globally rather than per

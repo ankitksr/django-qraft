@@ -78,7 +78,10 @@ class TestTouch:
         assert lease.touch(qraft_task_attempt.q2_task_id) == 0
 
 
-@pytest.mark.django_db
+# transaction=True for the same reason test_e2e.py uses it: heartbeat_loop
+# closes every connection on its way out, which the default transaction-wrapped
+# mode cannot survive against a real database server.
+@pytest.mark.django_db(transaction=True)
 class TestHeartbeatLoop:
     def test_stops_on_the_stop_event_without_touching(self, qraft_task_attempt):
         stop_event = threading.Event()
@@ -300,3 +303,300 @@ class TestMarkerLease:
         assert lease.open_marker_lease("some-user-task-name", "q2-plain") is False
         assert lease.open_marker_lease(None, "q2-plain") is False
         assert not QraftTaskAttempt.objects.filter(q2_task_id="q2-plain").exists()
+
+
+@pytest.mark.django_db
+class TestFirstStartAnnouncement:
+    def test_task_started_and_pickup_fire_once_under_duplicate_delivery(
+        self,
+        qraft_task_attempt,
+        signal_log,
+        recording_sink,
+        django_capture_on_commit_callbacks,
+    ):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from qraft.context import current_context
+
+        qraft_task_attempt.enqueued_at = timezone.now() - timedelta(seconds=3)
+        qraft_task_attempt.save(update_fields=["enqueued_at"])
+        task = {"id": qraft_task_attempt.q2_task_id, "name": "t"}
+
+        with django_capture_on_commit_callbacks(execute=True):
+            lease._on_pre_execute_lease(sender="django_q", func=None, task=task)
+            qraft_task_attempt.refresh_from_db()
+            first_beat = qraft_task_attempt.heartbeat_at
+            lease._on_pre_execute_lease(sender="django_q", func=None, task=task)
+
+        assert len(signal_log["task_started"]) == 1
+        payload = signal_log["task_started"][0]
+        assert payload["attempt_id"] == str(qraft_task_attempt.id)
+        assert payload["outcome"] is None
+        assert recording_sink.names("counter") == ["qraft.attempt.started"]
+        assert len(recording_sink.values("qraft.attempt.pickup")) == 1
+        assert recording_sink.values("qraft.attempt.pickup")[0] >= 3
+
+        # Re-entry inside one delivery is a no-op, not a second execution.
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.heartbeat_at >= first_beat
+        assert qraft_task_attempt.execution_count == 1
+        assert current_context()["attempt_id"] == str(qraft_task_attempt.id)
+        lease.stop_heartbeat(qraft_task_attempt.q2_task_id)
+
+    def test_stamp_start_is_false_for_plain_q2_tasks_and_after_resolution(
+        self, qraft_task_attempt
+    ):
+        from qraft import context
+
+        assert lease.stamp_start("not-ours") is False
+        assert lease.stamp_start(qraft_task_attempt.q2_task_id) is True
+
+        qraft_task_attempt.success = True
+        qraft_task_attempt.save(update_fields=["success"])
+        # A new delivery of the same message, which is what a redelivery is.
+        context.clear_context()
+        assert lease.stamp_start(qraft_task_attempt.q2_task_id) is False
+
+
+@pytest.mark.django_db
+class TestRedeliveryGuard:
+    """One attempt executes once, whatever the broker redelivers."""
+
+    def test_a_first_delivery_claims_and_runs(self, qraft_task_attempt):
+        from qraft import context
+        from qraft.runner import guard_delivery
+
+        context._current_q2_task_id.set(qraft_task_attempt.q2_task_id)
+        assert lease.claim_delivery(qraft_task_attempt.q2_task_id) == (
+            lease.FIRST_DELIVERY
+        )
+        guard_delivery()  # does not raise
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.execution_count == 1
+        assert qraft_task_attempt.date_started is not None
+
+    def test_a_second_delivery_is_refused_and_never_calls_the_function(
+        self, qraft_task_attempt, recording_sink
+    ):
+        from qraft import context
+        from qraft.runner import RedeliveredAttempt, run_task
+
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+        qraft_task_attempt.refresh_from_db()
+        started = qraft_task_attempt.date_started
+        beat = qraft_task_attempt.heartbeat_at
+        lease.stop_heartbeat(qraft_task_attempt.q2_task_id)
+
+        # A redelivery arrives in a fresh execution context.
+        context.clear_context()
+        context._current_q2_task_id.set(qraft_task_attempt.q2_task_id)
+
+        with pytest.raises(RedeliveredAttempt):
+            run_task("tests.test_lease._never_called", [], {})
+
+        assert _CALLS == []
+        qraft_task_attempt.refresh_from_db()
+        # The refused delivery neither restarts the attempt nor refreshes the
+        # lease - refreshing it is exactly what hid the stuck task before.
+        assert qraft_task_attempt.date_started == started
+        assert qraft_task_attempt.heartbeat_at == beat
+        assert qraft_task_attempt.execution_count == 1
+        assert recording_sink.names("counter") == [
+            "qraft.attempt.started",
+            "qraft.attempt.redelivered",
+        ]
+
+    def test_the_refusal_resolves_through_the_retry_policy(self, qraft_task_attempt):
+        from qraft.hooks import qraft_hook_handler
+        from qraft.models import QraftTaskAttempt
+        from qraft.models.tasks import AttemptState
+
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+        lease.stop_heartbeat(qraft_task_attempt.q2_task_id)
+
+        q2_task = type(
+            "Q2Task",
+            (),
+            {
+                "id": qraft_task_attempt.q2_task_id,
+                "name": "t",
+                "success": False,
+                "result": (
+                    "q2 task x is a repeat delivery : Traceback\n"
+                    "qraft.runner.RedeliveredAttempt: refused"
+                ),
+                "stopped": None,
+            },
+        )()
+        qraft_hook_handler(q2_task)
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.success is False
+        assert qraft_task_attempt.exception_class == "RedeliveredAttempt"
+        # The retry policy, not the broker's delivery loop, decides attempt 2.
+        second = QraftTaskAttempt.objects.get(
+            qraft_task=qraft_task_attempt.qraft_task, attempt_number=2
+        )
+        assert second.state == AttemptState.SCHEDULED
+
+    def test_a_higher_allowance_admits_the_repeat(
+        self, qraft_task_attempt, settings, monkeypatch
+    ):
+        from qraft import conf, context
+
+        monkeypatch.setitem(settings.QRAFT_CLUSTER, "max_executions_per_attempt", 2)
+        conf._cached_conf.cache_clear()
+        try:
+            lease.stamp_start(qraft_task_attempt.q2_task_id)
+            lease.stop_heartbeat(qraft_task_attempt.q2_task_id)
+            context.clear_context()
+            assert lease.claim_delivery(qraft_task_attempt.q2_task_id) == (
+                lease.REPEAT_DELIVERY
+            )
+            context.clear_context()
+            assert lease.claim_delivery(qraft_task_attempt.q2_task_id) == (
+                lease.REFUSED_DELIVERY
+            )
+        finally:
+            conf._cached_conf.cache_clear()
+
+    def test_a_plain_django_q_task_is_never_refused(self, db):
+        from qraft import context
+        from qraft.runner import run_task
+
+        context._current_q2_task_id.set("not-a-qraft-delivery")
+        assert lease.claim_delivery("not-a-qraft-delivery") == lease.NO_ATTEMPT
+        assert run_task("tests.test_lease._returns_ok", [], {}) == "ok"
+
+    def test_a_refused_marker_delivery_starts_no_heartbeat(self, qraft_task_attempt):
+        """
+        A Qraft-dispatched attempt's task_name IS a marker, so a refused
+        redelivery of one reaches `open_marker_lease`. Starting a heartbeat
+        there would refresh the lease of an attempt that will not run - which
+        is the exact thing that hid a redelivery loop from the reaper.
+        """
+        from qraft import context
+        from qraft.retry import QRAFT_MARKER_FMT, QRAFT_MARKER_PREFIX
+
+        marker = QRAFT_MARKER_FMT.format(
+            prefix=QRAFT_MARKER_PREFIX,
+            task_id=qraft_task_attempt.qraft_task_id,
+            attempt=qraft_task_attempt.attempt_number,
+        )
+        task = {"id": qraft_task_attempt.q2_task_id, "name": marker}
+
+        lease._on_pre_execute_lease(sender="django_q", func=None, task=task)
+        lease.stop_heartbeat(qraft_task_attempt.q2_task_id)
+        with lease._stop_events_lock:
+            lease._stop_events.clear()
+        qraft_task_attempt.refresh_from_db()
+        beat = qraft_task_attempt.heartbeat_at
+
+        context.clear_context()
+        lease._on_pre_execute_lease(sender="django_q", func=None, task=task)
+
+        with lease._stop_events_lock:
+            assert lease._stop_events == {}
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.heartbeat_at == beat
+
+    def test_the_payload_flags_a_redelivery(self, qraft_task_attempt):
+        from qraft import signals
+
+        qraft_task_attempt.execution_count = 2
+        payload = signals.attempt_payload(
+            qraft_task_attempt, qraft_task_attempt.qraft_task, "failed"
+        )
+        assert payload["execution_count"] == 2
+        assert payload["redelivered"] is True
+
+
+_CALLS: list = []
+
+
+def _never_called():
+    _CALLS.append("ran")
+
+
+def _returns_ok():
+    return "ok"
+
+
+def _raises_boom():
+    raise ValueError("boom")
+
+
+@pytest.mark.django_db
+class TestCloseLease:
+    """The lease ends when the function returns, not when the monitor says so.
+
+    A dead Django-Q2 monitor can leave the worker blocked in
+    `result_queue.put()` with the task already finished. The heartbeat thread
+    knows nothing about that and keeps the lease fresh, so the reaper reads the
+    attempt as alive and never resolves it.
+    """
+
+    def test_a_returned_task_stops_heartbeating_and_records_when_it_returned(
+        self, qraft_task_attempt
+    ):
+        from qraft import context
+        from qraft.runner import run_task
+
+        context._current_q2_task_id.set(qraft_task_attempt.q2_task_id)
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+        lease.start_heartbeat(qraft_task_attempt.q2_task_id)
+        # Held directly: the heartbeat thread unregisters itself once it stops,
+        # so the dict entry is gone by the time the assertion runs.
+        stop_event = lease._stop_events[qraft_task_attempt.q2_task_id]
+
+        assert run_task("tests.test_lease._returns_ok", [], {}) == "ok"
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.returned_at is not None
+        # Still unresolved: the result has not reached the monitor yet. That is
+        # the state the reaper has to be able to act on.
+        assert qraft_task_attempt.success is None
+        assert stop_event.is_set()
+
+    def test_a_raising_task_closes_its_lease_too(self, qraft_task_attempt):
+        from qraft import context
+        from qraft.runner import run_task
+
+        context._current_q2_task_id.set(qraft_task_attempt.q2_task_id)
+        lease.stamp_start(qraft_task_attempt.q2_task_id)
+
+        with pytest.raises(ValueError):
+            run_task("tests.test_lease._raises_boom", [], {})
+
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.returned_at is not None
+
+    def test_a_plain_django_q_task_is_left_alone(self, db):
+        from qraft import context
+        from qraft.runner import run_task
+
+        context.clear_context()
+        # No q2 task id bound: nothing to stamp, and no lease to close.
+        assert run_task("tests.test_lease._returns_ok", [], {}) == "ok"
+
+    def test_a_stamp_failure_never_costs_the_caller_its_result(
+        self, qraft_task_attempt, monkeypatch
+    ):
+        from qraft import context
+        from qraft.runner import run_task
+
+        context._current_q2_task_id.set(qraft_task_attempt.q2_task_id)
+
+        def _explode(*a, **kw):
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr(lease, "stop_heartbeat", _explode)
+        with pytest.raises(RuntimeError):
+            run_task("tests.test_lease._returns_ok", [], {})
+        # The stamp itself is the part that must not lose the result; the
+        # heartbeat stop is the last statement and has nothing after it.
+        qraft_task_attempt.refresh_from_db()
+        assert qraft_task_attempt.returned_at is not None

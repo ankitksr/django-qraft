@@ -14,6 +14,8 @@ from .models import (
     QraftChainModel,
     QraftChainStep,
     QraftIterModel,
+    QraftRun,
+    QraftRunStage,
     QraftTask,
     QraftTaskAttempt,
     WorkflowHookDispatch,
@@ -32,6 +34,14 @@ _WORKFLOW_STATUS_COLORS = {
 _TASK_STATUS_COLORS = {
     **_WORKFLOW_STATUS_COLORS,
     "exhausted": "#6f42c1",
+}
+
+_RUN_STATUS_COLORS = {
+    "open": "#007bff",
+    "succeeded": "#28a745",
+    "failed": "#dc3545",
+    "cancelled": "#fd7e14",
+    "abandoned": _DEFAULT_STATUS_COLOR,
 }
 
 
@@ -143,10 +153,16 @@ class QraftTaskAttemptInline(_UsageDisplay, _ReadOnly, admin.TabularInline):
         "success",
         "exception_class",
         "usage_display",
+        "progress",
+        "progress_reported_at",
+        "progress_advanced_at",
+        "stall_suspected_at",
         "cluster",
         "worker_pid",
         "worker_thread",
         "date_created",
+        "enqueued_at",
+        "returned_at",
         "date_completed",
     ]
     ordering = ["attempt_number"]
@@ -175,18 +191,25 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
         "short_id",
         "status_display",
         "func",
+        "subject_type",
+        "subject_id",
+        "stage",
         "attempt_count",
         "date_created",
         "date_updated",
     ]
-    list_filter = ["status", "date_created"]
-    search_fields = ["id", "func"]
+    list_filter = ["status", "subject_type", "stage", "date_created"]
+    search_fields = ["id", "func", "subject_type", "subject_id", "run__id"]
     readonly_fields = [
         "id",
         "date_created",
         "date_updated",
         "status",
         "func",
+        "subject_type",
+        "subject_id",
+        "run",
+        "stage",
         "task_args",
         "task_kwargs",
         "success_hook",
@@ -196,6 +219,7 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
         "failure_args",
         "failure_kwargs",
         "retry_policy",
+        "stall_after",
     ]
     inlines = [QraftTaskAttemptInline, HookDispatchInline]
     ordering = ["-date_created"]
@@ -203,6 +227,8 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
 
     fieldsets = [
         (None, {"fields": ["id", "status", "func", "date_created", "date_updated"]}),
+        ("Subject", {"fields": ["subject_type", "subject_id"]}),
+        ("Run", {"fields": ["run", "stage"]}),
         ("Task Arguments", {"fields": ["task_args", "task_kwargs"]}),
         (
             "Success Hook",
@@ -213,6 +239,7 @@ class QraftTaskAdmin(_ShortIdAdmin, admin.ModelAdmin):
             {"fields": ["failure_hook", "failure_args", "failure_kwargs"]},
         ),
         ("Retry Policy", {"fields": ["retry_policy"]}),
+        ("Stall Observation", {"fields": ["stall_after"]}),
     ]
 
     def get_queryset(self, request):
@@ -278,10 +305,17 @@ class QraftTaskAttemptAdmin(_UsageDisplay, _QraftTaskLinkAdmin, admin.ModelAdmin
         "success",
         "exception_class",
         "usage_display",
+        "progress",
+        "progress_reported_at",
+        "progress_advanced_at",
+        "stall_suspected_at",
+        "trace_context",
         "cluster",
         "worker_pid",
         "worker_thread",
         "date_created",
+        "enqueued_at",
+        "returned_at",
         "date_completed",
     ]
     ordering = ["-date_created"]
@@ -349,17 +383,22 @@ class QraftChainModelAdmin(_WorkflowAdmin, admin.ModelAdmin):
     list_display = [
         "short_id",
         "status_display",
+        "subject_type",
+        "subject_id",
         "step_count",
         "current_step_index",
         "hooks_display",
         "date_created",
         "date_updated",
     ]
-    list_filter = ["status"]
-    search_fields = ["id"]
+    list_filter = ["status", "subject_type"]
+    search_fields = ["id", "subject_type", "subject_id"]
     readonly_fields = [
         "id",
         "status",
+        "settled_at",
+        "subject_type",
+        "subject_id",
         "current_step_index",
         "success_hook",
         "success_args",
@@ -394,16 +433,21 @@ class QraftIterModelAdmin(_ParallelWorkflowAdmin, admin.ModelAdmin):
         "short_id",
         "status_display",
         "func",
+        "subject_type",
+        "subject_id",
         "counters_display",
         "hooks_display",
         "date_created",
         "date_updated",
     ]
-    list_filter = ["status"]
-    search_fields = ["id", "func"]
+    list_filter = ["status", "subject_type"]
+    search_fields = ["id", "func", "subject_type", "subject_id"]
     readonly_fields = [
         "id",
         "status",
+        "settled_at",
+        "subject_type",
+        "subject_id",
         "func",
         "default_qraft_options",
         "total_count",
@@ -431,16 +475,21 @@ class QraftBatchModelAdmin(_ParallelWorkflowAdmin, admin.ModelAdmin):
     list_display = [
         "short_id",
         "status_display",
+        "subject_type",
+        "subject_id",
         "counters_display",
         "hooks_display",
         "date_created",
         "date_updated",
     ]
-    list_filter = ["status"]
-    search_fields = ["id"]
+    list_filter = ["status", "subject_type"]
+    search_fields = ["id", "subject_type", "subject_id"]
     readonly_fields = [
         "id",
         "status",
+        "settled_at",
+        "subject_type",
+        "subject_id",
         "total_count",
         "completed_count",
         "success_count",
@@ -488,3 +537,113 @@ class WorkflowHookDispatchAdmin(_ShortIdAdmin, admin.ModelAdmin):
         return _short_uuid(obj.workflow_id)
 
     workflow_id_short.short_description = "Workflow ID"
+
+
+# ── Runs ─────────────────────────────────────────────────────
+
+
+class QraftRunStageInline(_ReadOnly, admin.TabularInline):
+    """Inline display of a run's declared stages and their bound units."""
+
+    model = QraftRunStage
+    extra = 0
+    readonly_fields = [
+        "position",
+        "name",
+        "status",
+        "unit_type",
+        "unit_id",
+        "skip_reason",
+        "bound_at",
+        "settled_at",
+    ]
+    ordering = ["position"]
+
+
+class QraftRunMemberInline(_ReadOnly, admin.TabularInline):
+    """Tasks correlated with this run, whether or not they own a stage."""
+
+    model = QraftTask
+    fk_name = "run"
+    extra = 0
+    fields = ["id", "stage", "func", "status", "date_created"]
+    readonly_fields = fields
+    ordering = ["date_created"]
+    verbose_name_plural = "Member tasks"
+
+
+@admin.register(QraftRun)
+class QraftRunAdmin(_ShortIdAdmin, admin.ModelAdmin):
+    """Read-only admin for QraftRun, with cancel and abandon as actions."""
+
+    list_display = [
+        "short_id",
+        "status_display",
+        "subject_type",
+        "subject_id",
+        "kind",
+        "revision",
+        "overdue_display",
+        "date_started",
+        "settled_at",
+    ]
+    list_filter = ["status", "subject_type", "kind", "date_created"]
+    search_fields = ["id", "subject_type", "subject_id", "kind", "revision"]
+    readonly_fields = [
+        "id",
+        "status",
+        "subject_type",
+        "subject_id",
+        "kind",
+        "revision",
+        "metadata",
+        "previous_run",
+        "date_started",
+        "settled_at",
+        "overdue_flagged_at",
+        "on_settled",
+        "on_settled_kwargs",
+        "summary",
+        "date_created",
+        "date_updated",
+    ]
+    inlines = [QraftRunStageInline, QraftRunMemberInline]
+    ordering = ["-date_created"]
+    actions = ["cancel_runs", "abandon_runs"]
+
+    def status_display(self, obj):
+        return _colored_status(obj.status, obj.get_status_display(), _RUN_STATUS_COLORS)
+
+    status_display.short_description = "Status"
+
+    def overdue_display(self, obj):
+        return "⚠" if obj.overdue_flagged_at else "-"
+
+    overdue_display.short_description = "Overdue"
+
+    def _settle_selected(self, request, queryset, action):
+        from qraft import runs
+
+        settled = skipped = 0
+        for run in queryset:
+            try:
+                action(runs, run.id)
+            except runs.RunError:
+                skipped += 1
+            else:
+                settled += 1
+        self.message_user(
+            request,
+            f"Settled {settled} run(s); skipped {skipped} already terminal.",
+            level=messages.WARNING if skipped else messages.INFO,
+        )
+
+    @admin.action(description="Cancel selected runs")
+    def cancel_runs(self, request, queryset):
+        self._settle_selected(request, queryset, lambda runs, id: runs.cancel(id))
+
+    @admin.action(description="Abandon selected runs")
+    def abandon_runs(self, request, queryset):
+        self._settle_selected(
+            request, queryset, lambda runs, id: runs.abandon(id, reason="admin")
+        )

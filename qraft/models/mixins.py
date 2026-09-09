@@ -51,6 +51,61 @@ class InvalidStatusTransition(ValueError):
     """Raised when an invalid workflow status transition is attempted."""
 
 
+class SubjectMixin(models.Model):
+    """
+    The domain entity a task or workflow is for, as a string pair.
+
+    Strings rather than a generic foreign key: the subject may live in another
+    database or another service, and a string pair is what every consumer can
+    produce.
+    """
+
+    subject_type = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text="Kind of domain entity this work is for (e.g. 'worksheet')",
+    )
+    subject_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Identifier of the domain entity, as a string",
+    )
+
+    class Meta:
+        abstract = True
+
+
+class RunMemberMixin(models.Model):
+    """
+    The run and stage a task or workflow is correlated with.
+
+    `SET_NULL`, never `CASCADE`: deleting a run must never delete work. The
+    pair is correlation only - a member of a workflow carries the same values
+    so it filters and logs correctly, but only the stage's one bound unit ever
+    settles the stage.
+    """
+
+    run = models.ForeignKey(
+        "QraftRun",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="%(class)s_members",
+        help_text="Run this work is correlated with",
+    )
+    stage = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text="Stage of the run this work is correlated with",
+    )
+
+    class Meta:
+        abstract = True
+
+
 class WorkflowStatusMixin(models.Model):
     """Mixin providing status field with state machine validation."""
 
@@ -59,6 +114,18 @@ class WorkflowStatusMixin(models.Model):
         choices=WorkflowStatus.choices,
         default=WorkflowStatus.PENDING,
         db_index=True,
+    )
+
+    # Transition identity for settlement. Status alone cannot tell a first
+    # settlement from a replayed one (a final-step redelivery, an
+    # already-terminal _complete_chain, a cancel racing a completion) and a
+    # resumed chain settles twice legitimately; the conditional update on this
+    # column is what fires workflow_settled and the workflow hook exactly once
+    # per settlement.
+    settled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the workflow last settled (settlement compare-and-swap column)",
     )
 
     def transition_to(self, new_status: str):
@@ -139,6 +206,14 @@ class WorkflowHookMixin(models.Model):
         null=True,
         blank=True,
         help_text="Hook called on each task completion (parallel workflows only)",
+    )
+
+    # db_default: a rolling deploy's previous release still inserts rows
+    # without this column (same reasoning as QraftTaskAttempt.state).
+    hook_context = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Whether workflow hooks receive a `context` keyword argument",
     )
 
     class Meta:

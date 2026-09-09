@@ -32,8 +32,8 @@ result.status   # TaskResultStatus
 |------|-------|-------|
 | `supports_get_result` | yes | Reads `QraftTask`/`QraftTaskAttempt` |
 | `supports_priority` | yes | Maps to Qraft's three lanes |
-| `supports_defer` | yes | `run_after` schedules through Django-Q2's `Schedule` model |
-| `supports_async_task` | no | Coroutine tasks are not executed by Qraft workers |
+| `supports_defer` | yes | `run_after` creates a `SCHEDULED` attempt row, dispatched at its due time |
+| `supports_async_task` | yes | An `async def` task runs to completion with `asyncio.run()` in its worker slot |
 
 ### Deferred execution (`run_after`)
 
@@ -42,7 +42,13 @@ result = summarize.using(run_after=timezone.now() + timedelta(hours=1)).enqueue(
 result.status  # READY - nothing has run yet
 ```
 
-A deferred task creates its `QraftTask` immediately (`PENDING`, no attempts yet) and a Django-Q2 `Schedule` (`ONCE`, firing at `run_after`) carrying a Qraft marker, the same linkage mechanism used for scheduled retries. The attempt row - and the usual `RUNNING`/`SUCCEEDED`/`FAILED` transitions - only appear once the schedule actually fires.
+A deferred task creates its `QraftTask` immediately (`PENDING`) with attempt 1 as a `SCHEDULED` row due at `run_after` - the same owned-scheduling path retries use. Qraft's dispatcher enqueues it at that time; the usual `RUNNING`/`SUCCEEDED`/`FAILED` transitions only start then.
+
+### Coroutine tasks
+
+`@task`-decorated `async def` functions enqueue and run like sync ones. The worker runs the coroutine to completion with `asyncio.run()` in the slot it already occupies, so lease, timeout, and retry semantics are identical - one coroutine per slot, not an event-loop worker. Concurrency still comes from workers and threads, not from the coroutine.
+
+Django's async rules apply inside the coroutine: the sync ORM raises `SynchronousOnlyOperation` under a running event loop, so use the async ORM (`aget`, `acreate`, `aupdate`) or wrap sync calls in `sync_to_async`. The same holds for `async def` hooks. `qraft.tasks.async_task()` and workflow members accept `async def` targets the same way.
 
 ### `TaskContext` (`takes_context`)
 

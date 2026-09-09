@@ -25,6 +25,7 @@ import time
 from django.db import close_old_connections, connection, models, transaction
 from django.utils import timezone
 
+from . import metrics
 from .conf import executing_cluster, get_conf
 
 logger = logging.getLogger("qraft")
@@ -84,10 +85,21 @@ def schedule_attempt(
     Returns:
         QraftTaskAttempt: the SCHEDULED row.
     """
-    from .models import QraftTaskAttempt, TaskStatus
+    from .models import QraftTask, QraftTaskAttempt, TaskStatus
     from .models.tasks import AttemptState
 
+    # The trace begun at the original enqueue continues across retries.
+    trace_context = (
+        qraft_task.attempts.order_by("-attempt_number")
+        .values_list("trace_context", flat=True)
+        .first()
+    )
+
     with transaction.atomic():
+        # Locked before the insert because `context._snapshot_progress` takes
+        # the same lock: the attempt this row supersedes must not still be
+        # reporting itself as the task's latest once this one exists.
+        QraftTask.objects.select_for_update().filter(pk=qraft_task.pk).first()
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=qraft_task,
             attempt_number=attempt_number,
@@ -96,6 +108,7 @@ def schedule_attempt(
             cluster=cluster,
             dispatch_func=dispatch_func,
             dispatch_args=dispatch_args,
+            trace_context=trace_context,
         )
         qraft_task.status = TaskStatus.PENDING
         qraft_task.save(update_fields=["status", "date_updated"])
@@ -114,7 +127,7 @@ def _enqueue(attempt, qraft_task) -> str:
     """Hand one claimed attempt to the broker and return its q2 task id."""
     from django_q.tasks import async_task as q2_async_task
 
-    from .brokers import QraftOrmBroker, priority_list_key
+    from .brokers import broker_for_cluster
     from .retry import QRAFT_MARKER_FMT, QRAFT_MARKER_PREFIX
 
     func = attempt.dispatch_func or DEFAULT_DISPATCH_FUNC
@@ -130,7 +143,7 @@ def _enqueue(attempt, qraft_task) -> str:
     q2_kwargs = {
         "hook": "qraft.hooks.qraft_hook_handler",
         # The q2 task id is stamped below, so linkage no longer depends on
-        # this name. It stays because it is what a pre-2.0 delivery still in
+        # this name. It stays because it is what a pre-1.3 delivery still in
         # flight is resolved by (qraft.hooks.attempt_from_marker), and it
         # keeps the two paths reading identically in the admin.
         "task_name": QRAFT_MARKER_FMT.format(
@@ -147,10 +160,8 @@ def _enqueue(attempt, qraft_task) -> str:
     # Priority survives the delay: the lane is rebuilt from the task's own
     # lane and the cluster this attempt is routed to. django_q drops
     # `cluster=` whenever an explicit broker is given, which is why the lane
-    # key has to carry the target cluster itself.
-    list_key = priority_list_key(qraft_task.priority, target)
-    if list_key is not None:
-        q2_kwargs["broker"] = QraftOrmBroker(list_key=list_key)
+    # key and the broker itself both have to carry the target cluster.
+    q2_kwargs["broker"] = broker_for_cluster(target, qraft_task.priority)
 
     return q2_async_task(func, *args, **q2_kwargs)
 
@@ -181,19 +192,38 @@ def _claim_and_enqueue(now) -> bool | None:
         if attempt is None:
             return None
 
+        # `now` is the due cutoff the whole pass shares; the claim stamps its
+        # own time, or a slow batch would backdate every attempt after the
+        # first and report their queue wait as longer than it was.
+        claimed_at = timezone.now()
+
         # The compare-and-swap, not the read above, is what decides ownership:
         # SQLite has no SKIP LOCKED, so two dispatchers can read the same row.
         claimed = QraftTaskAttempt.objects.filter(
             pk=attempt.pk, state=AttemptState.SCHEDULED
-        ).update(state=AttemptState.QUEUED, claimed_at=now)
+        ).update(state=AttemptState.QUEUED, claimed_at=claimed_at)
         if not claimed:
             return False
 
         qraft_task = attempt.qraft_task
         attempt.state = AttemptState.QUEUED
-        attempt.claimed_at = now
+        attempt.claimed_at = claimed_at
+        attempt.enqueued_at = claimed_at
+        # `_enqueue` routes an unstamped attempt to this dispatcher's own
+        # cluster; recording where it actually went is what gives the start
+        # and pickup metrics a cluster label, puts it in the active gauge,
+        # and lets the next attempt inherit the placement.
+        attempt.cluster = attempt.cluster or executing_cluster()
         attempt.q2_task_id = _enqueue(attempt, qraft_task)
-        attempt.save(update_fields=["state", "claimed_at", "q2_task_id"])
+        attempt.save(
+            update_fields=[
+                "state",
+                "claimed_at",
+                "enqueued_at",
+                "cluster",
+                "q2_task_id",
+            ]
+        )
 
         # In a broker queue now, which is what brings it inside the reaper's
         # reach if the delivery is lost. Scoped to PENDING so a duplicate
@@ -202,6 +232,9 @@ def _claim_and_enqueue(now) -> bool | None:
             status=TaskStatus.RUNNING, date_updated=timezone.now()
         )
 
+    lag = metrics.seconds_between(attempt.not_before, attempt.claimed_at)
+    if lag is not None:
+        metrics.histogram("qraft.scheduler.lag", lag, cluster=attempt.cluster)
     logger.debug(
         "Dispatched QraftTask %s attempt %d as q2 task %s",
         attempt.qraft_task_id,
@@ -269,6 +302,10 @@ def dispatch_loop(stop_event=None) -> None:
         try:
             close_old_connections()
             dispatch_due()
+            if get_conf().metrics_gauges:
+                from .metrics.gauges import emit_gauges
+
+                emit_gauges()
             delay = _seconds_until_due(get_conf().dispatch_interval)
         except Exception:
             logger.exception("Scheduler dispatch pass failed")

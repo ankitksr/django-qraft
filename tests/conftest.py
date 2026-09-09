@@ -14,6 +14,42 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
+def pytest_collection_modifyitems(config, items):
+    """Skip `postgres`-marked cases unless the suite runs against Postgres."""
+    if os.environ.get("QRAFT_TEST_DATABASE_URL", "").startswith("postgres"):
+        return
+    skip = pytest.mark.skip(reason="needs QRAFT_TEST_DATABASE_URL (Postgres)")
+    for item in items:
+        if "postgres" in item.keywords:
+            item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_execution_context():
+    """
+    Each test starts with no bound attempt and no delivery claim.
+
+    The claim is memoised on a ContextVar keyed by q2 task id, and fixtures
+    reuse ids across tests; without this a later test would inherit an
+    earlier one's verdict instead of taking its own compare-and-swap.
+    """
+    from qraft import context
+
+    context.clear_context()
+    yield
+    context.clear_context()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_metrics_sink():
+    """Each test sees the configured sink and a zeroed health counter."""
+    from qraft import metrics
+
+    metrics.reset_sink()
+    yield
+    metrics.reset_sink()
+
+
 @pytest.fixture
 def _disable_hook_validation():
     """Disable hook path import validation for tests using fake module paths."""
@@ -103,3 +139,71 @@ def retry_policy():
         jitter=False,
         jitter_max=0.2,
     )
+
+
+class RecordingSink:
+    """Metrics sink that keeps every emission for assertions."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, float, dict]] = []
+
+    def counter(self, name, value=1, **labels):
+        self.calls.append(("counter", name, value, labels))
+
+    def histogram(self, name, value, **labels):
+        self.calls.append(("histogram", name, value, labels))
+
+    def gauge(self, name, value, **labels):
+        self.calls.append(("gauge", name, value, labels))
+
+    def names(self, kind=None) -> list[str]:
+        return [name for k, name, _, _ in self.calls if kind is None or k == kind]
+
+    def labels(self, name) -> list[dict]:
+        return [labels for _, n, _, labels in self.calls if n == name]
+
+    def values(self, name) -> list[float]:
+        return [value for _, n, value, _ in self.calls if n == name]
+
+
+@pytest.fixture
+def recording_sink(monkeypatch):
+    """Route every metric emission into a RecordingSink for the test."""
+    from qraft import metrics
+
+    sink = RecordingSink()
+    monkeypatch.setattr(metrics, "get_sink", lambda: sink)
+    return sink
+
+
+@pytest.fixture
+def signal_log():
+    """
+    Connect recorders to every qraft signal; yields {signal_name: [payloads]}.
+
+    Sends ride `transaction.on_commit`, so pair this with
+    `django_capture_on_commit_callbacks(execute=True)` around the action.
+    """
+    from qraft import signals
+
+    names = (
+        "task_started",
+        "attempt_finished",
+        "task_settled",
+        "workflow_settled",
+        "attempt_stall_suspected",
+        "run_settled",
+        "run_overdue",
+    )
+    log: dict[str, list] = {name: [] for name in names}
+    receivers = []
+    for name in names:
+
+        def receiver(sender, payload, _name=name, **kwargs):
+            log[_name].append(payload)
+
+        getattr(signals, name).connect(receiver, weak=False)
+        receivers.append((name, receiver))
+    yield log
+    for name, receiver in receivers:
+        getattr(signals, name).disconnect(receiver)

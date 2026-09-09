@@ -4,10 +4,16 @@ import logging
 from uuid import UUID
 
 from django.db import transaction
+from django.utils import timezone
 
 from qraft.base import BaseWorkflow, _validate_hook_path
-from qraft.dispatchers import _dispatch_workflow_hook, _queue_chain_step
-from qraft.models import QraftChainModel, QraftChainStep, WorkflowStatus
+from qraft.dispatchers import _queue_chain_step
+from qraft.models import (
+    QraftChainModel,
+    QraftChainStep,
+    WorkflowHookDispatch,
+    WorkflowStatus,
+)
 from qraft.results import TaskResult, WorkflowResult
 
 _logger = logging.getLogger("qraft.chain")
@@ -50,6 +56,10 @@ class QraftChain(BaseWorkflow):
         failure_args: tuple = (),
         failure_kwargs: dict | None = None,
         chain_id: UUID | str | None = None,
+        subject: tuple | None = None,
+        run=None,
+        stage: str | None = None,
+        hook_context: bool = False,
     ):
         self._steps = []
 
@@ -60,15 +70,28 @@ class QraftChain(BaseWorkflow):
         if chain_id:
             self._model = QraftChainModel.objects.get(id=chain_id)
         else:
-            self._model = QraftChainModel.objects.create(
-                success_hook=on_success,
-                success_args=list(success_args),
-                success_kwargs=success_kwargs or {},
-                failure_hook=on_failure,
-                failure_args=list(failure_args),
-                failure_kwargs=failure_kwargs or {},
-                on_cancelled=on_cancelled,
-            )
+            from qraft import runs
+            from qraft.tasks import parse_subject
+
+            subject_type, subject_id = parse_subject(subject)
+            # The run's row lock is held across the insert, so a
+            # concurrent runs.bind_subject() cannot leave this workflow with
+            # a null subject it never backfills.
+            with runs.correlating(run, stage, subject_type, subject_id) as correlation:
+                self._model = QraftChainModel.objects.create(
+                    success_hook=on_success,
+                    success_args=list(success_args),
+                    success_kwargs=success_kwargs or {},
+                    failure_hook=on_failure,
+                    failure_args=list(failure_args),
+                    failure_kwargs=failure_kwargs or {},
+                    on_cancelled=on_cancelled,
+                    subject_type=correlation["subject_type"],
+                    subject_id=correlation["subject_id"],
+                    run_id=correlation["run_id"],
+                    stage=correlation["stage"],
+                    hook_context=hook_context,
+                )
 
         _logger.debug("Initialized QraftChain %s", self._model.id)
 
@@ -147,6 +170,7 @@ class QraftChain(BaseWorkflow):
 
             self._model.transition_to(WorkflowStatus.RUNNING)
             self._model.save(update_fields=["status", "date_updated"])
+            self._bind_to_run()
 
             first_step = self._model.steps.get(step_index=0)
             if first_step.requires_approval:
@@ -187,9 +211,41 @@ class QraftChain(BaseWorkflow):
         # landing in between, fails the locked transition instead of
         # double-queueing the step or enqueueing into a cancelled chain.
         with transaction.atomic():
+            # The run is locked before its status is read, so a cancel racing
+            # this cannot slip between the check and the enqueue. A chain that
+            # is a stage's unit failed its run the moment it failed, so in
+            # practice this only passes in the crash window replay_unrouted()
+            # closes; the expected path after a settled run is a new run.
+            if self._model.run_id:
+                from qraft.models.runs import QraftRun, RunStatus
+
+                run_status = (
+                    QraftRun.objects.select_for_update()
+                    .filter(pk=self._model.run_id)
+                    .values_list("status", flat=True)
+                    .first()
+                )
+                if run_status != RunStatus.OPEN:
+                    raise ValueError(
+                        f"chain {self._model.id} belongs to run "
+                        f"{self._model.run_id}, which is {run_status}; start a "
+                        "new run instead of resuming"
+                    )
+
             chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
             chain.transition_to(WorkflowStatus.RUNNING)
-            chain.save(update_fields=["status", "date_updated"])
+            # Cleared with the transition: the next settlement is a genuinely
+            # new one and must fire its signal and hook again.
+            chain.settled_at = None
+            chain.save(update_fields=["status", "settled_at", "date_updated"])
+            # The dedupe row is keyed on (workflow, hook_type) and knows
+            # nothing of generations, so the row left by the settlement being
+            # resumed from would suppress the next settlement's hook. Dropping
+            # it here is what makes `settled_at` the first line of defence and
+            # the row the second, as the two are meant to be.
+            WorkflowHookDispatch.objects.filter(
+                workflow_type=self._workflow_type, workflow_id=chain.id
+            ).delete()
 
             current_step = chain.steps.get(step_index=chain.current_step_index)
             if current_step.qraft_task:
@@ -239,23 +295,18 @@ class QraftChain(BaseWorkflow):
         Raises:
             InvalidStatusTransition: If chain is not WAITING_APPROVAL
         """
+        # The announcement shares the transaction, as in BaseWorkflow.cancel():
+        # nothing replays a rejection, so a crash between the two would leave
+        # the run's stage row believing this chain is still running.
         with transaction.atomic():
             chain = QraftChainModel.objects.select_for_update().get(id=self._model.id)
             chain.transition_to(WorkflowStatus.CANCELLED)
-            chain.save(update_fields=["status", "date_updated"])
+            chain.settled_at = timezone.now()
+            chain.save(update_fields=["status", "settled_at", "date_updated"])
+            self._model = chain
+            self._announce_cancelled()
 
-        self._model = chain
         _logger.info("QraftChain %s rejected: %s", chain.id, reason)
-
-        if chain.on_cancelled:
-            _dispatch_workflow_hook(
-                workflow_type="chain",
-                workflow_id=chain.id,
-                hook_type="cancelled",
-                hook_path=chain.on_cancelled,
-                hook_args=[],
-                hook_kwargs={},
-            )
         return chain.id
 
     def current(self) -> int:

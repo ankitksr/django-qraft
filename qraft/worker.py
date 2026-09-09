@@ -183,9 +183,14 @@ def _execute_task_in_thread(
     finally:
         # Close the execution lease: post_execute fires in the monitor process,
         # so the worker has to stop its own heartbeat thread.
+        from . import context, tracing
         from .lease import stop_heartbeat
 
         stop_heartbeat(task.get("id"))
+        # A pool thread outlives the task it ran, so the attempt's ids and its
+        # span are cleared here rather than left for the next task to inherit.
+        context.clear_context()
+        tracing.detach_current()
         # Always close connections after task execution
         close_old_django_connections()
         # Drop this task's deadline; the timer re-arms to the earliest

@@ -11,6 +11,7 @@ urlpatterns = [
     path("dlq/<uuid:task_id>/requeue/", views.requeue_task, name="requeue"),
     path("chains/<uuid:chain_id>/approve/", views.approve_chain, name="approve"),
     path("chains/<uuid:chain_id>/reject/", views.reject_chain, name="reject"),
+    path("runs/<str:action>/<uuid:run_id>/", views.settle_run, name="settle_run"),
     path(
         "workflows/<str:kind>/<uuid:workflow_id>/cancel/",
         views.cancel_workflow,

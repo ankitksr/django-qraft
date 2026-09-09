@@ -278,3 +278,60 @@ class TestTakesContext:
         assert context.attempt == 1
         assert args == (1,)
         assert kwargs == {"k": "v"}
+
+
+async def async_task_func(*args, **kwargs):
+    """Module-level coroutine task; must be awaited to produce its result."""
+    return ("async-done", args, kwargs)
+
+
+async def async_context_task_func(context, *args, **kwargs):
+    """Coroutine `takes_context=True` target."""
+    return ("async-ctx", context.attempt)
+
+
+@pytest.mark.django_db
+class TestCoroutineTasks:
+    @patch("qraft.tasks.q2_async_task")
+    def test_enqueue_accepts_a_coroutine_task(self, mock_q2, backend):
+        """validate_task() passes (supports_async_task) and the dispatched
+        run_task wrapper is what awaits the coroutine worker-side."""
+        mock_q2.return_value = "q2-async-1"
+        task = _make_django_task(func=async_task_func)
+
+        result = backend.enqueue(task, (1,), {"k": "v"})
+
+        qraft_task = QraftTask.objects.get()
+        assert qraft_task.func == "tests.test_backend.async_task_func"
+        assert result.id == str(qraft_task.id)
+        assert mock_q2.call_args[0][0] == "qraft.backend.run_task"
+
+    def test_run_task_awaits_the_coroutine(self):
+        from qraft.backend import run_task
+
+        assert run_task("tests.test_backend.async_task_func", [1], {"k": "v"}) == (
+            "async-done",
+            (1,),
+            {"k": "v"},
+        )
+
+    def test_context_wrapper_awaits_a_coroutine_target(self, backend):
+        qraft_task = QraftTask.objects.create(
+            func="tests.test_backend.async_context_task_func",
+            task_args=[],
+            task_kwargs={},
+            status=TaskStatus.RUNNING,
+        )
+        QraftTaskAttempt.objects.create(
+            qraft_task=qraft_task, attempt_number=1, q2_task_id="q2-async-ctx"
+        )
+
+        return_value = run_task_with_context(
+            "tests.test_backend.async_context_task_func",
+            str(qraft_task.id),
+            "default",
+            [],
+            {},
+        )
+
+        assert return_value == ("async-ctx", 1)

@@ -49,7 +49,7 @@ def _make_attempt(workflow_fk_field, workflow, success):
     return QraftTaskAttempt.objects.create(
         qraft_task=task,
         attempt_number=1,
-        q2_task_id=f"q2-{task.id}",
+        q2_task_id=f"q2-{task.id.hex[:24]}",
         success=success,
     )
 
@@ -78,7 +78,7 @@ def _chain_attempt(step, success, task_status):
     return QraftTaskAttempt.objects.create(
         qraft_task=task,
         attempt_number=1,
-        q2_task_id=f"q2-{task.id}",
+        q2_task_id=f"q2-{task.id.hex[:24]}",
         success=success,
     )
 
@@ -256,7 +256,7 @@ class TestChainDispatcher:
         return QraftTaskAttempt.objects.create(
             qraft_task=task,
             attempt_number=1,
-            q2_task_id=f"q2-{task.id}",
+            q2_task_id=f"q2-{task.id.hex[:24]}",
             success=success,
         )
 
@@ -734,3 +734,263 @@ class TestReaperRoutesWorkflowCompletion:
         assert iter_model.completed_count == 1
         assert iter_model.status == WorkflowStatus.FAILED
         mock_async.assert_called_once()
+
+
+@pytest.mark.django_db
+class TestSettlementIdentity:
+    """Every settlement fires workflow_settled and the hook exactly once."""
+
+    def _final_step(self, chain_fields=None):
+        chain, (step,) = _chain_with_steps(1, **(chain_fields or {}))
+        attempt = _chain_attempt(step, success=True, task_status=TaskStatus.SUCCEEDED)
+        return chain, step, attempt
+
+    def test_final_step_replay_settles_once(self, db, signal_log, django_capture_on_commit_callbacks):
+        chain, step, attempt = self._final_step({"success_hook": "x.hooks.done"})
+
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h1") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, attempt).handle()
+            ChainDispatcher(chain, step, attempt).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.SUCCEEDED
+        assert chain.settled_at is not None
+        assert len(signal_log["workflow_settled"]) == 1
+        assert signal_log["workflow_settled"][0]["outcome"] == "succeeded"
+        assert enqueue.call_count == 1
+
+    def test_already_terminal_complete_chain_settles_once(self, db, signal_log, django_capture_on_commit_callbacks):
+        chain, (step,) = _chain_with_steps(1, failure_hook="x.hooks.failed")
+        attempt = _chain_attempt(step, success=False, task_status=TaskStatus.EXHAUSTED)
+
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h2") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, attempt).handle()
+            ChainDispatcher(chain, step, attempt).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.FAILED
+        assert len(signal_log["workflow_settled"]) == 1
+        assert enqueue.call_count == 1
+
+    def test_cancel_racing_completion_is_one_settlement(self, db, signal_log, django_capture_on_commit_callbacks):
+        from qraft.chain import QraftChain
+
+        chain, step, attempt = self._final_step({"success_hook": "x.hooks.done"})
+        with django_capture_on_commit_callbacks(execute=True):
+            assert QraftChain(chain_id=chain.id).cancel() is True
+
+        with (
+            patch("qraft.dispatchers.q2_async_task") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, attempt).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.CANCELLED
+        assert [p["outcome"] for p in signal_log["workflow_settled"]] == ["cancelled"]
+        enqueue.assert_not_called()
+
+    def test_a_pre_1_4_row_is_treated_as_already_settled(
+        self, db, signal_log, django_capture_on_commit_callbacks
+    ):
+        """
+        A workflow that settled before this release has a terminal status and a
+        null `settled_at`. A replayed completion against it must send nothing —
+        the column being null is not an invitation to settle it again.
+        """
+        chain, step, attempt = self._final_step({"success_hook": "x.hooks.done"})
+        QraftChainModel.objects.filter(id=chain.id).update(
+            status=WorkflowStatus.SUCCEEDED, settled_at=None
+        )
+        chain.refresh_from_db()
+
+        with (
+            patch("qraft.dispatchers.q2_async_task") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, attempt).handle()
+
+        chain.refresh_from_db()
+        assert chain.settled_at is None
+        assert signal_log["workflow_settled"] == []
+        enqueue.assert_not_called()
+
+    def test_resume_then_settle_fires_again(self, db, signal_log, django_capture_on_commit_callbacks):
+        from qraft.chain import QraftChain
+
+        chain, (step,) = _chain_with_steps(1, failure_hook="x.hooks.failed")
+        failed = _chain_attempt(step, success=False, task_status=TaskStatus.EXHAUSTED)
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h3"),
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, failed).handle()
+
+        with patch("qraft.tasks.q2_async_task", return_value="q2-resumed"):
+            QraftChain(chain_id=chain.id).resume()
+        step.refresh_from_db()
+        chain.refresh_from_db()
+        assert chain.settled_at is None
+        # resume() queued a fresh task whose attempt 1 already exists.
+        succeeded = step.qraft_task.attempts.get(q2_task_id="q2-resumed")
+        succeeded.success = True
+        succeeded.save(update_fields=["success"])
+        step.qraft_task.status = TaskStatus.SUCCEEDED
+        step.qraft_task.save(update_fields=["status"])
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h4"),
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, succeeded).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.SUCCEEDED
+        assert [p["outcome"] for p in signal_log["workflow_settled"]] == [
+            "failed",
+            "succeeded",
+        ]
+
+    def test_parallel_duplicate_after_settlement_is_a_noop(
+        self, db, iter_model, signal_log, django_capture_on_commit_callbacks
+    ):
+        first = _make_attempt("qraft_iter", iter_model, success=True)
+        second = _make_attempt("qraft_iter", iter_model, success=True)
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h5") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ParallelDispatcher(iter_model, first).handle()
+            ParallelDispatcher(iter_model, second).handle()
+            # A third member that should not exist (overshoot) after settlement.
+            extra = _make_attempt("qraft_iter", iter_model, success=True)
+            assert ParallelDispatcher(iter_model, extra)._atomic_increment() == (
+                INCREMENT_NOOP
+            )
+        assert len(signal_log["workflow_settled"]) == 1
+        assert enqueue.call_count == 1
+
+    def test_hook_context_reaches_workflow_and_task_hooks(self, db, iter_model):
+        iter_model.hook_context = True
+        iter_model.total_count = 1
+        iter_model.save(update_fields=["hook_context", "total_count"])
+        attempt = _make_attempt("qraft_iter", iter_model, success=True)
+        with patch("qraft.dispatchers.q2_async_task", return_value="h6") as enqueue:
+            ParallelDispatcher(iter_model, attempt).handle()
+        context = enqueue.call_args.kwargs["context"]
+        assert context["workflow_type"] == "iter"
+        assert context["outcome"] == "succeeded"
+        assert context["completed_count"] == 1
+
+        from qraft.hooks import HookDispatcher
+
+        task = QraftTask.objects.create(
+            func="t.f",
+            status=TaskStatus.SUCCEEDED,
+            success_hook="x.hooks.done",
+            success_kwargs={"label": "a"},
+            hook_context=True,
+            subject_type="worksheet",
+            subject_id="4117",
+        )
+        task_attempt = QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=1, q2_task_id="q2-ctx", success=True
+        )
+        with patch("qraft.hooks.q2_async_task", return_value="h7") as enqueue:
+            HookDispatcher(task, task_attempt).dispatch(True)
+        kwargs = enqueue.call_args.kwargs
+        assert kwargs["label"] == "a"
+        assert kwargs["context"]["result_ref"] == "q2-ctx"
+        assert kwargs["context"]["outcome"] == "succeeded"
+        assert kwargs["context"]["subject_id"] == "4117"
+        assert kwargs["context"]["attempt_id"] == str(task_attempt.id)
+
+
+class TestResumedGeneration:
+    """resume() starts a new generation; the previous one must not settle it."""
+
+    def _failed_chain(self):
+        chain, (step,) = _chain_with_steps(1, failure_hook="x.hooks.failed")
+        failed = _chain_attempt(step, success=False, task_status=TaskStatus.EXHAUSTED)
+        return chain, step, failed
+
+    def test_a_completion_captured_before_resume_settles_nothing(
+        self, db, signal_log, django_capture_on_commit_callbacks
+    ):
+        """
+        The routing pass joins the step onto the task before it routes (the
+        hook handler's select_related, the reaper's replay batch). A resume
+        committing in that window rebinds the step, and the captured task must
+        then be recognised as the superseded generation it is.
+        """
+        from qraft.chain import QraftChain
+        from qraft.dispatchers import route_workflow_completion
+
+        chain, step, failed = self._failed_chain()
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h-gen-1"),
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, failed).handle()
+
+        captured = QraftTask.objects.select_related("chain_step__chain").get(
+            id=failed.qraft_task_id
+        )
+        with patch("qraft.tasks.q2_async_task", return_value="q2-gen-2"):
+            QraftChain(chain_id=chain.id).resume()
+
+        with (
+            patch("qraft.dispatchers.q2_async_task") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            assert route_workflow_completion(captured, failed) is True
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.RUNNING
+        assert chain.settled_at is None
+        assert [p["outcome"] for p in signal_log["workflow_settled"]] == ["failed"]
+        enqueue.assert_not_called()
+
+    def test_a_second_failure_after_resume_dispatches_the_hook_again(
+        self, db, django_capture_on_commit_callbacks
+    ):
+        from qraft.chain import QraftChain
+
+        chain, step, failed = self._failed_chain()
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h-f1") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, failed).handle()
+        assert enqueue.call_count == 1
+
+        with patch("qraft.tasks.q2_async_task", return_value="q2-refailed"):
+            QraftChain(chain_id=chain.id).resume()
+        step.refresh_from_db()
+        chain.refresh_from_db()
+        second = step.qraft_task.attempts.get(q2_task_id="q2-refailed")
+        second.success = False
+        second.save(update_fields=["success"])
+        step.qraft_task.status = TaskStatus.EXHAUSTED
+        step.qraft_task.save(update_fields=["status"])
+
+        with (
+            patch("qraft.dispatchers.q2_async_task", return_value="h-f2") as enqueue,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            ChainDispatcher(chain, step, second).handle()
+
+        chain.refresh_from_db()
+        assert chain.status == WorkflowStatus.FAILED
+        assert enqueue.call_count == 1
+        assert (
+            WorkflowHookDispatch.objects.filter(
+                workflow_id=chain.id, hook_type="failure"
+            ).count()
+            == 1
+        )

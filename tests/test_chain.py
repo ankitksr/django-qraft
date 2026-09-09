@@ -366,3 +366,36 @@ class TestResumeConcurrency:
 
         simple_chain._model.refresh_from_db()
         assert simple_chain._model.status == WorkflowStatus.CANCELLED
+
+
+class TestChainObservability:
+    def test_constructor_labels_reach_members_and_resume_clears_settled_at(self, db):
+        from django.utils import timezone
+
+        chain = QraftChain(
+            subject=("worksheet", 4117),
+            hook_context=True,
+            on_failure="fake.hooks.failed",
+        )
+        assert (chain._model.subject_type, chain._model.subject_id) == (
+            "worksheet",
+            "4117",
+        )
+        assert chain._model.hook_context is True
+
+        chain.append("demo.showcase.tasks.noop_task", 1)
+        with patch("qraft.tasks.q2_async_task", return_value="q2-chain-member"):
+            chain.run()
+        member = chain._model.steps.get(step_index=0).qraft_task
+        assert (member.subject_type, member.subject_id) == ("worksheet", "4117")
+
+        # A settled (FAILED) chain that is resumed must be able to settle again.
+        QraftChainModel.objects.filter(id=chain.id).update(
+            status=WorkflowStatus.FAILED, settled_at=timezone.now()
+        )
+        chain._model.refresh_from_db()
+        with patch("qraft.tasks.q2_async_task", return_value="q2-chain-resume"):
+            chain.resume()
+        chain._model.refresh_from_db()
+        assert chain._model.status == WorkflowStatus.RUNNING
+        assert chain._model.settled_at is None

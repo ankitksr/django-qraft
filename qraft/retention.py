@@ -15,6 +15,11 @@ Two invariants shape what is safe to delete:
 - A workflow is pruned as a unit. Deleting a member task out from under a live
   workflow would leave its counters pointing at rows that no longer exist, so
   member tasks are only pruned once their workflow is terminal (or gone).
+- Run membership is protected in every pass, not just the task pass. Deleting
+  an iter or batch cascades to its member tasks, so a completed batch under an
+  open run would lose its rows through the workflow pass alone. Terminal runs
+  are pruned after the task pass and their stages cascade with them; the
+  `summary` written at settlement is what makes that safe.
 
 Deletion runs in bounded batches: a first sweep over a table with millions of
 rows must not hold one transaction open or build one enormous id list.
@@ -30,7 +35,9 @@ from .models import (
     QraftBatchModel,
     QraftChainModel,
     QraftIterModel,
+    QraftRun,
     QraftTask,
+    RunStatus,
     TaskStatus,
     WorkflowHookDispatch,
     WorkflowStatus,
@@ -114,7 +121,7 @@ def log_retention_policy() -> None:
     """
     conf = get_conf()
     if not conf.retention_enabled():
-        logger.info("Qraft retention: disabled; settled rows are kept forever")
+        logger.info("Qraft retention: %s", "disabled; settled rows are kept forever")
         return
 
     rules = []
@@ -140,6 +147,19 @@ def _live_workflow_ids(model) -> list:
         model.objects.exclude(status__in=TERMINAL_WORKFLOW_STATUSES).values_list(
             "id", flat=True
         )
+    )
+
+
+def _open_run_ids() -> list:
+    """
+    Ids of runs still deciding, whose members are evidence and must be kept.
+
+    An explicit id list rather than an `exclude(run__status=...)` join, so a
+    row with no run is unambiguously kept - the same shape the workflow
+    exclusions above use.
+    """
+    return list(
+        QraftRun.objects.filter(status=RunStatus.OPEN).values_list("id", flat=True)
     )
 
 
@@ -193,6 +213,7 @@ def sweep_retention(
     # a running task, and FAILED can land while stragglers run. Deleting the
     # workflow would cascade those away mid-flight, so it waits for them.
     live_member = (TaskStatus.PENDING, TaskStatus.RUNNING)
+    open_runs = _open_run_ids()
     workflow_querysets = (
         QraftChainModel.objects.exclude(steps__qraft_task__status__in=live_member),
         QraftIterModel.objects.exclude(tasks__status__in=live_member),
@@ -202,7 +223,7 @@ def sweep_retention(
         count = _delete_in_batches(
             queryset.filter(
                 status__in=TERMINAL_WORKFLOW_STATUSES, date_updated__lt=cutoff
-            ),
+            ).exclude(run_id__in=open_runs),
             batch_size,
         )
         if count:
@@ -213,10 +234,29 @@ def sweep_retention(
     ).exclude(qraft_iter_id__in=_live_workflow_ids(QraftIterModel))
     tasks = tasks.exclude(qraft_batch_id__in=_live_workflow_ids(QraftBatchModel))
     tasks = tasks.exclude(chain_step__chain__id__in=_live_workflow_ids(QraftChainModel))
+    tasks = tasks.exclude(run_id__in=open_runs)
 
     count = _delete_in_batches(tasks, batch_size)
     if count:
         deleted["QraftTask"] = count
+
+    # After the task pass, so a run's members go first and the `summary`
+    # snapshot is the only thing that has to survive. Stages cascade.
+    #
+    # Live members are excluded for the same reason the workflow pass excludes
+    # them, and the case is not hypothetical: a cancelled run's `date_updated`
+    # is stamped at cancel time and can be past the cutoff while a unit it did
+    # not revoke is still running. `run` is SET_NULL, so deleting the row would
+    # not delete that work - it would strand it, and the outcome it is about to
+    # report would have nowhere to go.
+    count = _delete_in_batches(
+        QraftRun.objects.exclude(status=RunStatus.OPEN)
+        .filter(date_updated__lt=cutoff)
+        .exclude(qrafttask_members__status__in=live_member),
+        batch_size,
+    )
+    if count:
+        deleted["QraftRun"] = count
 
     # WorkflowHookDispatch has no FK to its workflow, so nothing cascades to
     # it; its own age is the only signal available.

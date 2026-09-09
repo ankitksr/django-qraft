@@ -234,21 +234,45 @@ class TestBatchCounters:
         assert simple_batch.success_count == 0
         assert simple_batch.failure_count == 0
 
-    def test_counters_update_on_completion(self, db, simple_batch):
-        """Test that counters update when tasks complete."""
-        simple_batch.run()
+    def test_dispatcher_tallies_real_completions_and_fires_hook_once(self, db):
+        """The dispatcher, not the model, owns the counters - drive it
+        through real member completions instead of writing the fields by
+        hand, and check its workflow hook fires exactly once."""
+        batch = QraftBatch(
+            on_success="showcase.tasks.on_success",
+            on_failure="showcase.tasks.on_failure",
+        )
+        batch.append("demo.showcase.tasks.noop_task", 1)
+        batch.append("demo.showcase.tasks.noop_task", 2)
+        batch.append("demo.showcase.tasks.noop_task", 3)
+        batch.run()
 
-        # Manually increment counters (normally done by ParallelDispatcher)
-        model = simple_batch._model
-        model.completed_count = 2
-        model.success_count = 1
-        model.failure_count = 1
-        model.save()
+        model = batch._model
+        tasks = list(QraftTask.objects.filter(qraft_batch=model))
+        outcomes = [True, True, False]  # 2 success, 1 failure
 
-        simple_batch._model.refresh_from_db()
-        assert simple_batch.completed_count == 2
-        assert simple_batch.success_count == 1
-        assert simple_batch.failure_count == 1
+        with patch("qraft.dispatchers.q2_async_task") as mock_async:
+            mock_async.return_value = "q2-hook"
+            for task, success in zip(tasks, outcomes):
+                task.status = TaskStatus.SUCCEEDED if success else TaskStatus.EXHAUSTED
+                task.save(update_fields=["status"])
+                attempt = task.attempts.get(attempt_number=1)
+                attempt.success = success
+                attempt.save(update_fields=["success"])
+                ParallelDispatcher(model, attempt).handle()
+
+            mock_async.assert_called_once()
+
+        model.refresh_from_db()
+        assert model.completed_count == 3
+        assert model.success_count == 2
+        assert model.failure_count == 1
+        assert (
+            WorkflowHookDispatch.objects.filter(
+                workflow_type="batch", workflow_id=model.id, hook_type="failure"
+            ).count()
+            == 1
+        )
 
 
 class TestBatchQueries:
@@ -500,3 +524,18 @@ class TestBatchHookDispatch:
             hook_type="failure",
         ).first()
         assert hook_dispatch is not None
+
+
+@pytest.mark.django_db
+class TestBatchObservability:
+    def test_constructor_labels_are_stored_and_copied_to_members(self):
+        batch = QraftBatch(subject=("report", 9), hook_context=True)
+        batch.append("showcase.tasks.noop_task", 1)
+        batch.append("showcase.tasks.noop_task", 2)
+        batch.run()
+
+        model = QraftBatchModel.objects.get(id=batch.id)
+        assert (model.subject_type, model.subject_id) == ("report", "9")
+        assert model.hook_context is True
+        members = QraftTask.objects.filter(qraft_batch=model)
+        assert {(m.subject_type, m.subject_id) for m in members} == {("report", "9")}

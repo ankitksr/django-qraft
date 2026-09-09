@@ -35,7 +35,10 @@ def _task(status=TaskStatus.SUCCEEDED, days_old=90, **extra):
         func="demo.showcase.tasks.noop_task", status=status, **extra
     )
     QraftTaskAttempt.objects.create(
-        qraft_task=task, attempt_number=1, q2_task_id=f"q2-{task.id}", success=True
+        qraft_task=task,
+        attempt_number=1,
+        q2_task_id=f"q2-{task.id.hex[:24]}",
+        success=True,
     )
     return _age(task, days_old)
 
@@ -242,7 +245,7 @@ class TestPolicyLogging:
     def test_reports_that_nothing_is_pruned(self, caplog):
         log_retention_policy()
 
-        assert "disabled" in caplog.text
+        assert "disabled" in caplog.records[0].args[0]
 
     def test_names_the_inherited_source(self, settings, caplog):
         from qraft.conf import _cached_conf
@@ -252,8 +255,9 @@ class TestPolicyLogging:
 
         log_retention_policy()
 
-        assert "newest 1000 task(s)" in caplog.text
-        assert "save_limit" in caplog.text
+        rules = caplog.records[0].args[0]
+        assert "newest 1000 task(s)" in rules
+        assert "save_limit" in rules
 
     def test_names_an_explicit_age_window(self, settings, caplog):
         from qraft.conf import _cached_conf
@@ -263,8 +267,9 @@ class TestPolicyLogging:
 
         log_retention_policy()
 
-        assert "older than 30.0 day(s)" in caplog.text
-        assert "save_limit" not in caplog.text
+        rules = caplog.records[0].args[0]
+        assert "older than 30.0 day(s)" in rules
+        assert "save_limit" not in rules
 
 
 class TestRevivedRows:
@@ -329,3 +334,89 @@ class TestLiveMemberWorkflows:
         assert deleted.get("QraftIterModel") == 1
         # Member cascades with its workflow
         assert not QraftTask.objects.filter(pk=member.pk).exists()
+
+
+class TestRunMembership:
+    """
+    A run's members are the evidence its summary is derived from. Every pass
+    has to protect them, including the workflow pass - deleting an iter or
+    batch cascades to its member tasks.
+    """
+
+    def _run(self, status, days_old=90):
+        from qraft.models.runs import QraftRun
+
+        run = QraftRun.objects.create(
+            subject_type="worksheet", subject_id="1", status=status
+        )
+        return _age(run, days_old)
+
+    def test_an_open_run_keeps_its_tasks_and_its_workflows(self):
+        from qraft.models.runs import QraftRun, RunStatus
+
+        run = self._run(RunStatus.OPEN)
+        batch = QraftBatchModel.objects.create(
+            total_count=1, status=WorkflowStatus.SUCCEEDED, run=run, stage="rules"
+        )
+        _age(batch, 90)
+        _task(qraft_batch=batch, run=run, stage="rules")
+        _task(run=run, stage="ingest")
+
+        sweep_retention(retention_days=30)
+
+        assert QraftRun.objects.count() == 1
+        assert QraftBatchModel.objects.count() == 1
+        assert QraftTask.objects.count() == 2
+
+    def test_a_terminal_run_is_pruned_with_its_stages_after_its_members(self):
+        from qraft.models.runs import QraftRun, QraftRunStage, RunStatus
+
+        run = self._run(RunStatus.SUCCEEDED)
+        QraftRunStage.objects.create(run=run, name="ingest", position=0)
+        run.summary = {"outcome": RunStatus.SUCCEEDED, "stages": []}
+        QraftRun.objects.filter(pk=run.pk).update(summary=run.summary)
+        batch = QraftBatchModel.objects.create(
+            total_count=1, status=WorkflowStatus.SUCCEEDED, run=run, stage="rules"
+        )
+        _age(batch, 90)
+        _task(qraft_batch=batch, run=run, stage="rules")
+
+        deleted = sweep_retention(retention_days=30)
+
+        assert deleted["QraftRun"] == 1
+        assert QraftRunStage.objects.count() == 0
+        assert QraftBatchModel.objects.count() == 0
+        assert QraftTask.objects.count() == 0
+
+    def test_the_summary_is_what_survives_a_pruned_member_set(self):
+        from qraft.models.runs import QraftRun, RunStatus
+
+        run = self._run(RunStatus.SUCCEEDED)
+        QraftRun.objects.filter(pk=run.pk).update(
+            summary={"outcome": RunStatus.SUCCEEDED, "duration_s": 12.5},
+            # date_updated is auto_now, so the summary write has to keep the
+            # row outside the window for this to test what it says.
+            date_updated=timezone.now(),
+        )
+        _task(run=run, stage="ingest")
+
+        sweep_retention(retention_days=30)
+
+        assert QraftTask.objects.count() == 0
+        assert QraftRun.objects.get(pk=run.pk).summary["duration_s"] == 12.5
+
+    def test_a_terminal_run_with_a_live_member_is_kept(self):
+        """
+        A cancel stamps `date_updated` and does not revoke work in flight, so a
+        CANCELLED run can be past the cutoff while a unit is still running.
+        `run` is SET_NULL: deleting the row would strand that unit, and the
+        outcome it is about to report would have nowhere to go.
+        """
+        from qraft.models.runs import QraftRun, RunStatus
+
+        run = self._run(RunStatus.CANCELLED)
+        _task(status=TaskStatus.RUNNING, run=run, stage="ingest")
+
+        sweep_retention(retention_days=30)
+
+        assert QraftRun.objects.count() == 1

@@ -46,6 +46,12 @@ button {
 button:hover:not(:disabled) { border-color: var(--run); color: var(--run); }
 button:disabled { opacity: .45; cursor: default; }
 button.on { border-color: var(--run); color: var(--run); }
+input.filter {
+  font: inherit; font-size: 11px; color: var(--ink); background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 5px; padding: 3px 8px; width: 220px;
+}
+input.filter:focus { outline: none; border-color: var(--run); }
+.pill.bad { color: var(--bad); border-color: var(--bad); }
 
 main { display: grid; grid-template-columns: 300px 1fr; gap: 12px; padding: 12px; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
@@ -106,10 +112,18 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .members { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { font-size: 10px; padding: 0 5px; border-radius: 3px;
         border: 1px solid var(--line); color: var(--dim); }
+a.chip { text-decoration: none; }
+a.chip:hover { text-decoration: underline; }
 .chip.succeeded { color: var(--ok); border-color: var(--ok); }
 .chip.failed, .chip.exhausted { color: var(--bad); border-color: var(--bad); }
 .chip.running { color: var(--run); border-color: var(--run); }
 .chip.gated::after { content: " ⏸"; color: var(--warn); }
+.chip.bound { color: var(--run); border-color: var(--run); }
+.chip.skipped, .chip.pending { color: var(--faint); }
+.chip.cancelled, .chip.abandoned { color: var(--warn); border-color: var(--warn); }
+.wf-head .overdue { color: var(--warn); font-size: 11px; }
+.stall { color: var(--warn); font-size: 10px; }
+.stall.recovered { color: var(--faint); }
 
 .metric-tiles { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px 0; }
 .spark { display: flex; align-items: flex-end; gap: 2px; height: 44px;
@@ -131,7 +145,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   <span class="pill" id="queued">queue —</span>
   <span class="pill" id="sched">scheduled —</span>
   <span class="pill warn" id="legacy" hidden>legacy schedules —</span>
+  <span class="pill bad" id="metrics-health" hidden>metrics sink —</span>
   <span class="spacer"></span>
+  <input class="filter" id="filter" type="text" placeholder="subject filter: type:id"
+         title="Filter tasks and workflows by subject, e.g. worksheet:4117 (type alone also works)">
   <span class="pill live" id="beat">polling</span>
   <button id="theme">light</button>
 </header>
@@ -173,6 +190,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
     </section>
 
     <section>
+      <h2>Runs <span class="count" id="run-count"></span></h2>
+      <div class="scroll" id="runs"><div class="empty">none</div></div>
+    </section>
+
+    <section>
       <h2>Workflows <span class="count" id="wf-count"></span></h2>
       <div class="scroll" id="workflows"><div class="empty">none</div></div>
     </section>
@@ -184,7 +206,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
           <thead><tr>
             <th>id</th><th>function</th><th>status</th><th>pri</th>
             <th class="num">try</th><th class="num">age</th>
-            <th class="num">beat</th><th>progress</th><th>error</th>
+            <th class="num">beat</th><th>progress</th><th class="num">moved</th><th>error</th>
           </tr></thead>
           <tbody id="tasks"></tbody>
         </table>
@@ -228,6 +250,10 @@ function renderState(state) {
     (state.next_due_in == null ? "" : ` · next in ${state.next_due_in}s`);
   $("legacy").hidden = !state.legacy_scheduled;
   $("legacy").textContent = `legacy schedules ${state.legacy_scheduled}`;
+  const health = state.metrics_health || {};
+  $("metrics-health").hidden = !health.failures;
+  $("metrics-health").textContent = `metrics sink failures ${health.failures}`;
+  $("metrics-health").title = health.last_error || "";
 
   $("tiles").innerHTML = TILES.map((name) =>
     `<div class="tile"><b>${state.counts[name] || 0}</b><span>${name}</span></div>`
@@ -238,15 +264,47 @@ function renderState(state) {
     <td class="faint">${task.admin_url
       ? `<a href="${esc(task.admin_url)}" target="_blank">${esc(task.short)}</a>`
       : esc(task.short)}</td>
-    <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}</td>
+    <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}${task.subject_type ? ` <span class="faint" title="subject">${esc(task.subject_type)}:${esc(task.subject_id)}</span>` : ""}</td>
     <td>${chip(task.status)}</td>
     <td class="faint">${task.priority === "default" ? "" : esc(task.priority)}</td>
     <td class="num">${task.attempts}${task.max_attempts ? `<span class="faint">/${task.max_attempts}</span>` : ""}</td>
     <td class="num muted">${task.elapsed}s</td>
     <td class="num faint">${task.heartbeat == null ? "" : task.heartbeat + "s"}</td>
     <td class="muted">${esc(task.progress)} <span class="faint">${esc(task.message)}</span></td>
+    <td class="num faint" title="seconds since progress last advanced">${task.advanced_age == null ? "" : task.advanced_age + "s"}${
+      task.stalled ? `<span class="stall${task.stall_recovered ? " recovered" : ""}" title="${task.stall_recovered
+        ? "flagged as stalled, has advanced since" : "no progress past stall_after; not retried"}">${
+        task.stall_recovered ? " ✓" : " ⚠"}</span>` : ""}</td>
     <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
-  </tr>`).join("") || `<tr><td colspan="9" class="empty">no tasks yet</td></tr>`;
+  </tr>`).join("") || `<tr><td colspan="10" class="empty">no tasks yet</td></tr>`;
+
+  const runs = state.runs || [];
+  $("run-count").textContent = runs.length;
+  $("runs").innerHTML = runs.map((run) => {
+    const actions = run.can_settle
+      ? `<button data-run-cancel="${esc(run.id)}">cancel</button>
+         <button data-run-abandon="${esc(run.id)}">abandon</button>` : "";
+    return `<div class="wf">
+      <div class="wf-head"><span class="kind">${esc(run.kind || "run")}</span>
+        <span class="faint">${esc(run.short)}</span>${chip(run.status)}
+        ${run.subject_type ? `<span class="faint" title="subject">${esc(run.subject_type)}:${esc(run.subject_id)}</span>` : ""}
+        ${run.overdue ? `<span class="overdue" title="open past QRAFT_RUN_OVERDUE_AFTER">⚠ overdue</span>` : ""}
+        ${run.previous_run ? `<span class="faint" title="reruns ${esc(run.previous_run_id)}">↩ ${esc(run.previous_run)}</span>` : ""}
+        <span class="spacer"></span>${actions}
+        <span class="muted">${run.elapsed}s</span></div>
+      <div class="members">${run.stages.map((s) => {
+        const title = [s.unit_type || "no unit", s.unit_id, s.error].filter(Boolean).join(" · ");
+        const label = `${esc(s.name)}${s.error ? ` ${esc(s.error)}` : ""}`;
+        // The stage chip is the one click to the failure: a stage that failed
+        // before its subject existed shows up nowhere else.
+        return s.unit_url
+          ? `<a class="chip ${esc(s.status)}" href="${esc(s.unit_url)}" title="${esc(title)}">${label}</a>`
+          : `<span class="chip ${esc(s.status)}" title="${esc(title)}">${label}</span>`;
+      }).join("")}</div>
+    </div>`;
+  }).join("") || `<div class="empty">none</div>`;
+  wire("[data-run-cancel]", (id) => post(`runs/cancel/${id}/`));
+  wire("[data-run-abandon]", (id) => post(`runs/abandon/${id}/`));
 
   $("wf-count").textContent = state.workflows.length;
   $("workflows").innerHTML = state.workflows.map((wf) => {
@@ -259,6 +317,7 @@ function renderState(state) {
     return `<div class="wf">
       <div class="wf-head"><span class="kind">${esc(wf.kind)}</span>
         <span class="faint">${esc(wf.short)}</span>${chip(wf.status)}
+        ${wf.subject_type ? `<span class="faint" title="subject">${esc(wf.subject_type)}:${esc(wf.subject_id)}</span>` : ""}
         ${wf.gated ? `<span class="gate" title="has approval-gated step">⏸ gated</span>` : ""}
         <span class="spacer"></span>${actions}
         <span class="muted">${c.completed}/${c.total}</span></div>
@@ -296,10 +355,19 @@ function renderState(state) {
     : `<div class="empty">none</div>`;
 
   const usage = Object.entries(state.usage);
-  $("usage").innerHTML = usage.length
+  const c = state.cost;
+  // "estimated" and the coverage word are part of the number: a configured
+  // price is an estimate of what the provider will bill, never proof of it.
+  const costRow = c
+    ? `<tr><td class="muted">cost</td><td class="num" title="${esc(c.coverage)} coverage${
+        c.estimated ? ", estimated from configured prices" : ", as reported by the caller"}">${
+        esc(c.amount)} ${esc(c.currency || "")}<span class="faint"> ${
+        esc(c.coverage)}${c.estimated ? " est" : ""}</span></td></tr>`
+    : "";
+  $("usage").innerHTML = usage.length || costRow
     ? `<table><tbody>` + usage.map(([key, value]) =>
         `<tr><td class="muted">${esc(key)}</td><td class="num">${value}</td></tr>`
-      ).join("") + `</tbody></table>`
+      ).join("") + costRow + `</tbody></table>`
     : `<div class="empty">none</div>`;
 }
 
@@ -370,10 +438,22 @@ document.querySelectorAll("[data-window]").forEach((button) => {
   };
 });
 
+// "type:id" filters tasks and workflows by subject; "type" alone filters by type.
+function filterQuery() {
+  const raw = $("filter").value.trim();
+  if (!raw) return "";
+  const [type, ...rest] = raw.split(":");
+  const params = new URLSearchParams();
+  if (type) params.set("subject_type", type);
+  if (rest.length) params.set("subject_id", rest.join(":"));
+  return "?" + params.toString();
+}
+$("filter").oninput = () => pollState();
+
 let failures = 0;
 async function pollState() {
   try {
-    const response = await fetch(BASE + "api/state/");
+    const response = await fetch(BASE + "api/state/" + filterQuery());
     if (!response.ok) throw new Error(response.status);
     renderState(await response.json());
     failures = 0;

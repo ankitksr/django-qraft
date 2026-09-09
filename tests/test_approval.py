@@ -61,7 +61,7 @@ class TestMidChainApproval:
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task,
             attempt_number=1,
-            q2_task_id=f"q2-{task.id}",
+            q2_task_id=f"q2-{task.id.hex[:24]}",
             success=True,
         )
 
@@ -85,7 +85,7 @@ class TestMidChainApproval:
         attempt = QraftTaskAttempt.objects.create(
             qraft_task=task,
             attempt_number=1,
-            q2_task_id=f"q2-{task.id}",
+            q2_task_id=f"q2-{task.id.hex[:24]}",
             success=True,
         )
         with patch("qraft.tasks.q2_async_task"):
@@ -113,7 +113,7 @@ class TestMidChainApproval:
         attempt0 = QraftTaskAttempt.objects.create(
             qraft_task=task0,
             attempt_number=1,
-            q2_task_id=f"q2-{task0.id}",
+            q2_task_id=f"q2-{task0.id.hex[:24]}",
             success=True,
         )
         with patch("qraft.tasks.q2_async_task"):

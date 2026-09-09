@@ -75,10 +75,9 @@ QRAFT_CLUSTER = {
 python manage.py migrate
 ```
 
-This creates the necessary database tables:
-- `qraft_qrafttask` - Logical tasks
-- `qraft_qrafttaskattempt` - Execution attempts
-- `qraft_hookdispatch` - Hook tracking
+This creates the Qraft tables: tasks and their attempts, hook dispatch tracking,
+the workflow models (chain, iter, batch), runs and run stages, and rate buckets
+for throttling. See [Architecture](architecture.md) for the full schema.
 
 ## Starting the Cluster
 
@@ -141,11 +140,11 @@ Add success and failure hooks:
 
 ```python
 # myapp/hooks.py
-def on_success(task_result, **kwargs):
-    print(f"Task succeeded with result: {task_result}")
+def on_success(**kwargs):
+    print("Task succeeded")
 
-def on_failure(task_id, exception_class, **kwargs):
-    print(f"Task {task_id} failed with {exception_class}")
+def on_failure(context=None, **kwargs):
+    print(f"Task {context['task_id']} failed with {context['exception_class']}")
 
 # Queue with hooks
 task_id = async_task(
@@ -154,9 +153,13 @@ task_id = async_task(
     qraft_options={
         'success_hook': 'myapp.hooks.on_success',
         'failure_hook': 'myapp.hooks.on_failure',
+        'hook_context': True,
     }
 )
 ```
+
+A hook receives only what you configure in `qraft_options` — Qraft injects nothing by
+default. See [Hooks Guide](hooks.md) for the full contract, including `hook_context`.
 
 See [Hooks Guide](hooks.md) for detailed hook documentation.
 
@@ -257,13 +260,27 @@ async_task('myapp.tasks.send_email',
 
 ### Pattern 2: Scheduled Task
 
+`async_task` has no `schedule_type` or `next_run` parameter — passing them falls through
+to `**kwargs` and they land as ordinary keyword arguments on the target function, not on
+a scheduler. For a one-off delayed run, use Django-Q2's own `schedule()` directly. It
+creates a `Schedule` row outside Qraft, so the resulting task carries no `QraftTask`,
+hooks, or retry policy:
+
 ```python
 from datetime import datetime, timedelta
+from django_q.tasks import schedule
+from django_q.models import Schedule
 
-# Schedule for later
 run_at = datetime.now() + timedelta(hours=1)
-async_task('myapp.tasks.cleanup_old_data', schedule_type='O', next_run=run_at)
+schedule(
+    'myapp.tasks.cleanup_old_data',
+    schedule_type=Schedule.ONCE,
+    next_run=run_at,
+)
 ```
+
+If the task needs Qraft hooks or retries, have the scheduled function call `async_task`
+itself rather than running the work directly.
 
 ### Pattern 3: Task Chain with Hooks
 
@@ -275,10 +292,14 @@ async_task(
     qraft_options={
         'success_hook': 'myapp.tasks.transform_data',
         'success_kwargs': {'pipeline_id': 'pipe-123'},
+        'hook_context': True,
     }
 )
 
-# Task 2 (transform_data) will be called as hook when extract_data succeeds
+# Task 2 (transform_data) is called as a hook when extract_data succeeds. It does not
+# receive extract_data's return value as an argument — it reads context['result_ref']
+# to fetch it. See "Task Chaining" in the Hooks Guide for the full example, or use
+# QraftChain (workflows.md) for multi-step pipelines like this one.
 ```
 
 ### Pattern 4: Retry on Specific Errors

@@ -29,6 +29,7 @@ import threading
 from django.db import close_old_connections, connections
 from django.utils import timezone
 
+from . import context, metrics, signals, tracing
 from .conf import get_conf
 
 _logger = logging.getLogger("qraft")
@@ -43,6 +44,9 @@ LEASE_DEADLINE_MARGIN = 60
 _stop_events: dict[str, threading.Event] = {}
 _stop_events_lock = threading.Lock()
 
+# q2_task_id -> attempt span opened at first start, ended when the lease closes.
+_pending_spans: dict[str, object] = {}
+
 
 def _lease_deadline_seconds() -> float:
     """Hard upper bound on one lease, derived from the configured task timeout."""
@@ -52,6 +56,119 @@ def _lease_deadline_seconds() -> float:
     if timeout:
         return timeout + LEASE_DEADLINE_MARGIN
     return DEFAULT_MAX_LEASE_SECONDS
+
+
+# Verdicts from claim_delivery().
+FIRST_DELIVERY = "first"  # this delivery started the attempt
+REPEAT_DELIVERY = "repeat"  # a further delivery the execution budget allows
+REFUSED_DELIVERY = "refused"  # the attempt has already run its allowance
+NO_ATTEMPT = "unowned"  # a plain django_q task, with no Qraft row behind it
+
+
+def claim_delivery(q2_task_id: str) -> str:
+    """
+    Decide whether this delivery of an attempt may execute, and record it.
+
+    Django-Q2 redelivers a message it never got an acknowledgement for, which
+    after a monitor crash means re-running a task whose attempt row is still
+    unresolved. Every such re-run refreshed the lease heartbeat, so the
+    reaper's liveness test answered "alive" and the attempt never surfaced as
+    orphaned; the run stayed OPEN until somebody cancelled it by hand.
+
+    The guard is a compare-and-swap on `execution_count`: at most
+    `max_executions_per_attempt` deliveries (default 1) are ever admitted, and
+    a resolved attempt admits none. The verdict is memoised on the executing
+    context so the lease and `qraft.runner.run_task` share one claim - the
+    lease opens the heartbeat on it, the runner refuses to call the function
+    on it. `NO_ATTEMPT` is deliberately not memoised: the legacy marker path
+    creates the attempt row between two calls (see `open_marker_lease`).
+
+    Returns one of FIRST_DELIVERY, REPEAT_DELIVERY, REFUSED_DELIVERY,
+    NO_ATTEMPT.
+    """
+    claimed = context.delivery_claim()
+    if claimed and claimed[0] == q2_task_id:
+        return claimed[1]
+
+    verdict, now = _claim(q2_task_id)
+    if verdict != NO_ATTEMPT:
+        context.set_delivery_claim((q2_task_id, verdict, now))
+    if verdict == FIRST_DELIVERY:
+        # Here rather than in `stamp_start`, because this is the one call that
+        # made the claim: `task_started` and the pickup histogram fire once per
+        # attempt, and both the lease receiver and the runner call this.
+        try:
+            _announce_start(q2_task_id, now)
+        except Exception:
+            # Observability, never the execution decision.
+            _logger.exception("Could not announce the start of %s", q2_task_id)
+    return verdict
+
+
+def _claim(q2_task_id: str):
+    """The two compare-and-swaps behind `claim_delivery`. Returns (verdict, now)."""
+    from django.db.models import F
+
+    from .models import QraftTaskAttempt
+
+    limit = get_conf().max_executions_per_attempt
+    now = timezone.now()
+    # ThreadPoolExecutor threads are named via `thread_name_prefix`
+    # (qraft.worker uses "qraft_worker"); the standard worker executes on
+    # "MainThread", which isn't a pool thread worth reporting.
+    thread_name = threading.current_thread().name
+    worker_thread = thread_name if thread_name != "MainThread" else None
+
+    # `success__isnull` on both: an attempt the reaper already resolved as
+    # orphaned must not run, whatever the execution budget says.
+    started = QraftTaskAttempt.objects.filter(
+        q2_task_id=q2_task_id,
+        date_started__isnull=True,
+        success__isnull=True,
+        execution_count__lt=limit,
+    ).update(
+        date_started=now,
+        heartbeat_at=now,
+        worker_pid=os.getpid(),
+        worker_thread=worker_thread,
+        execution_count=F("execution_count") + 1,
+    )
+    if started:
+        return FIRST_DELIVERY, now
+
+    repeated = QraftTaskAttempt.objects.filter(
+        q2_task_id=q2_task_id,
+        success__isnull=True,
+        execution_count__lt=limit,
+    ).update(
+        heartbeat_at=now,
+        worker_pid=os.getpid(),
+        worker_thread=worker_thread,
+        execution_count=F("execution_count") + 1,
+    )
+    if repeated:
+        return REPEAT_DELIVERY, now
+
+    row = (
+        QraftTaskAttempt.objects.filter(q2_task_id=q2_task_id)
+        .values("qraft_task__func", "cluster")
+        .first()
+    )
+    if row is None:
+        return NO_ATTEMPT, now
+
+    _logger.warning(
+        "Refusing a repeat delivery of q2 task %s: the attempt has already "
+        "used its %d execution(s)",
+        q2_task_id,
+        limit,
+    )
+    metrics.counter(
+        "qraft.attempt.redelivered",
+        func=row["qraft_task__func"],
+        cluster=row["cluster"],
+    )
+    return REFUSED_DELIVERY, now
 
 
 def stamp_start(q2_task_id: str) -> bool:
@@ -64,24 +181,46 @@ def stamp_start(q2_task_id: str) -> bool:
     threaded worker (see qraft.worker._execute_task_in_thread), so
     `os.getpid()` is always the real worker pid rather than the monitor's.
 
-    Returns False when no Qraft attempt owns this Django-Q2 task (a plain
-    django_q task), in which case there is nothing to heartbeat.
+    The start stamp is conditional on `date_started` being null, so a
+    redelivered message stamps nothing and announces nothing: `task_started`
+    and the pickup histogram fire once per attempt, only when that
+    conditional update matched.
+
+    Returns False both when no Qraft attempt owns this Django-Q2 task (a
+    plain django_q task) and when the delivery was refused - neither has a
+    lease to heartbeat. A refused delivery is not silently dropped: the
+    claim is memoised, and `qraft.runner.run_task` raises
+    `RedeliveredAttempt` off it rather than calling the function. Raising
+    here instead would be lost, since django_q's worker wraps no try/except
+    around a `pre_execute` receiver.
     """
+    return claim_delivery(q2_task_id) in (FIRST_DELIVERY, REPEAT_DELIVERY)
+
+
+def _announce_start(q2_task_id: str, now) -> None:
+    """Bind the context, send `task_started`, count the start, open the span."""
     from .models import QraftTaskAttempt
 
-    now = timezone.now()
-    # ThreadPoolExecutor threads are named via `thread_name_prefix`
-    # (qraft.worker uses "qraft_worker"); the standard worker executes on
-    # "MainThread", which isn't a pool thread worth reporting.
-    thread_name = threading.current_thread().name
-    worker_thread = thread_name if thread_name != "MainThread" else None
-    updated = QraftTaskAttempt.objects.filter(q2_task_id=q2_task_id).update(
-        date_started=now,
-        heartbeat_at=now,
-        worker_pid=os.getpid(),
-        worker_thread=worker_thread,
+    attempt = QraftTaskAttempt.objects.select_related("qraft_task").get(
+        q2_task_id=q2_task_id
     )
-    return bool(updated)
+    task = attempt.qraft_task
+    context.bind_attempt(attempt, task)
+    signals.send(
+        signals.task_started,
+        QraftTaskAttempt,
+        signals.attempt_payload(attempt, task, outcome=None),
+    )
+    metrics.counter("qraft.attempt.started", func=task.func, cluster=attempt.cluster)
+    pickup = metrics.seconds_between(attempt.enqueued_at, now)
+    if pickup is not None:
+        metrics.histogram(
+            "qraft.attempt.pickup", pickup, func=task.func, cluster=attempt.cluster
+        )
+    span = tracing.start_attempt_span(attempt.trace_context, task.func)
+    if span is not None:
+        with _stop_events_lock:
+            _pending_spans[q2_task_id] = span
 
 
 def touch(q2_task_id: str) -> int:
@@ -98,8 +237,16 @@ def heartbeat_loop(
     stop_event: threading.Event,
     interval: float,
     deadline: float,
+    span=None,
 ) -> None:
-    """Refresh `heartbeat_at` every `interval` seconds until the task ends."""
+    """
+    Refresh `heartbeat_at` every `interval` seconds until the task ends.
+
+    The attempt span (if any) ends here, on the worker side, because the loop
+    is the one thing that reliably learns the attempt is over in the process
+    that ran it: the threaded worker sets the stop event, and the standard
+    worker's loop sees the first heartbeat UPDATE match no rows.
+    """
     elapsed = 0.0
     try:
         while not stop_event.wait(interval):
@@ -117,6 +264,7 @@ def heartbeat_loop(
     except Exception:
         _logger.exception("Heartbeat for q2 task %s failed", q2_task_id)
     finally:
+        tracing.end_span(span)
         connections.close_all()
 
 
@@ -127,6 +275,7 @@ def start_heartbeat(q2_task_id: str) -> threading.Thread | None:
             return None
         stop_event = threading.Event()
         _stop_events[q2_task_id] = stop_event
+        span = _pending_spans.pop(q2_task_id, None)
 
     def _run():
         try:
@@ -135,6 +284,7 @@ def start_heartbeat(q2_task_id: str) -> threading.Thread | None:
                 stop_event,
                 get_conf().heartbeat_interval,
                 _lease_deadline_seconds(),
+                span,
             )
         finally:
             with _stop_events_lock:
@@ -190,10 +340,19 @@ def _on_pre_execute_lease(sender, func, task, **kwargs):
     if not q2_task_id:
         return
     try:
-        if not stamp_start(q2_task_id):
+        verdict = claim_delivery(q2_task_id)
+        if verdict == NO_ATTEMPT:
+            # A pre-1.3 Schedule delivery has no attempt row yet; the marker
+            # in its task_name creates one, and the claim is then real.
             if not open_marker_lease(task.get("name"), q2_task_id):
                 return
-            stamp_start(q2_task_id)
+            verdict = claim_delivery(q2_task_id)
+        if verdict not in (FIRST_DELIVERY, REPEAT_DELIVERY):
+            # No heartbeat for a delivery that will not run. Refreshing the
+            # lease on a redelivery is exactly what kept a stuck attempt
+            # looking alive to the reaper, and a Qraft-dispatched attempt's
+            # task_name is a marker, so a refused one reaches the line above.
+            return
     except Exception:
         _logger.exception("Could not open execution lease for %s", q2_task_id)
         return

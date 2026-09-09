@@ -7,10 +7,12 @@ import warnings
 from typing import Any, Callable
 
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from django.utils.module_loading import import_string
 from django_q.tasks import async_task as q2_async_task
 
-from qraft.brokers import QraftOrmBroker, priority_list_key
+from qraft import tracing
+from qraft.brokers import broker_for_cluster
 from qraft.conf import executing_cluster
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.tasks import TaskPriority
@@ -18,10 +20,16 @@ from qraft.retry import RetryPolicy
 
 _logger = logging.getLogger("qraft")
 
+# Every attempt is enqueued as this wrapper, never as the target itself.
+RUNNER_PATH = "qraft.runner.run_task"
+
 # django_q/tasks.py opt_keys: popped as task options before the remainder
-# become the function's kwargs. A name from this set in our **kwargs would
-# be consumed as an option on attempt 1 and replayed into the function on
-# retry (TypeError or behavior change).
+# become the function's kwargs. Qraft rejects a name from this set in our
+# **kwargs rather than guessing: `chain=` or `iter_count=` almost always means
+# django_q's option, and a caller who meant a function parameter of that name
+# has said something Qraft cannot tell apart from a mistake. (The enqueue
+# itself no longer depends on this - every attempt rides inside
+# `qraft.runner.run_task`, whose arguments django_q never parses as options.)
 _DJANGO_Q_OPT_KEYS = frozenset(
     {
         "hook",
@@ -68,6 +76,25 @@ def _reject_workflow_member_opt_keys(kwargs: dict) -> None:
             "task options instead of reaching the member function. Rename "
             "the callable's parameters."
         )
+
+
+def parse_subject(subject) -> tuple[str | None, str | None]:
+    """
+    Normalise a `("worksheet", 4117)` pair into the two stored strings.
+
+    The id is coerced with `str()` so integer ids work; anything but a pair
+    raises, since a silently mis-stored subject is worse than none.
+    """
+    if subject is None:
+        return None, None
+    if not isinstance(subject, (tuple, list)) or len(subject) != 2:
+        raise ValueError(
+            f"subject must be a (subject_type, subject_id) pair, got {subject!r}"
+        )
+    subject_type, subject_id = subject
+    if not subject_type or subject_id is None:
+        raise ValueError(f"subject must name both a type and an id, got {subject!r}")
+    return str(subject_type), str(subject_id)
 
 
 def _existing_task_for_key(idempotency_key: str) -> str | None:
@@ -162,18 +189,71 @@ def _importable_func_path(func: Callable) -> str:
     return func_path
 
 
-def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
+def _wrapped_dispatch(qraft_metadata: dict, func, args, q2_kwargs: dict):
+    """
+    Reroute attempt 1 through ``qraft.runner.run_task``.
+
+    Every attempt Qraft enqueues goes through that wrapper, which is what
+    gives execution a place to stand: it refuses a broker redelivery of an
+    attempt that already ran (``qraft.runner.guard_delivery``) and it awaits
+    a coroutine target instead of dropping the coroutine unrun. Retries and
+    DLQ requeues already dispatched this way (``qraft.scheduler._enqueue``);
+    this gives attempt 1 the same path.
+
+    The function's kwargs move out of ``q2_kwargs`` into ``run_task``'s
+    arguments; ``QraftTask.func``/args/kwargs still record the real target,
+    so nothing user-visible changes shape.
+
+    ``func`` is returned untouched when it is already ``run_task`` (the
+    django.tasks backend enqueues through it directly), since wrapping the
+    wrapper would only add a resolution step.
+    """
+    task_kwargs = qraft_metadata["task_kwargs"]
+    if qraft_metadata["func"] == RUNNER_PATH:
+        return func, args, q2_kwargs
+
+    q2_kwargs = {k: v for k, v in q2_kwargs.items() if k not in task_kwargs}
+    return (
+        RUNNER_PATH,
+        (qraft_metadata["func"], qraft_metadata["task_args"], task_kwargs),
+        q2_kwargs,
+    )
+
+
+def _create_and_enqueue(
+    qraft_metadata: dict, func, args, q2_kwargs: dict, bind_stage: str | None = None
+):
     """
     Create a QraftTask, queue it to Django-Q2, and record attempt 1.
 
-    All three happen in one transaction so a failed enqueue leaves no
-    half-built task behind.
+    All four happen in one transaction so a failed enqueue leaves no
+    half-built task behind, and a refused stage bind (the run settled, the
+    stage already has a unit) leaves nothing queued at all.
+
+    Args:
+        bind_stage: Stage name to bind this task to as the run's completion
+            unit. Workflow members pass None: they carry the run and stage for
+            correlation but never settle a stage.
 
     Returns:
         tuple[QraftTask, str]: the created task and its Django-Q2 task ID
     """
+    from qraft import runs
+
+    func, args, q2_kwargs = _wrapped_dispatch(qraft_metadata, func, args, q2_kwargs)
     with transaction.atomic():
+        # Re-read the subject under the run's row lock: `runs.bind_subject()`
+        # holds that lock while it backfills members, so a task inserted here
+        # either precedes the bind (and the backfill catches it) or waits and
+        # reads the bound subject. The lock is the same one `runs.bind()`
+        # takes a few lines down.
+        if qraft_metadata.get("run_id") and not qraft_metadata.get("subject_type"):
+            run = runs._locked(qraft_metadata["run_id"])
+            qraft_metadata["subject_type"] = run.subject_type
+            qraft_metadata["subject_id"] = run.subject_id
         qraft_task = QraftTask.objects.create(**qraft_metadata)
+        if bind_stage:
+            runs.bind(qraft_metadata["run_id"], bind_stage, qraft_task)
         q2_task_id = q2_async_task(func, *args, **q2_kwargs)
         QraftTaskAttempt.objects.create(
             qraft_task=qraft_task,
@@ -183,6 +263,8 @@ def _create_and_enqueue(qraft_metadata: dict, func, args, q2_kwargs: dict):
             # means django_q resolves the broker against this process's own
             # cluster name, which is what the fallback spells out.
             cluster=q2_kwargs.get("cluster") or executing_cluster(),
+            enqueued_at=timezone.now(),
+            trace_context=tracing.current_traceparent(),
         )
     return qraft_task, q2_task_id
 
@@ -222,12 +304,20 @@ def async_task(
         hook (str, optional):
             Legacy Django-Q2 hook. Deprecated. If no Qraft hooks are provided,
             this will be treated as a `success_hook` with a warning.
-        group, timeout, broker, cluster:
+        group, timeout, cluster:
             Same semantics as Django-Q2 async_task. `cluster` may also be
             set via `qraft_options["cluster"]`; if both are given they must
             match. It is never stored in task_kwargs, so retries re-route
             from the attempt row instead of replaying `cluster` into the
-            function.
+            function. Omitted, it means "this process's own cluster", and
+            Qraft resolves the target cluster's broker itself
+            (`qraft.brokers.broker_for_cluster`).
+        broker:
+            Escape hatch for a broker Qraft would not build. Requires
+            `cluster` too: the attempt row records the cluster, every retry
+            and DLQ requeue inherits it, and without a name the row would
+            claim the enqueuing process's cluster instead of the one this
+            broker actually feeds.
         ack_failure:
             Forced to True - Qraft schedules its own retries, so Django-Q2
             must never also redeliver a failed message. `False` is rejected.
@@ -288,6 +378,25 @@ def async_task(
                     enqueue into. Only takes effect if the cluster's broker
                     is `qraft.brokers.QraftOrmBroker` (see that module's
                     docstring); otherwise the task is queued normally.
+                subject (tuple): `(subject_type, subject_id)` naming the
+                    domain entity this task is for; the id is stored as a
+                    string. Retries inherit it; `QraftTask.objects
+                    .for_subject()` finds every task for it.
+                run (str | UUID): id of the `qraft.runs` run this task is a
+                    stage of. Paired with `stage`, the task becomes that
+                    stage's one completion unit at enqueue. A run implies its
+                    subject: a task that names no subject inherits the run's,
+                    and one that names a different subject raises.
+                stage (str): name of the run stage this task completes. Must
+                    be one the run declared, and must not already have a unit.
+                stall_after (int): seconds an attempt may heartbeat without
+                    its progress advancing before the reaper flags it as a
+                    suspected stall. Observation only - the attempt keeps
+                    running and is never resolved or retried on this signal.
+                hook_context (bool): when True, success and failure hooks
+                    receive one extra keyword argument, `context`, describing
+                    the attempt that produced them (ids, outcome, timestamps,
+                    `result_ref`, `traceparent`).
         **kwargs:
             Extra keyword arguments passed to the task function.
 
@@ -342,17 +451,15 @@ def async_task(
 
     # Names that are real async_task() parameters (hook/group/save/cluster/...)
     # never land in **kwargs; what can is the rest of django_q's opt_keys
-    # (chain/iter_count/iter_cached). Those would be stripped as options on
-    # attempt 1 and replayed as function kwargs on retry.
+    # (chain/iter_count/iter_cached), where the caller's intent is ambiguous.
     colliding = _DJANGO_Q_OPT_KEYS.intersection(kwargs)
     if colliding:
         raise ValueError(
             f"async_task() keyword argument(s) {sorted(colliding)} collide "
-            "with django_q option names: on attempt 1 they are consumed as "
-            "task options instead of reaching the function, but "
-            "task_kwargs replays them into the function on retry. Pass "
-            "options via q_options (reserved invariant keys are rejected "
-            "there too)."
+            "with django_q option names, so what you meant by them is "
+            "ambiguous. Pass task options via q_options (reserved invariant "
+            "keys are rejected there too), and rename the parameter if the "
+            "function really takes one by that name."
         )
 
     # Idempotency: a task already enqueued under this key is never
@@ -396,6 +503,14 @@ def async_task(
     # Build retry policy
     retry_policy = RetryPolicy.from_options(qraft_options)
 
+    from qraft import runs
+
+    subject_type, subject_id = parse_subject(qraft_options.get("subject"))
+    stage = qraft_options.get("stage")
+    correlation = runs.member_labels(
+        qraft_options.get("run"), stage, subject_type, subject_id
+    )
+
     # Prepare Qraft metadata
     func_path = func if isinstance(func, str) else _importable_func_path(func)
     qraft_metadata = {
@@ -412,6 +527,12 @@ def async_task(
         "status": TaskStatus.RUNNING,
         "idempotency_key": idempotency_key,
         "priority": priority,
+        "subject_type": correlation["subject_type"],
+        "subject_id": correlation["subject_id"],
+        "run_id": correlation["run_id"],
+        "stage": correlation["stage"],
+        "stall_after": qraft_options.get("stall_after"),
+        "hook_context": bool(qraft_options.get("hook_context", False)),
     }
 
     # Cluster routing: named parameter and qraft_options["cluster"] are
@@ -430,15 +551,25 @@ def async_task(
     if cluster is None:
         cluster = options_cluster
 
-    # Priority lanes: only takes effect against a cluster running
-    # qraft.brokers.QraftOrmBroker (see that module's docstring). The lane is
-    # keyed off the target cluster because django_q drops `cluster=` whenever
-    # an explicit broker is supplied. Explicit `broker=` from the caller wins
-    # over priority routing.
+    # Every enqueue names its broker, because django_q would otherwise resolve
+    # one from *this* process's Conf and hand a task meant for an ORM-broker
+    # cluster to whatever this process happens to run. The lane suffix is
+    # keyed off the target cluster for the same reason, and only takes effect
+    # against a cluster running qraft.brokers.QraftOrmBroker (see that
+    # module's docstring). Explicit `broker=` from the caller wins over both.
     if broker is None:
-        list_key = priority_list_key(priority, cluster)
-        if list_key is not None:
-            broker = QraftOrmBroker(list_key=list_key)
+        broker = broker_for_cluster(cluster, priority)
+    elif cluster is None:
+        # An explicit broker routes attempt 1 somewhere Qraft cannot name, and
+        # the attempt row would then record this process's cluster - which is
+        # what every retry and DLQ requeue inherits, sending them to a
+        # different cluster than the one that ran attempt 1.
+        raise ValueError(
+            "async_task(broker=...) must also name the cluster that broker "
+            "targets, so retries of this task reach the same cluster. Pass "
+            "cluster='<name>' (or qraft_options={'cluster': '<name>'}), or "
+            "drop broker= and let Qraft resolve it from the cluster."
+        )
 
     # Build Q2 task options. The remaining ones below are only added when the
     # caller gave a value, since passing e.g. timeout=None differs from
@@ -477,7 +608,7 @@ def async_task(
     # runs outside it, against the winner's already-committed row.
     try:
         qraft_task, q2_task_id = _create_and_enqueue(
-            qraft_metadata, func, args, q2_kwargs
+            qraft_metadata, func, args, q2_kwargs, bind_stage=correlation["stage"]
         )
     except IntegrityError:
         existing_q2_task_id = (
@@ -505,6 +636,7 @@ def _create_workflow_task(
     qraft_options: dict,
     qraft_iter_id: str | None = None,
     qraft_batch_id: str | None = None,
+    labels: dict | None = None,
 ):
     """
     Internal helper to create and queue a QraftTask for workflow execution.
@@ -520,6 +652,9 @@ def _create_workflow_task(
         qraft_options: Qraft-specific options (retry policy, etc.)
         qraft_iter_id: UUID of parent QraftIter (if part of iter)
         qraft_batch_id: UUID of parent QraftBatch (if part of batch)
+        labels: Correlation fields copied from the workflow onto the member
+            (`subject_type`, `subject_id`, and later `run`/`stage`) - see
+            `workflow_member_labels`
 
     Returns:
         QraftTask: Created task instance
@@ -530,12 +665,10 @@ def _create_workflow_task(
     """
     from qraft.models import QraftBatchModel, QraftIterModel
 
-    # Member kwargs are the function's kwargs, but q2_async_task treats
-    # django_q opt_keys (and q_options/task_name) as options. A collision
-    # would override Qraft's forced hook/save/ack_failure/group on attempt
-    # 1 and never reach the member function (while task_kwargs still
-    # stores them for retry). Also called at append time as the early
-    # user-facing guard; kept here as a backstop.
+    # Member kwargs are the function's kwargs, and a name django_q treats as
+    # an option (its opt_keys, plus q_options/task_name) makes the caller's
+    # intent ambiguous the same way it does in async_task(). Also called at
+    # append time as the early user-facing guard; kept here as a backstop.
     _reject_workflow_member_opt_keys(kwargs)
 
     retry_policy = RetryPolicy.from_options(qraft_options)
@@ -549,6 +682,8 @@ def _create_workflow_task(
         # Workflow tasks don't have task-level hooks (workflow-level only)
         "success_hook": None,
         "failure_hook": None,
+        "stall_after": qraft_options.get("stall_after"),
+        **(labels or {}),
     }
     if qraft_iter_id:
         qraft_metadata["qraft_iter"] = QraftIterModel.objects.get(id=qraft_iter_id)
@@ -571,6 +706,9 @@ def _create_workflow_task(
     cluster = qraft_options.get("cluster")
     if cluster is not None:
         q2_kwargs["cluster"] = cluster
+    # Named for the same reason async_task() names it: the member has to reach
+    # the target cluster's broker, not the enqueuing process's.
+    q2_kwargs["broker"] = broker_for_cluster(cluster)
 
     qraft_task, q2_task_id = _create_and_enqueue(qraft_metadata, func, args, q2_kwargs)
 
@@ -584,3 +722,20 @@ def _create_workflow_task(
     )
 
     return qraft_task
+
+
+def workflow_member_labels(workflow) -> dict:
+    """
+    Correlation fields a workflow copies onto every member it creates.
+
+    Members inherit the subject, run and stage so they filter and log
+    correctly; membership itself still rides on the workflow foreign keys, and
+    a member never binds or settles a stage - the workflow is the stage's one
+    completion unit.
+    """
+    return {
+        "subject_type": workflow.subject_type,
+        "subject_id": workflow.subject_id,
+        "run_id": workflow.run_id,
+        "stage": workflow.stage,
+    }

@@ -62,6 +62,38 @@ class TestExecuteTaskInThread:
         # Timer reset to idle once the task (executed synchronously here) finishes.
         assert timer.value == TIMER_IDLE
 
+    def test_finished_task_leaves_no_context_for_the_next_one(self):
+        """
+        A pool thread runs task after task. Whatever the last one bound - the
+        ids the logging filter stamps, the span the enqueue would parent to -
+        must be gone before the next one starts.
+        """
+        from qraft import context, tracing
+
+        def bind_something():
+            context._bound_context.set({"task_id": "leaked"})
+            tracing._thread_state.token = "attached"
+
+        task = make_task(func=bind_something)
+        semaphore = Semaphore(1)
+        semaphore.acquire()
+
+        with patch.object(tracing, "trace", object()), patch.object(
+            tracing.otel_context, "detach"
+        ) as detach:
+            _execute_task_in_thread(
+                task,
+                ThreadQueue(),
+                _DeadlineRegistry(Value("f", TIMER_IDLE)),
+                semaphore,
+                timeout=30,
+            )
+
+        assert context.current_context()["task_id"] is None
+        assert context._current_q2_task_id.get() is None
+        detach.assert_called_once_with("attached")
+        assert tracing._thread_state.token is None
+
     def test_exception_reports_failure_without_raising(self):
         def boom():
             raise ValueError("kaboom")

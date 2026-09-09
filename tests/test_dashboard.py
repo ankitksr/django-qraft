@@ -177,7 +177,15 @@ class TestStateEndpoint:
 
         assert [entry["func"] for entry in state["dlq"]] == ["flaky"]
         assert state["buckets"] == [{"key": "openai", "tokens": 3.5}]
-        assert state["usage"] == {"input_tokens": 100, "cost": 0.5}
+        # Tokens stay in the rollup; money moves to the cost summary, which is
+        # what carries its coverage and whether it was estimated.
+        assert state["usage"] == {"input_tokens": 100}
+        assert state["cost"] == {
+            "amount": "0.5",
+            "currency": None,
+            "coverage": "complete",
+            "estimated": False,
+        }
 
     def test_admin_links_degrade_without_admin(self, db, client):
         # django.contrib.admin is deliberately absent from test settings.
@@ -405,3 +413,216 @@ def test_state_payload_is_json_serializable_roundtrip(db, client, public):
         "buckets",
         "usage",
     }
+
+
+@pytest.mark.usefixtures("public")
+class TestSubjectFilterAndProgress:
+    def test_filters_progress_age_and_metrics_health(self, db, client):
+        now = timezone.now()
+        mine = _task(status=TaskStatus.RUNNING, subject_type="worksheet", subject_id="1")
+        _attempt(
+            mine,
+            date_started=now - timedelta(seconds=30),
+            progress={"current": 4, "total": 8, "message": "scoring"},
+            progress_advanced_at=now - timedelta(seconds=20),
+        )
+        other = _task(subject_type="worksheet", subject_id="2")
+        other.progress = {"current": 1, "total": 2}  # pre-1.4 snapshot only
+        other.save()
+        _attempt(other)
+        _task()
+        QraftIterModel.objects.create(
+            func="app.tasks.x", subject_type="worksheet", subject_id="1"
+        )
+        QraftBatchModel.objects.create(subject_type="worksheet", subject_id="2")
+
+        state = client.get("/qraft/api/state/").json()
+        assert len(state["tasks"]) == 3
+        assert state["filters"] == {}
+        assert state["metrics_health"] == {"failures": 0, "last_error": None}
+        by_id = {row["id"]: row for row in state["tasks"]}
+        assert by_id[str(mine.id)]["progress"] == "4/8"
+        assert 19 <= by_id[str(mine.id)]["advanced_age"] <= 22
+        assert by_id[str(other.id)]["progress"] == "1/2"
+        assert by_id[str(other.id)]["advanced_age"] is None
+
+        filtered = client.get(
+            "/qraft/api/state/?subject_type=worksheet&subject_id=1"
+        ).json()
+        assert filtered["filters"] == {"subject_type": "worksheet", "subject_id": "1"}
+        assert [row["id"] for row in filtered["tasks"]] == [str(mine.id)]
+        assert [wf["kind"] for wf in filtered["workflows"]] == ["iter"]
+        assert filtered["workflows"][0]["subject_id"] == "1"
+
+
+@pytest.mark.usefixtures("public")
+class TestRunsPanel:
+    def test_run_rows_carry_stages_badges_and_the_previous_run_link(self, db, client):
+        from qraft import runs
+        from qraft.models.runs import QraftRun, RunStatus, StageStatus
+
+        first = runs.start(subject=("worksheet", "1"), stages=["ingest"])
+        runs.abandon(first, reason="never enqueued")
+        second = runs.start(
+            subject=("worksheet", "1"),
+            stages=["ingest", "rules"],
+            kind="shadow",
+            previous_run=first,
+        )
+        runs.skip(second, "rules", reason="nothing undecided")
+        QraftRun.objects.filter(id=second).update(overdue_flagged_at=timezone.now())
+        runs.start(subject=("worksheet", "2"), stages=["ingest"])
+
+        state = client.get("/qraft/api/state/").json()
+        assert len(state["runs"]) == 3
+        row = next(r for r in state["runs"] if r["id"] == second)
+        assert row["kind"] == "shadow"
+        assert row["status"] == RunStatus.OPEN
+        assert row["overdue"] is True
+        assert row["can_settle"] is True
+        assert row["previous_run_id"] == first
+        assert row["elapsed"] >= 0
+        assert [(s["name"], s["status"]) for s in row["stages"]] == [
+            ("ingest", StageStatus.PENDING),
+            ("rules", StageStatus.SKIPPED),
+        ]
+
+        filtered = client.get(
+            "/qraft/api/state/?subject_type=worksheet&subject_id=1"
+        ).json()
+        assert {r["id"] for r in filtered["runs"]} == {first, second}
+        by_run = client.get(f"/qraft/api/state/?run={second}").json()
+        assert [r["id"] for r in by_run["runs"]] == [second]
+
+    def test_cancel_and_abandon_actions(self, db, client):
+        from qraft import runs
+        from qraft.models.runs import QraftRun, RunStatus
+
+        run_id = runs.start(subject=("worksheet", "1"), stages=["ingest"])
+
+        assert client.post(f"/qraft/runs/cancel/{run_id}/").status_code == 200
+        assert QraftRun.objects.get(id=run_id).status == RunStatus.CANCELLED
+        # Repeating it is a conflict, not a silent second settlement.
+        assert client.post(f"/qraft/runs/cancel/{run_id}/").status_code == 409
+        assert client.get(f"/qraft/runs/cancel/{run_id}/").status_code == 405
+
+        other = runs.start(subject=("worksheet", "2"), stages=["ingest"])
+        assert client.post(f"/qraft/runs/abandon/{other}/").status_code == 200
+        assert QraftRun.objects.get(id=other).status == RunStatus.ABANDONED
+
+        unknown = "00000000-0000-0000-0000-000000000000"
+        assert client.post(f"/qraft/runs/cancel/{unknown}/").status_code == 404
+        assert client.post(f"/qraft/runs/nope/{run_id}/").status_code == 404
+
+
+@pytest.mark.usefixtures("public")
+class TestStallBadge:
+    def test_a_flagged_attempt_shows_stalled_then_recovered(self, db, client):
+        now = timezone.now()
+        stalled = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
+        _attempt(
+            stalled,
+            date_started=now - timedelta(minutes=10),
+            progress_advanced_at=now - timedelta(minutes=9),
+            stall_suspected_at=now - timedelta(minutes=1),
+        )
+        recovered = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
+        _attempt(
+            recovered,
+            date_started=now - timedelta(minutes=10),
+            stall_suspected_at=now - timedelta(minutes=5),
+            progress_advanced_at=now - timedelta(seconds=10),
+        )
+        healthy = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
+        _attempt(healthy, date_started=now - timedelta(minutes=1))
+
+        rows = {row["id"]: row for row in client.get("/qraft/api/state/").json()["tasks"]}
+        assert (rows[str(stalled.id)]["stalled"], rows[str(stalled.id)]["stall_recovered"]) == (
+            True,
+            False,
+        )
+        assert (
+            rows[str(recovered.id)]["stalled"],
+            rows[str(recovered.id)]["stall_recovered"],
+        ) == (True, True)
+        assert rows[str(healthy.id)]["stalled"] is False
+
+
+@pytest.mark.usefixtures("public")
+class TestProgressOwnership:
+    def test_a_superseded_snapshot_is_not_shown_beside_a_newer_attempt(
+        self, db, client
+    ):
+        """
+        `QraftTask.progress` is whatever attempt wrote it last. Showing it
+        beside a newer attempt reports a superseded attempt's numbers as the
+        running one's.
+        """
+        task = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
+        first = _attempt(task, progress={"current": 9, "total": 10})
+        task.progress = {"current": 9, "total": 10, "attempt_id": str(first.id)}
+        task.save(update_fields=["progress"])
+        second = QraftTaskAttempt.objects.create(
+            qraft_task=task, attempt_number=2, q2_task_id="q2-second"
+        )
+
+        (row,) = client.get("/qraft/api/state/").json()["tasks"]
+        assert row["progress"] == ""
+
+        # Once the current attempt reports, its own numbers show.
+        QraftTaskAttempt.objects.filter(id=second.id).update(
+            progress={"current": 1, "total": 10}
+        )
+        (row,) = client.get("/qraft/api/state/").json()["tasks"]
+        assert row["progress"] == "1/10"
+
+    def test_a_pre_1_4_snapshot_with_no_attempt_id_still_shows(self, db, client):
+        task = _task(status=TaskStatus.RUNNING, func="app.tasks.score")
+        task.progress = {"current": 3, "total": 4}
+        task.save(update_fields=["progress"])
+        _attempt(task)
+
+        (row,) = client.get("/qraft/api/state/").json()["tasks"]
+        assert row["progress"] == "3/4"
+
+
+@pytest.mark.usefixtures("public")
+class TestRunStageLinks:
+    """A stage failure is one click from the run row, and named on it."""
+
+    def test_a_task_stage_carries_its_unit_link_and_exception(self, db, client):
+        from qraft import runs
+        from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
+
+        run_id = runs.start(subject=("worksheet", "7"), stages=["ingest", "rules"])
+        task = QraftTask.objects.create(
+            func="revenue.tasks.ingest",
+            task_args=[],
+            task_kwargs={},
+            status=TaskStatus.EXHAUSTED,
+            run_id=run_id,
+            stage="ingest",
+        )
+        QraftTaskAttempt.objects.create(
+            qraft_task=task,
+            attempt_number=1,
+            q2_task_id="q2-stage-link",
+            success=False,
+            exception_class="IngestError",
+        )
+        runs.bind(run_id, "ingest", task)
+
+        row = next(
+            r for r in client.get("/qraft/api/state/").json()["runs"] if r["id"] == run_id
+        )
+        ingest = next(s for s in row["stages"] if s["name"] == "ingest")
+        assert ingest["unit_id"] == str(task.id)
+        assert ingest["error"] == "IngestError"
+        # The admin is deliberately not installed in the test project, so the
+        # link degrades to None rather than raising.
+        assert ingest["unit_url"] is None
+
+        unbound = next(s for s in row["stages"] if s["name"] == "rules")
+        assert unbound["unit_id"] == ""
+        assert unbound["unit_url"] is None
+        assert unbound["error"] == ""

@@ -45,11 +45,11 @@ except ImportError as exc:
         "DEP 14). Upgrade Django or use qraft.tasks.async_task() directly."
     ) from exc
 
-from qraft.brokers import QraftOrmBroker, priority_lanes_available, priority_list_key
+from qraft.brokers import broker_for_cluster, priority_lanes_available
 from qraft.conf import executing_cluster
 from qraft.models import QraftTask, QraftTaskAttempt, TaskStatus
 from qraft.models.tasks import TaskPriority
-from qraft.runner import _resolve_target
+from qraft.runner import _resolve_target, call_target, close_lease, guard_delivery
 from qraft.runner import run_task as run_task  # re-exported: resolved by dotted path
 from qraft.tasks import async_task as qraft_async_task
 
@@ -91,9 +91,12 @@ class QraftTaskBackend(BaseTaskBackend):
     """
     Engine for django.tasks backed by Qraft's async_task()/QraftTask.
 
-    Coroutine tasks aren't wired into Qraft's pipeline, so they stay
-    unsupported (``supports_async_task`` defaults to ``False`` on the base
-    class) and are rejected by ``validate_task()`` before enqueueing.
+    Coroutine tasks are supported: every enqueue path dispatches through
+    ``run_task``/``run_task_with_context``, which run an ``async def`` target
+    to completion with ``asyncio.run()`` in the worker slot it already
+    occupies (see ``qraft.runner.call_target``). One coroutine per slot -
+    this is not the parked asyncio worker
+    (``docs/future/asyncio-worker.md``).
 
     ``run_after`` (deferred execution) and ``takes_context`` (``TaskContext``
     injection) are supported - see ``_enqueue_deferred()`` and
@@ -102,6 +105,7 @@ class QraftTaskBackend(BaseTaskBackend):
 
     supports_get_result = True
     supports_defer = True
+    supports_async_task = True
 
     @property
     def supports_priority(self) -> bool:
@@ -164,10 +168,7 @@ class QraftTaskBackend(BaseTaskBackend):
         still record the real target, so ``get_result()`` reports it
         untouched.
         """
-        broker = None
-        list_key = priority_list_key(lane)
-        if list_key is not None:
-            broker = QraftOrmBroker(list_key=list_key)
+        broker = broker_for_cluster(priority=lane)
 
         with transaction.atomic():
             qraft_task = QraftTask.objects.create(
@@ -183,8 +184,7 @@ class QraftTaskBackend(BaseTaskBackend):
                 "hook": "qraft.hooks.qraft_hook_handler",
                 "ack_failure": True,
             }
-            if broker is not None:
-                q2_kwargs["broker"] = broker
+            q2_kwargs["broker"] = broker
             q2_task_id = q2_async_task(
                 _CONTEXT_WRAPPER_PATH,
                 func_path,
@@ -342,7 +342,15 @@ def run_task_with_context(func_path, qraft_task_id, backend_alias, args, kwargs)
     """
     from django.tasks import task_backends
 
+    # Same guard run_task applies: this wrapper is the worker-side entry
+    # point for these tasks, so the redelivery refusal has to live here too.
+    guard_delivery()
     func = _resolve_target(func_path)
     task_result = task_backends[backend_alias].get_result(qraft_task_id)
     context = TaskContext(task_result=task_result)
-    return func(context, *args, **kwargs)
+    try:
+        return call_target(func, context, *args, **kwargs)
+    finally:
+        # Same reason run_task closes it: this is the worker-side entry point
+        # for these tasks, so it owns the end of the lease too.
+        close_lease()

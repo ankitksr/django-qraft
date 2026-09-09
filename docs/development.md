@@ -20,7 +20,7 @@ This guide covers local setup, testing, code style, and common development tasks
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.10 or higher
 - uv (recommended) or pip
 - Git
 
@@ -46,7 +46,7 @@ source .venv/bin/activate  # On Linux/Mac
 .venv\Scripts\activate  # On Windows
 
 # Install package in editable mode with dev dependencies
-uv pip install -e ".[dev]"
+uv sync --group dev
 ```
 
 ### Install with pip
@@ -58,8 +58,8 @@ python -m venv .venv
 # Activate virtual environment
 source .venv/bin/activate  # On Linux/Mac
 
-# Install package in editable mode with dev dependencies
-pip install -e ".[dev]"
+# Install package in editable mode
+pip install -e .
 ```
 
 ### Verify Installation
@@ -76,36 +76,104 @@ pytest tests/ -k test_basic --no-cov
 
 ```
 django-qraft/
-├── qraft/                  # Main package
+├── qraft/                       # Main package
 │   ├── __init__.py
-│   ├── cluster.py         # QraftCluster and QraftSentinel
-│   ├── conf.py            # Pydantic settings
-│   ├── hooks.py           # Hook dispatching
-│   ├── models.py          # Database models
-│   ├── retry.py           # Retry policy logic
-│   ├── tasks.py           # Enhanced async_task
-│   ├── worker.py          # Threaded worker
-│   └── management/
-│       └── commands/
-│           └── qraftcluster.py
+│   ├── admin.py                # Django admin configuration for Qraft models
+│   ├── apps.py                 # QraftConfig (AppConfig)
+│   ├── backend.py              # QraftTaskBackend, the django.tasks (DEP 14) backend for Django 6.0+
+│   ├── base.py                 # Shared workflow patterns for chain/iter/batch
+│   ├── batch.py                # QraftBatch wrapper for parallel heterogeneous workflows
+│   ├── brokers.py              # broker_for_cluster(), RoutingBroker, QraftOrmBroker (priority lanes)
+│   ├── chain.py                 # QraftChain wrapper for sequential workflows
+│   ├── cluster.py               # QraftCluster and QraftSentinel (Django-Q2 extensions)
+│   ├── conf.py                  # Pydantic settings with DjangoSettingsSource + ALT_CLUSTERS support
+│   ├── context.py                # Per-attempt progress/cost reporting, run request budgets
+│   ├── dashboard/                 # Staff-only monitoring UI and JSON metrics endpoints
+│   │   ├── apps.py
+│   │   ├── metrics.py            # Bounded metric queries for the dashboard
+│   │   ├── templates/qraft_dashboard/dashboard.html
+│   │   ├── urls.py
+│   │   └── views.py
+│   ├── dispatchers.py             # ChainDispatcher and ParallelDispatcher
+│   ├── dlq.py                      # Dead-letter listing and requeue onto the same attempt series
+│   ├── hooks.py                     # Global hook handler with workflow detection and routing
+│   ├── iter.py                      # QraftIter wrapper for parallel homogeneous workflows
+│   ├── lease.py                     # Execution lease; creates the attempt row for retries/requeues/deferred tasks
+│   ├── logging.py                   # QraftContextFilter, stamps log records with the executing attempt's ids
+│   ├── management/commands/qraftcluster.py   # `qraftcluster` management command
+│   ├── metrics/                     # Sink protocol + emission points
+│   │   ├── __init__.py              # Sink protocol, NullSink, label guard and health counter
+│   │   ├── gauges.py                 # Backlog gauges
+│   │   └── otel.py                   # OpenTelemetrySink
+│   ├── migrations/                   # 15 migrations — see Database Migrations below
+│   ├── models/                       # Database schema (modularized in v1.1.0)
+│   │   ├── __init__.py               # Re-exports all
+│   │   ├── hooks.py                   # HookDispatch, WorkflowHookDispatch
+│   │   ├── mixins.py                   # WorkflowStatus enum, SubjectMixin, RunMemberMixin, WorkflowStatusMixin, WorkflowHookMixin
+│   │   ├── runs.py                      # QraftRun, QraftRunStage, RunStatus/StageStatus/UnitType
+│   │   ├── tasks.py                     # QraftTask, QraftTaskAttempt, RateBucket
+│   │   └── workflows.py                  # Chain/Iter/Batch models
+│   ├── pricing.py                        # Optional cost resolver over usage entries (schemaless; no migration)
+│   ├── reaper.py                         # Orphan detection, routing replay, stall flagging, run overdue sweep
+│   ├── results.py                        # Rich result objects for workflow primitives
+│   ├── retention.py                      # Bounded pruning of settled rows (opt-in via retention_days)
+│   ├── retry.py                          # RetryPolicy with backoff calculations + schedule_retry()
+│   ├── runner.py                         # Worker-side entry point for every attempt
+│   ├── runs.py                           # Run and stage lifecycle: start, bind, skip, cancel, abandon, settlement
+│   ├── scheduler.py                      # Owned scheduling: SCHEDULED attempt rows + the claiming dispatcher
+│   ├── signals.py                        # Signals Qraft emits about its own transitions
+│   ├── tasks.py                          # Enhanced async_task() + _create_workflow_task() helper
+│   ├── throttle.py                       # Shared Postgres token bucket for cross-worker rate limiting
+│   ├── tracing.py                        # W3C trace propagation across the enqueue boundary
+│   └── worker.py                         # threaded_worker() using ThreadPoolExecutor
 │
-├── tests/                 # Unit tests
-│   ├── conftest.py        # Pytest fixtures
-│   ├── test_models.py
-│   ├── test_retry.py
-│   ├── test_tasks.py
-│   ├── test_hooks.py
-│   ├── test_conf.py
-│   └── test_integration.py
+├── tests/                       # Unit tests (see tests/README.md for details)
+│   ├── conftest.py              # Shared fixtures and pytest configuration
+│   ├── settings.py              # Django settings for tests
+│   ├── urls.py                  # URLconf for the dashboard tests
+│   ├── e2e_tasks.py             # Real task/hook functions the e2e tests execute
+│   ├── test_models.py           # QraftTask, QraftTaskAttempt, HookDispatch
+│   ├── test_tasks.py            # async_task(): validation, options, enqueue
+│   ├── test_retry.py            # RetryPolicy: backoff, jitter, exception filtering
+│   ├── test_hooks.py            # Hook handler, dual-phase dispatch, idempotency
+│   ├── test_scheduler.py        # The dispatcher that owns delayed execution
+│   ├── test_lease.py            # Execution lease and heartbeat
+│   ├── test_reaper.py           # Orphan detection, replay, stall flagging
+│   ├── test_dlq.py              # Dead-letter listing and requeue
+│   ├── test_retention.py        # Bounded pruning of settled rows
+│   ├── test_chain.py            # QraftChain sequential workflow
+│   ├── test_iter.py             # QraftIter parallel fan-out
+│   ├── test_batch.py            # QraftBatch fork-join
+│   ├── test_approval.py         # Human-in-the-loop chain steps
+│   ├── test_dispatchers.py      # Chain/parallel dispatcher races and idempotency
+│   ├── test_worker.py           # threaded_worker loop and thread execution
+│   ├── test_cluster.py          # QraftSentinel/QraftCluster worker selection
+│   ├── test_commands.py         # qraftcluster management command
+│   ├── test_brokers.py          # Priority lanes, per-cluster brokers, RoutingBroker
+│   ├── test_throttle.py         # Shared token bucket
+│   ├── test_context.py          # Progress and usage reporting
+│   ├── test_backend.py          # django.tasks backend (skips below Django 6.0)
+│   ├── test_conf.py             # Settings and ALT_CLUSTERS
+│   ├── test_dashboard.py        # Bundled monitoring dashboard
+│   ├── test_runs.py             # Binding rules, derived settlement, replay paths
+│   ├── test_signals.py          # Send sites, id payloads, send_robust isolation
+│   ├── test_metrics.py          # Emission points, label sets, gauge ownership
+│   ├── test_logging.py          # QraftContextFilter inside and outside a task
+│   ├── test_pricing.py          # Cost resolver, subset formula, coverage flags
+│   ├── test_e2e.py              # Real broker + worker + monitor, nothing stubbed
+│   ├── test_integration.py      # Cross-cutting flows with the enqueue seam mocked
+│   ├── test_workflow_integration.py  # Workflow flows (integration marker)
+│   └── test_postgres_concurrency.py  # Row-lock races; skipped unless run on Postgres
 │
 ├── demo/                  # Integration tests
 │   ├── manage.py
-│   ├── demo_project/
-│   │   ├── settings.py
-│   │   └── tasks.py
-│   └── management/
-│       └── commands/
-│           └── demo.py
+│   ├── showcase/
+│   │   ├── tasks.py
+│   │   ├── hooks.py
+│   │   ├── scenarios/            # core, ai, bench, djangotasks, durability, workflows
+│   │   └── management/
+│   │       └── commands/
+│   │           └── demo.py
 │
 ├── docs/                  # Documentation
 │   ├── getting-started.md
@@ -356,16 +424,14 @@ uv run ruff check qraft/retry.py
 
 ```toml
 [tool.ruff]
-line-length = 88
-target-version = "py312"
+target-version = "py310"
+exclude = ["*/migrations/*", "tests/*"]
 
 [tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
     "F",   # pyflakes
     "I",   # isort
-    "B",   # flake8-bugbear
 ]
 ```
 
@@ -403,61 +469,65 @@ def test_should_retry_with_exception_filter():
     assert policy.should_retry(1, 'ValueError') is False
 ```
 
-### Integration Tests
+### End-to-End Tests
 
-Test component interactions:
+`tests/test_e2e.py` runs the whole path with nothing stubbed: `async_task()` writes a real
+`OrmQ` row, Django-Q2's own `pusher`/`worker`/`monitor` loops run in-process, and the
+`Task` row they save fires `qraft_hook_handler` through its normal `post_save` receiver.
+Task functions live in `tests/e2e_tasks.py` because a retry re-imports them by dotted path.
 
-**Example: Testing task with retry**
+Two things stand in for parts that cannot run inside a test process: the sentinel (process
+spawning, recycling, timeout kills) is absent, and `dispatch_due()` is called directly
+instead of polled by the dispatcher thread — which is also what makes backoff instant here.
+
+**Example: retry really re-runs the task**
 
 ```python
-# tests/test_integration.py
-import pytest
-from qraft.tasks import async_task
-from qraft.models import QraftTask, TaskStatus
-
-@pytest.mark.django_db
-def test_task_retry_on_failure():
-    # Create task with retry
-    task_id = async_task(
-        'demo_project.tasks.failing_task',
-        qraft_options={
-            'max_attempts': 3,
-            'base_delay': 1,
-        }
+def test_retry_reruns_the_task(broker):
+    e2e_tasks.FAIL_BUDGET['flaky'] = 1
+    async_task(
+        'tests.e2e_tasks.flaky', 'beta',
+        qraft_options={'max_attempts': 3, 'base_delay': 0,
+                       'backoff_strategy': 'fixed', 'jitter': False},
     )
 
-    # Get task
-    task = QraftTask.objects.get(id=task_id)
+    run_once()                        # attempt 1 executes and fails
+    assert QraftTask.objects.get().status == TaskStatus.PENDING
+    retry = QraftTaskAttempt.objects.get(attempt_number=2)
+    assert retry.state == AttemptState.SCHEDULED  # a row, not a queued message
 
-    # Simulate first failure
-    # ... (execution simulation)
-
-    # Check retry was scheduled
-    from django_q.models import Schedule
-    retry = Schedule.objects.filter(
-        name__startswith=f'qraft_retry:{task_id}'
-    ).first()
-
-    assert retry is not None
-    assert task.status == TaskStatus.PENDING
+    assert dispatch_due() == 1        # the dispatcher hands it to the broker
+    run_once()                        # attempt 2 executes and succeeds
+    assert QraftTask.objects.get().status == TaskStatus.SUCCEEDED
 ```
+
+### Integration Tests
+
+`tests/test_integration.py` and `tests/test_workflow_integration.py` cover component
+interactions with the enqueue seam mocked, which keeps them fast and lets them assert on
+call arguments. Reach for an end-to-end test instead whenever the thing under test is
+whether the seam itself behaves.
 
 ### Test Database
 
-Tests use in-memory SQLite for speed:
+Tests run against in-memory SQLite, declared in `tests/settings.py` (selected by
+`--ds=tests.settings` in `pyproject.toml`):
 
 ```python
-# tests/conftest.py
-import pytest
-from django.conf import settings
-
-@pytest.fixture(scope='session')
-def django_db_setup():
-    settings.DATABASES['default'] = {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+# tests/settings.py
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": ":memory:",
     }
+}
 ```
+
+SQLite is fast but cannot express `SELECT ... FOR UPDATE SKIP LOCKED`, which several
+concurrency paths use where the database offers it. Those paths fall back to their
+compare-and-swap branch here, so the fallback is what the suite verifies; run the suite
+against Postgres before trusting the locking behaviour of a change to `scheduler.py`,
+`reaper.py`, or `dispatchers.py`.
 
 ### Fixtures
 
@@ -496,9 +566,13 @@ def test_something(sample_task, retry_policy):
 
 ### Coverage Goals
 
-- **Overall**: >90% code coverage
+- **Overall**: 85% today; CI fails the build below 72%
 - **Critical paths**: 100% coverage (retry logic, hook dispatching)
 - **Fast execution**: All tests should complete in <30 seconds
+
+`qraft/admin.py` is not imported by the test settings (no `django.contrib.admin`), so it
+never appears in the report; it is verified manually via the demo app. `qraft/backend.py`
+reads 0% on Django 5.x, where its tests skip.
 
 **Check coverage:**
 
@@ -554,7 +628,7 @@ uv run python manage.py demo perf -n 20 --duration 5.0
 
 ### Demo Tasks
 
-Located in `demo/demo_project/tasks.py`:
+Located in `demo/showcase/tasks.py`:
 
 ```python
 def flaky_task(fail_rate=0.5):
@@ -578,7 +652,7 @@ def slow_io_task(duration=1.0):
 ### Creating New Demo Scenarios
 
 ```python
-# demo/demo_project/management/commands/demo.py
+# demo/showcase/management/commands/demo.py
 
 class Command(BaseCommand):
     def add_arguments(self, parser):
@@ -597,7 +671,7 @@ class Command(BaseCommand):
     def run_my_scenario(self, count):
         """My custom scenario."""
         for i in range(count):
-            async_task('demo_project.tasks.my_task', i)
+            async_task('showcase.tasks.my_task', i)
 ```
 
 ## Common Development Tasks
@@ -657,33 +731,8 @@ class Command(BaseCommand):
 
 ### Modifying Core Logic
 
-**When changing cluster/sentinel (`cluster.py`):**
-
-1. Test with both `threads=1` and `threads>1`
-2. Verify graceful shutdown (SIGTERM handling)
-3. Check process recycling still works
-4. Update integration tests
-
-**When changing hook handler (`hooks.py`):**
-
-1. Test both initial tasks and retry tasks (different lookup paths)
-2. Verify idempotency (HookDispatch unique constraint)
-3. Test both `sync_hooks=True` and `False` modes
-4. Check edge cases (missing hooks, import errors)
-
-**When changing retry logic (`retry.py`):**
-
-1. Test exponential/linear/fixed backoff calculations
-2. Verify jitter randomization
-3. Test exception filtering (retry_exceptions, skip_exceptions)
-4. Check Schedule record format matches worker expectations
-
-**When changing worker (`worker.py`):**
-
-1. Test semaphore backpressure (max_inflight)
-2. Verify graceful shutdown (ThreadPoolExecutor.shutdown)
-3. Check database connection cleanup
-4. Test with long-running tasks (timeout behavior)
+See "When Editing Core Logic" in `CLAUDE.md` for what to test when changing
+`cluster.py`, `hooks.py`, `retry.py`, or `worker.py`.
 
 ### Debugging Tests
 
@@ -770,12 +819,12 @@ cat qraft/migrations/0003_new_migration.py
 
 ### Migration History
 
-Django-Qraft schema evolved through migrations:
+See "Database Migrations" in `CLAUDE.md` for the annotated list of migrations.
 
-- **0001_initial**: Original design with q2_task_id FK on QraftTask
-- **0002_retry_redesign**: Refactored to QraftTaskAttempt model, removed FK constraint, added HookDispatch
-
-When modifying models, ensure backward compatibility with existing QraftTask records.
+Generate a migration with `makemigrations`; never hand-author one. Every column
+added since 1.4.0 is nullable or defaulted (`db_default` where a Python default
+would not survive it), so a rolling deploy — where the previous release is
+still inserting rows on the old schema — keeps working.
 
 ## Performance Testing
 
@@ -793,7 +842,7 @@ def benchmark_throughput(n_tasks=100):
     # Queue tasks
     task_ids = []
     for i in range(n_tasks):
-        task_id = async_task('demo_project.tasks.fast_task', i)
+        task_id = async_task('showcase.tasks.fast_task', i)
         task_ids.append(task_id)
 
     # Wait for completion
@@ -816,7 +865,7 @@ if __name__ == '__main__':
 for i in {1..1000}; do
     python manage.py shell -c "
 from qraft.tasks import async_task
-async_task('demo_project.tasks.io_task', $i)
+async_task('showcase.tasks.io_task', $i)
 "
 done
 
@@ -958,44 +1007,22 @@ python manage.py shell
 
 ### Commit Message Format
 
-```
-type: Brief description (50 chars max)
+Not Conventional Commits — no `feat:`/`fix:` prefixes. Prefix with the
+app or area instead (`Scheduler: ...`, `Dashboard: ...`).
 
-Longer explanation if needed (wrap at 72 chars).
-
-- Bullet points for details
-- Reference issues: Fixes #123
-```
-
-**Types:**
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation only
-- `style`: Formatting, no code change
-- `refactor`: Code restructuring
-- `test`: Adding tests
-- `chore`: Maintenance tasks
+- Default to a title only.
+- Upgrade to title + one short paragraph only when the behaviour change
+  is not obvious from the title.
+- Upgrade to 2-3 bullets only when the change has genuinely separable
+  axes. Never more than 3, and never bullet diff-readable mechanics.
+- No AI attribution or `Co-Authored-By` lines.
 
 **Examples:**
 
 ```
-feat: Add linear backoff strategy
+Scheduler: Add linear backoff strategy
 
-Implements linear backoff as an alternative to exponential.
-Delay increases linearly: delay * attempt_number.
-
-Fixes #42
-
----
-
-fix: Handle missing exception class in retry
-
-Gracefully handle cases where exception class cannot be
-extracted from task result.
-
----
-
-docs: Update threading guide with connection pool sizing
+Retry: Handle a missing exception class without crashing the hook handler
 ```
 
 ### Release Process

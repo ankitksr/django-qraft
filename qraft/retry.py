@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from . import metrics
 from .conf import RetryBackoff, executing_cluster, get_conf
 
 logger = logging.getLogger("qraft")
@@ -18,7 +19,7 @@ MIN_JITTER_DELAY = 1
 
 # Task-name marker. Linkage runs off the attempt's q2_task_id now; the marker
 # survives as the name a dispatched attempt is queued under, and as the only
-# way to resolve a pre-2.0 Schedule delivery still in flight across an upgrade
+# way to resolve a pre-1.3 Schedule delivery still in flight across an upgrade
 # (see qraft.hooks.attempt_from_marker).
 QRAFT_MARKER_PREFIX = "qraft"
 QRAFT_MARKER_FMT = "{prefix}:{task_id}:{attempt}"
@@ -425,6 +426,11 @@ def handle_task_retry(qraft_task, attempt, result_text: str | None = None) -> bo
         # Schedule retry with backoff delay
         retry_policy.schedule_retry(
             qraft_task, current_attempt, retry_after, is_rate_limit
+        )
+        metrics.counter_on_commit(
+            "qraft.retry.scheduled",
+            func=qraft_task.func,
+            exception_class=exc_class_name,
         )
         return True
 

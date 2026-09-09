@@ -24,10 +24,9 @@ from showcase import probe
 from showcase.harness import scenario
 from showcase.models import Control, Event
 
-# qraft floors the heartbeat grace period at 90 seconds
-# (`qraft.reaper.MIN_HEARTBEAT_GRACE`), which cannot be configured down. The
-# kill is real; only the dead worker's last heartbeat is pushed into the past,
-# so the suite does not have to idle for a minute and a half per scenario.
+# The demo keeps `min_heartbeat_grace` at its 90-second default. The kill is
+# real; only the dead worker's last heartbeat is pushed into the past, so the
+# suite does not have to idle for a minute and a half per scenario.
 BACKDATE = timedelta(seconds=300)
 
 

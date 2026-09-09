@@ -9,6 +9,8 @@ This guide covers all Django-Qraft configuration options, Django integration, en
 - [Threading Settings](#threading-settings)
 - [Retry Defaults](#retry-defaults)
 - [Hook Settings](#hook-settings)
+- [Observability Settings](#observability-settings)
+- [Durability Settings](#durability-settings)
 - [Retention Settings](#retention-settings)
 - [ALT_CLUSTERS Pattern](#alt_clusters-pattern)
 - [Environment Variables](#environment-variables)
@@ -18,7 +20,9 @@ This guide covers all Django-Qraft configuration options, Django integration, en
 
 ## Basic Setup
 
-Django-Qraft uses `QRAFT_CLUSTER` in your Django settings (with fallback to `Q_CLUSTER` for compatibility):
+Django-Qraft reads `QRAFT_CLUSTER` in your Django settings. It never falls back to
+`Q_CLUSTER` for its own settings — see [Django-Q2 Compatibility](#django-q2-compatibility)
+for the two places Qraft does read `Q_CLUSTER`.
 
 ```python
 # settings.py
@@ -210,6 +214,234 @@ Hooks execute synchronously in the monitor process after task completion. Use fo
 - Maintaining exact Django-Q2 behavior
 
 See [Hooks Guide](hooks.md) for detailed information.
+
+## Observability Settings
+
+Metrics, progress coalescing and log context. All three are off or inert by default.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `metrics_sink` | `str` | `"qraft.metrics.NullSink"` | Dotted path to the sink class; resolved once per process |
+| `metrics_gauges` | `bool` | `False` | Whether this cluster emits the backlog gauges |
+| `progress_min_interval` | `float` | `0.0` | Seconds between progress writes from one attempt; `0` writes on every call |
+
+### Metrics sink
+
+Qraft emits counters, histograms and gauges at its own transition points. The sink is a
+class with three methods:
+
+```python
+class Sink:
+    def counter(self, name, value=1, **labels): ...
+    def histogram(self, name, value, **labels): ...
+    def gauge(self, name, value, **labels): ...
+```
+
+The bundled OpenTelemetry sink instruments through `opentelemetry-api` only:
+
+```bash
+pip install 'django-qraft[otel]'
+```
+
+```python
+QRAFT_CLUSTER = {
+    "metrics_sink": "qraft.metrics.otel.OpenTelemetrySink",
+}
+```
+
+Qraft creates instruments on a meter named `qraft` and records to them. The host
+application configures the SDK, the exporter, the resource and the process lifecycle —
+that is the boundary OpenTelemetry draws between a library and an application, and it
+means a host that has not configured an SDK gets a no-op meter rather than an error.
+
+What is emitted:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `qraft.attempt.started` | counter | `func`, `cluster` |
+| `qraft.attempt.pickup` | histogram (s) | `func`, `cluster` |
+| `qraft.attempt.finished` | counter | `func`, `cluster`, `outcome`, `exception_class` |
+| `qraft.attempt.duration` | histogram (s) | `func`, `cluster`, `outcome` |
+| `qraft.attempt.stall_suspected` | counter | `func`, `cluster` |
+| `qraft.attempt.redelivered` | counter | `func`, `cluster` |
+| `qraft.scheduler.lag` | histogram (s) | `cluster` |
+| `qraft.retry.scheduled` | counter | `func`, `exception_class` |
+| `qraft.reaper.action` | counter | `action` |
+| `qraft.workflow.settled` | counter | `workflow_type`, `outcome` |
+| `qraft.run.settled` | counter | `subject_type`, `kind`, `outcome` |
+| `qraft.run.duration` | histogram (s) | `subject_type`, `kind`, `outcome` |
+| `qraft.run.report_to_ready` | histogram (s) | `subject_type`, `kind` |
+| `qraft.queue.depth` | gauge | `cluster` |
+| `qraft.queue.oldest_ready_age` | gauge (s) | `cluster` |
+| `qraft.attempt.active` | gauge | `cluster` |
+| `qraft.scheduler.overdue` | gauge | |
+| `qraft.attempt.unrouted_age_max` | gauge (s) | |
+| `qraft.run.open_age_max` | gauge (s) | `subject_type` |
+
+`outcome` is `succeeded`, `failed` or `orphaned`, so a fleet whose failures are detected
+by the reaper does not look faster than one whose failures return. Pickup is recorded
+when the attempt starts, not when it finishes: an attempt that is hung right now is
+already in the pickup histogram, and its absence from the duration histogram is itself
+the signal.
+
+No subject id, run id, task id, revision or metadata is ever a label. Subject ids are
+unbounded; metric cardinality is not. An operator who wants one worksheet's timeline uses
+the dashboard's subject filter, not a metric.
+
+A sink that raises is caught: the exception is logged at most once per minute per process
+and counted in a health counter that `api/state/` exposes as `metrics_health` and the
+dashboard shows as a pill. The sink is never disabled — a transient exporter failure must
+not silence a process until restart.
+
+### One gauge owner
+
+Every cluster runs a dispatcher and a reaper. A gauge emitted by all of them lets a
+consumer sum the same backlog once per replica, so gauges are emitted only by clusters
+started with `metrics_gauges=True`, from the dispatcher loop once per pass. **Set it on
+exactly one cluster.**
+
+```python
+QRAFT_CLUSTER = {
+    "metrics_sink": "qraft.metrics.otel.OpenTelemetrySink",
+    "metrics_gauges": True,
+    "ALT_CLUSTERS": {
+        "io-workers": {"threads": 8},   # inherits the sink, not the gauge flag
+    },
+}
+```
+
+`metrics_gauges` is the one key an `ALT_CLUSTERS` entry does not inherit: an entry that
+does not name it is not a gauge owner, whatever the base entry says. Ownership names one
+process, and inheriting it would make every alt cluster a second reporter of the same
+numbers.
+
+The two queue gauges read `OrmQ` rows, so they need the ORM broker. A gauge owner running
+any other broker logs one warning at startup and emits the remaining gauges, which read
+Qraft's own tables.
+
+### Overdue runs
+
+`QRAFT_RUN_OVERDUE_AFTER` is a plain Django setting, not a `QRAFT_CLUSTER` key, because
+it describes application work rather than cluster behaviour:
+
+```python
+QRAFT_RUN_OVERDUE_AFTER = 3600   # seconds; None (the default) turns the sweep off
+```
+
+With it set, the reaper thread flags every `OPEN` run whose `date_started` is older than
+the threshold: `overdue_flagged_at` is set once by compare-and-swap, the `run_overdue`
+signal fires, and the dashboard shows a badge. Nothing is failed automatically — a stage
+that was never enqueued is an application defect, and `runs.skip`, `runs.cancel` and
+`runs.abandon` are the tools for deciding which it was. `qraft.run.open_age_max` reports
+the oldest open run per subject type.
+
+### Pricing
+
+`QRAFT_PRICING` is a plain Django setting, like `QRAFT_RUN_OVERDUE_AFTER`, and turning
+tokens into money is entirely optional:
+
+```python
+QRAFT_PRICING = {
+    "resolver": "qraft.pricing.StaticTablePricing",   # the default when the dict exists
+    "currency": "USD",
+    "revision": "2026-09",
+    "models": {
+        "gpt-5.4-nano": {"input": 0.05, "output": 0.40, "cached_input": 0.005},
+    },
+}
+```
+
+Rates are per million tokens. Without the setting there is no resolver and every cost
+path answers "unknown" rather than guessing. The resolver is resolved once per process;
+`qraft.pricing.reset_resolver()` re-reads the setting. See
+[AI Workloads](ai-workloads.md#cost-from-usage) for the per-increment entries, the
+cached-token convention, and what `coverage` and `estimated` mean.
+
+### Log context
+
+`qraft.logging.QraftContextFilter` attaches the executing attempt's ids to every log
+record, so a host's formatter can print or ship them:
+
+```python
+LOGGING = {
+    "version": 1,
+    "filters": {"qraft": {"()": "qraft.logging.QraftContextFilter"}},
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "filters": ["qraft"],
+            "formatter": "qraft",
+        },
+    },
+    "formatters": {
+        "qraft": {
+            "format": "%(asctime)s %(levelname)s %(qraft_task_id)s "
+                      "%(qraft_attempt_number)s %(qraft_subject_type)s "
+                      "%(qraft_subject_id)s %(message)s",
+        },
+    },
+}
+```
+
+The attributes are `qraft_task_id`, `qraft_attempt_id`, `qraft_attempt_number`,
+`qraft_run_id`, `qraft_stage`, `qraft_subject_type` and `qraft_subject_id`. Outside a
+task they are present and empty, so a format string that names them never raises.
+
+### Trace propagation
+
+With `opentelemetry-api` importable and a span current at enqueue, `async_task()` injects
+a W3C `traceparent` onto the attempt row; the dispatcher copies it onto retry attempts.
+At `pre_execute` the lease starts a child span named after `func` for the attempt's
+duration, so a trace begun in the web request that enqueued the first stage continues
+into the worker and across retries. Hooks receive the same `traceparent`, but only
+through `hook_context` — a hook's keyword arguments are the caller's and cannot safely
+gain a key. Without the package the column stays null and nothing else changes.
+
+## Durability Settings
+
+These govern the execution lease, the orphan reaper and the redelivery guard — how Qraft
+decides that a running attempt is dead, and what it does about a delivery it has already
+seen.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `heartbeat_interval` | `float` | `30.0` | Seconds between lease heartbeats from a running worker |
+| `min_heartbeat_grace` | `float` | `90.0` | Floor on the grace period before a stale heartbeat is reaped |
+| `reap_interval` | `float` | `60.0` | Seconds between reaper sweeps |
+| `reap_stale_after` | `float` | `3600.0` | Seconds an attempt that never started may sit unresolved before it counts as orphaned |
+| `max_executions_per_attempt` | `int` | `1` | How many times one attempt may be handed to a worker |
+
+### The heartbeat grace period
+
+The reaper reclaims an attempt whose heartbeat is older than
+`max(3 * heartbeat_interval, min_heartbeat_grace)`. The floor exists so a short
+`heartbeat_interval` cannot make the reaper trigger-happy on a briefly paused worker.
+Lower it when your stages are short enough that 90 seconds of lost work per crash costs
+more than a rare false reap:
+
+```python
+QRAFT_CLUSTER = {
+    "heartbeat_interval": 5.0,
+    "min_heartbeat_grace": 20.0,
+}
+```
+
+### The redelivery guard
+
+Django-Q2 redelivers a message it never got an acknowledgement for, so a monitor crash
+used to re-run a task whose attempt row was still unresolved — and each re-run refreshed
+the heartbeat, so the reaper read it as alive and the run stayed open until somebody
+cancelled it by hand.
+
+Every attempt Qraft enqueues runs through `qraft.runner.run_task`, which claims the
+delivery by compare-and-swap on `QraftTaskAttempt.execution_count` before calling
+anything. With the default `max_executions_per_attempt` of 1, a second delivery of an
+attempt that already started neither calls the function nor refreshes the lease. It
+counts `qraft.attempt.redelivered` and raises `qraft.runner.RedeliveredAttempt`, so the
+attempt resolves through the normal failure path and the retry policy decides attempt
+N+1 — the retry policy, not the broker's delivery loop.
+
+Raise it only for a target that is genuinely idempotent and cheap to repeat.
 
 ## Retention Settings
 
@@ -463,25 +695,19 @@ environment=Q_CLUSTER_NAME=cpu-intensive
 
 Django-Qraft maintains full backward compatibility with Django-Q2:
 
-### Using Q_CLUSTER (Deprecated)
+### Q_CLUSTER still belongs to Django-Q2
 
-```python
-# Still works, but shows deprecation warning
-Q_CLUSTER = {
-    "workers": 4,
-    "timeout": 60,
-}
-```
+`Q_CLUSTER` keeps configuring Django-Q2 itself. Qraft does not copy it and emits no
+deprecation warning; a setting you want Qraft to honour goes in `QRAFT_CLUSTER`. Qraft
+reads `Q_CLUSTER` for exactly two things:
 
-**Migration:**
-
-```python
-# Recommended: Rename to QRAFT_CLUSTER
-QRAFT_CLUSTER = {
-    "workers": 4,
-    "timeout": 60,
-}
-```
+- **Broker resolution.** `qraft.brokers.broker_for_cluster()` builds a named cluster's
+  broker from that cluster's own `Q_CLUSTER` entry merged over the base.
+- **Retention inheritance.** An explicit `Q_CLUSTER["save_limit"]` says task history
+  should be bounded, so Qraft mirrors it as `retention_max_tasks` when neither
+  `retention_days` nor `retention_max_tasks` is set in `QRAFT_CLUSTER`. The read-only
+  `retention_inherited_from_save_limit` flag records that this happened. Django-Q2's own
+  default of 250 is not inherited — only a value you wrote yourself.
 
 ### Using qcluster Command
 
@@ -515,6 +741,14 @@ QRAFT_CLUSTER = {
 PostgreSQL specifically, because the throttle, the reaper and the workflow
 dispatchers all coordinate through `SELECT ... FOR UPDATE`.
 
+**Degradation is per cluster.** Qraft resolves a broker from the *target*
+cluster's own merged `Q_CLUSTER` entry (`qraft.brokers.broker_for_cluster()`),
+so a project may run one cluster on the ORM broker while the rest stay on
+Redis. Read the table below against the cluster the task runs on, not against
+the process that enqueued it: a task enqueued from a Redis-configured web
+process onto an ORM-broker cluster gets the ORM broker's guarantees, and the
+cluster's startup warnings report that cluster's own broker.
+
 **What degrades on a broker other than the ORM broker** (Redis, SQS, IronMQ,
 MongoDB):
 
@@ -524,9 +758,89 @@ MongoDB):
 | Priority lanes | Lost. Lanes are extra `OrmQ` keys; `priority_list_key()` declines to route and the task runs in the default lane with a warning. |
 | Reaper | Half. Attempts with a stale heartbeat are still reclaimed, but attempts that never started cannot be checked against the queue, so the reaper leaves them alone rather than risk duplicating a task that is merely waiting. |
 | Enqueue visibility | Racy. The ORM broker enqueues inside the caller's transaction, so a task and the rows describing it commit together. Any other broker makes the task visible to a worker before the transaction commits. |
+| Start observability | Lost for the tasks that lose the enqueue race above. A worker that picks a task up before its attempt row commits finds nothing to open a lease on, and nothing retries the lookup: that attempt gets no `date_started`, no heartbeat, no `task_started`, no pickup measurement and no span. It still runs, and its completion still resolves the attempt normally. The marker fallback cannot cover it — the marker resolves through the same uncommitted rows. |
+| Queue gauges | Lost. `qraft.queue.depth` and `qraft.queue.oldest_ready_age` read `OrmQ` rows. The gauge owner warns once at startup and emits the rest, which read Qraft's own tables. |
 
 Retries, hooks, workflows and the DLQ work on any broker: they run off the
 task rows, not the queue.
+
+### Mixed brokers across clusters
+
+Every Qraft enqueue names its broker explicitly, built from the target
+cluster's merged `Q_CLUSTER` entry. Django-Q2 on its own would resolve the
+broker from the *enqueuing* process's config
+(`broker = task.pop("broker") or get_broker(task["cluster"])`), which is what
+sends a task meant for an ORM-broker cluster into whatever the web process
+happens to run.
+
+```python
+Q_CLUSTER = {
+    "name": "default",
+    # Only needed for enqueues Qraft does not make itself - a plain
+    # django_q.tasks.async_task(..., cluster="revenue") from application code.
+    "broker_class": "qraft.brokers.RoutingBroker",
+    "redis": {"host": "127.0.0.1", "port": 6379},
+    "timeout": 300,
+    "retry": 360,
+    "ALT_CLUSTERS": {
+        # Stays on Redis, inherited from the base entry.
+        "reports": {"workers": 4},
+        # Runs on the ORM broker, with priority lanes.
+        "revenue": {
+            "orm": "default",
+            "broker_class": "qraft.brokers.QraftOrmBroker",
+            "workers": 2,
+        },
+    },
+}
+```
+
+With that config:
+
+- `qraft.async_task(..., qraft_options={"cluster": "revenue"})` from the web
+  process enqueues an `OrmQ` row under the key `revenue`, inside the caller's
+  transaction, whatever the web process's own broker is.
+- `qraft.async_task(...)` with no cluster keeps using Redis.
+- `django_q.tasks.async_task(..., cluster="revenue")` — code Qraft does not
+  own — reaches the same ORM queue, because `RoutingBroker` forwards every
+  call to `broker_for_cluster("revenue")`.
+- `python manage.py qraftcluster --name revenue` re-execs with
+  `Q_CLUSTER_NAME=revenue`, so Django-Q2's own `Conf` carries the merged entry
+  (`Conf.ORM == "default"`) and the cluster drains the ORM queue it was
+  configured for.
+
+Two things stay fleet-wide rather than per cluster, and a mixed deployment has
+to keep them that way:
+
+- **Hook tasks follow the cluster that dispatches them, not the one that ran
+  the task.** A hook is queued with `cluster=executing_cluster()` so it lands
+  where a worker is known to be running (`cluster=None` would send it to the
+  default cluster, which may not be up). Normally that is the same cluster,
+  because the monitor that resolves a completion belongs to it — but every
+  cluster runs a reaper, and `reaper.replay_unrouted()` sweeps the whole
+  table, so a resolution whose routing was lost can be replayed, and its hook
+  queued, by a different cluster. Hook functions must therefore be importable
+  by every cluster's workers.
+- **Retries and DLQ requeues do not.** They inherit `QraftTaskAttempt.cluster`,
+  so an attempt always retries on the cluster that ran it. That is why
+  `async_task(broker=...)` requires `cluster=` as well: the broker routes
+  attempt 1, the recorded cluster routes everything after it.
+
+Per-cluster connection settings are read when the broker is first built and
+cached per process; `qraft.brokers.reset_broker_cache()` drops the cache, and
+a `Q_CLUSTER`/`QRAFT_CLUSTER` change under `override_settings` does it
+automatically. The ORM broker's database alias is pinned onto the instance,
+because `ORM.get_connection()` re-reads `Conf.ORM` on every call.
+
+**Public API:**
+
+| Name | Meaning |
+|------|---------|
+| `broker_for_cluster(cluster=None, priority=None)` | The broker instance that enqueues onto that cluster's queue, in that priority lane. `cluster=None` means this process's own. |
+| `cluster_broker_config(cluster=None)` | The merged `Q_CLUSTER` dict that cluster runs under. |
+| `RoutingBroker` | A `broker_class` that delegates every call to `broker_for_cluster(self.list_key)`. |
+| `delivering_broker(broker=None)` | Unwraps a `RoutingBroker` to the broker that actually moves messages, for capability checks. |
+| `reset_broker_cache()` | Drops every resolved broker. |
 
 ## Settings Hierarchy
 

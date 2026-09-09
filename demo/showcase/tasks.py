@@ -6,6 +6,7 @@ what happened is an `Event` row, so every task records one before it does
 anything else.
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -94,6 +95,33 @@ def flaky_task(run: str, label: str, fail_times: int = 2) -> dict:
     """Fail the first `fail_times` attempts, then succeed."""
     attempt = bump(f"{run}:{label}")
     record(run, Event.TASK, label, pid=os.getpid(), attempt=attempt)
+    if attempt <= fail_times:
+        raise TransientError(f"{label} failed on attempt {attempt}")
+    return {"label": label, "attempt": attempt}
+
+
+async def async_flaky_task(run: str, label: str, fail_times: int = 1) -> dict:
+    """
+    Coroutine twin of `flaky_task`.
+
+    The Event is only recorded after a real `await`, so its existence proves
+    the worker awaited the coroutine rather than dropping it unawaited.
+
+    Uses the async ORM throughout: inside a running event loop Django's sync
+    ORM raises SynchronousOnlyOperation, and an async task has one - that
+    rule applies to user coroutines exactly as it does here.
+    """
+    await asyncio.sleep(0.05)
+    key = f"{run}:{label}"
+    await Control.objects.aget_or_create(key=key)
+    await Control.objects.filter(key=key).aupdate(counter=F("counter") + 1)
+    attempt = (await Control.objects.aget(key=key)).counter
+    await Event.objects.acreate(
+        run=run,
+        kind=Event.TASK,
+        name=label,
+        payload={"pid": os.getpid(), "attempt": attempt, "awaited": True},
+    )
     if attempt <= fail_times:
         raise TransientError(f"{label} failed on attempt {attempt}")
     return {"label": label, "attempt": attempt}

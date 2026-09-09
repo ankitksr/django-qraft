@@ -7,6 +7,251 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A finished task stops heartbeating, and says when it finished.**
+  `qraft.runner.run_task` stamps the new `QraftTaskAttempt.returned_at` and stops the
+  lease heartbeat as soon as the target returns or raises, rather than at the monitor's
+  `post_execute`. A killed monitor holds the result queue's write lock, so the worker
+  blocks in `result_queue.put()` with its task already done while the heartbeat keeps
+  refreshing the lease — the reaper then reads the attempt as alive and never resolves
+  it. Such an attempt is now reaped as `ResultLost` rather than `OrphanedTask`: the work
+  ran and a retry re-does it, which a retry policy may treat differently. New migration
+  `0015`
+- **Late subject bind on runs.** `runs.start()` may omit the subject, and
+  `runs.bind_subject(run_id, subject)` (also `QraftRun.bind_subject(type, id)`) names it
+  once afterwards, while the run is OPEN and the subject is unset. It updates the run and
+  every member already bound to it — tasks, chains, iters and batches — in one transaction
+  under the run's row lock, which is the lock a member insert now also takes, so a member
+  created concurrently either lands before the bind or reads the bound subject. The
+  pipeline this exists for is one whose first stage creates the domain object the run is
+  about; before this such a run had to key on whatever row existed beforehand, splitting
+  one worksheet across two subject types and halving the dashboard's subject filter
+- **Request budgets for metered stages.** `runs.start(..., budgets={"openai_requests":
+  40})` declares an allowance and `qraft.context.consume_budget(key, n=1)` spends it
+  atomically — one guarded `UPDATE ... RETURNING` on Postgres, a locked read-modify-write
+  elsewhere — raising `BudgetExhausted` rather than letting the balance go below zero.
+  `remaining_budget(key)` reads without spending. It answers what a token bucket cannot:
+  a bucket refills, so it bounds how fast a fleet may call a provider, not how much one
+  pipeline may spend across every stage and every retry. A key the run does not declare is
+  unmetered. New `QraftRun.budgets` JSON column
+- **Stage links on the dashboard run rows.** A bound stage's chip deep-links to the task or
+  workflow that owns it, and a failed task stage carries its exception class on the chip.
+  A stage that failed before its subject existed shows up nowhere but the run
+- **Redelivery guard: an attempt executes at most once.** Django-Q2 redelivers a message
+  it never got an acknowledgement for, so a monitor crash re-ran a task whose attempt row
+  was still unresolved, and each re-run refreshed the heartbeat so the reaper read it as
+  alive. Every attempt Qraft enqueues now runs through `qraft.runner.run_task`, which
+  claims the delivery by compare-and-swap on the new `QraftTaskAttempt.execution_count`
+  before calling anything. A refused delivery neither calls the function nor refreshes the
+  lease; it counts `qraft.attempt.redelivered` and raises
+  `qraft.runner.RedeliveredAttempt`, so the retry policy decides attempt N+1. New setting
+  `max_executions_per_attempt` (default 1). Attempt signal payloads gain `execution_count`
+  and `redelivered`
+- **`min_heartbeat_grace` setting** (default 90.0). The reaper's grace period is
+  `max(3 * heartbeat_interval, min_heartbeat_grace)`, and the floor was a module constant,
+  so `heartbeat_interval` read like a detection-latency knob and was not one below 30s. For
+  sub-second stages, 90s of lost work per crash can cost more than a rare false reap; the
+  floor is now lowerable per cluster
+- **Per-cluster brokers.** `qraft.brokers.broker_for_cluster(cluster, priority)` builds the
+  broker a *named* cluster runs, from that cluster's own `Q_CLUSTER` entry merged over the
+  base, and every Qraft enqueue now passes it as django_q's `broker=` kwarg — `async_task`,
+  the scheduler's dispatch of SCHEDULED attempts (and so DLQ requeues), workflow members and
+  chain steps, task hooks, workflow hooks, the progress hook and the django.tasks backend.
+  Django-Q2 resolves an omitted broker against the *enqueuing* process's config, so before
+  this a web process on Redis handed every task to Redis whatever the target cluster ran.
+  A project may now run `revenue` on the ORM broker while `default` and `reports` stay on
+  Redis. `async_task(broker=...)` now requires `cluster=` beside it, since the attempt row
+  records the cluster and every retry and DLQ requeue inherits it — without a name the row
+  would claim the enqueuing process's cluster rather than the one the broker feeds.
+  `qraft.brokers.RoutingBroker`, declared as the base `broker_class`, extends the
+  same routing to enqueues Qraft does not make itself (`django_q.tasks.async_task(...,
+  cluster="revenue")` from application code). The ORM broker's database alias is pinned onto
+  the instance, since `ORM.get_connection()` re-reads `Conf.ORM` on every call. Brokers are
+  cached per process and cluster; `reset_broker_cache()` clears them and a `Q_CLUSTER`
+  change under `override_settings` does it automatically
+- **Cost from usage** (`qraft.pricing`, optional, schemaless). `QRAFT_PRICING` names a
+  resolver — `StaticTablePricing` reads a per-million-token table out of the setting — and
+  without the setting there is no resolver and every cost path answers "unknown". Each
+  `record_usage()` call that names a `model` now appends one entry to `usage["entries"]`
+  with the model, provider, token counts, `estimated_cost`, `currency`,
+  `pricing_revision` and `cost_source`. Entries exist because the totals cannot be priced:
+  the merge keeps the latest model name while summing all tokens, so pricing the totals
+  would bill one model's tokens at another's rate. Caller-supplied `cost` always wins for
+  its entry, and pricing an increment as it is written means a corrected table never
+  re-prices a call the provider already billed. Cached tokens are a subset of input tokens
+  by default (the OpenAI convention), with `cached_is_subset: False` for providers that
+  report them separately. `cost(usage)` returns a `CostSummary(amount, currency, coverage,
+  estimated)` rather than a bare number — a configured price is an estimate of what the
+  provider will bill, never proof of it — and every aggregate carries the same summary
+  under `cost_summary` beside the token totals. Money is summed as `Decimal` throughout
+- **Stall observation.** `qraft_options={"stall_after": 300}` puts a second question to
+  the reaper beside "is the worker alive": every sweep, an unresolved attempt whose
+  heartbeat is fresh but whose `progress_advanced_at` (falling back to `date_started`) is
+  older than `stall_after` gets `stall_suspected_at` set by compare-and-swap, sends
+  `attempt_stall_suspected`, counts `qraft.attempt.stall_suspected`, and is marked on the
+  dashboard. It reads `advanced_at`, not `reported_at`, so a task narrating its own hang
+  cannot defeat it. Nothing is resolved and nothing is retried: the attempt keeps running,
+  and while the hook handler would drop its reported result, nothing drops its database
+  writes or its provider charges. `qraft.context.current_attempt_id()` is the supported
+  way to act on the flag — put the attempt id in the same statement as the write
+- **Runs** (`qraft.runs`, `QraftRun`, `QraftRunStage`): one row spanning a pipeline whose
+  stages enqueue each other, which a chain models badly because a chain owns its steps
+  before execution. `runs.start(subject=..., stages=[...])` declares the stages; a task or
+  workflow enqueued with `run` and `stage` becomes that stage's one completion unit, at
+  enqueue for a task and at `run()` for a workflow. The run settles by derivation — a
+  failed or cancelled stage fails it, every stage succeeded or skipped succeeds it — under
+  a `settled_at` compare-and-swap, so it settles exactly once and is never mutated
+  afterwards; a rerun is a new run linked by `previous_run`. `runs.skip`, `runs.cancel`
+  and `runs.abandon` are the explicit transitions, and every edge rule (a terminal run, a
+  stage that already has a unit, a stage the run never declared, a subject that differs
+  from the run's) raises at the bind. Members inherit `run` and `stage` for correlation
+  and never settle a stage. New: a durable `on_settled` hook keyed `(run_id, "settled")`,
+  a `summary` snapshot written at settlement, `run_settled` and `run_overdue` signals,
+  `qraft.run.settled`/`duration`/`report_to_ready`/`open_age_max` metrics, an overdue
+  sweep behind `QRAFT_RUN_OVERDUE_AFTER`, a dashboard run panel with cancel and abandon,
+  and a read-only `QraftRunAdmin`
+- **Subjects.** `async_task(..., qraft_options={"subject": ("worksheet", 4117)})` records
+  the domain entity a task is for as an indexed `(subject_type, subject_id)` string pair;
+  workflow constructors take `subject=` and copy it onto every member. Retries inherit it.
+  `QraftTask.objects.for_subject(type, id)` is the one query an application detail view
+  needs, and the dashboard filter box and admin filters read the same pair
+- **Attempt-owned progress.** `report_progress()` now writes to `QraftTaskAttempt`, with
+  `progress_reported_at` moving on every call and `progress_advanced_at` only when
+  `current`/`total` change — so a task narrating its own hang is distinguishable from one
+  that is moving. `QraftTask.progress` stays as the dashboard's snapshot, stamped with the
+  writing `attempt_id` and updated only by the task's latest attempt, so a superseded
+  attempt can no longer overwrite its successor's numbers. Progress and usage merges are
+  atomic (one `jsonb ||` statement on Postgres, a locked read-modify-write elsewhere),
+  and `progress_min_interval` coalesces writes from chunk-heavy tasks. New
+  `areport_progress()` and `arecord_usage()` for coroutine tasks
+- **Signals** (`qraft/signals.py`): `task_started`, `attempt_finished`, `task_settled`,
+  `workflow_settled`, `attempt_stall_suspected`, `run_settled` and `run_overdue`. Every
+  send is `send_robust()` from `transaction.on_commit` inside the transaction that
+  performs the transition, and every payload is an immutable mapping of ids, outcomes and
+  ISO timestamps rather than a model instance. Signals are best-effort observers; anything
+  the application must not miss still goes through a hook
+- **Metrics sink** (`qraft/metrics/`): counters, histograms and gauges at Qraft's own
+  transition points, through a `Sink` protocol resolved from `QRAFT_CLUSTER["metrics_sink"]`
+  (default `NullSink`). `qraft.metrics.otel.OpenTelemetrySink` records through
+  `opentelemetry-api` only, installed by the new `django-qraft[otel]` extra; the host owns
+  the SDK. Backlog gauges are emitted by the one cluster flagged `metrics_gauges=True`, so
+  a consumer cannot sum the same backlog once per replica. No subject id, run id, task id,
+  revision or metadata is ever a label. A sink that raises is logged once a minute and
+  counted in `api/state/`'s `metrics_health`, never disabled
+- **Enqueue time on the attempt** (`QraftTaskAttempt.enqueued_at`), so queue wait is
+  measured from the moment the broker received the attempt rather than from row creation,
+  which conflated an intentional backoff with a queue backlog
+- **Log context and trace propagation.** `qraft.logging.QraftContextFilter` stamps every
+  log record with the executing attempt's ids; with `opentelemetry-api` importable,
+  `async_task()` injects a W3C `traceparent` onto the attempt row and the lease starts a
+  child span for the attempt, so a trace begun in the web request continues into the
+  worker and across retries
+- **Durable hook context.** `qraft_options={"hook_context": True}` (and `hook_context=` on
+  workflow constructors) gives hooks one extra `context` keyword argument naming the
+  attempt that produced them: ids, outcome, exception class, subject, `result_ref`,
+  `traceparent` and timestamps. Opt-in, so no existing hook signature breaks
+- **Coroutine tasks.** An `async def` target now runs everywhere Qraft executes a
+  callable: `qraft.tasks.async_task()`, workflow members, task and workflow hooks, and
+  the `django.tasks` backend (`supports_async_task` is now true). The enqueue reroutes
+  coroutine targets through `qraft.runner.run_task`, which runs them to completion with
+  `asyncio.run()` in the worker slot they already occupy — one coroutine per slot, so
+  lease, timeout, and retry semantics are unchanged. Previously a coroutine target was
+  called but never awaited. Django's async rules apply inside the coroutine: use the
+  async ORM or `sync_to_async`, since the sync ORM raises `SynchronousOnlyOperation`
+  under a running event loop
+- **End-to-end tests** (`tests/test_e2e.py`): the enqueue seam is no longer mocked
+  everywhere. These drive the real path — `async_task()` writes an `OrmQ` row, Django-Q2's
+  own `pusher`/`worker`/`monitor` loops run in-process, and the saved `Task` row fires
+  `qraft_hook_handler` through its normal `post_save` receiver — across success, retry,
+  exhaustion, DLQ requeue, chain ordering, iter counting, and `threaded_worker`
+
+### Fixed
+- **A reaped task never fired its failure hook.** `reaper._reap_one` called
+  `route_workflow_completion()` and discarded the answer, so a task with a `failure_hook`
+  and no workflow — a task whose worker was OOM-killed, or whose result the monitor lost —
+  settled FAILED or EXHAUSTED with the hook never dispatched. The reaper then set
+  `routed=True`, which took the attempt out of `replay_unrouted()`'s query, so nothing
+  recovered it. It now falls back to `HookDispatcher.dispatch()` the way the replay path
+  always did
+- **Receiver order decided whether any task could run.** `context._on_pre_execute` cleared
+  the memoised delivery claim, so connecting it after `lease._on_pre_execute_lease` would
+  have made `runner.guard_delivery` re-claim an attempt that had already spent its
+  execution budget and refuse every task as `RedeliveredAttempt`. The claim is keyed by q2
+  task id and dropped by `clear_context()`, so the receiver no longer clears it
+- **A stale completion could settle a resumed chain.** Routing was handed a task with its
+  chain step already joined on (the hook handler's `select_related`, the reaper's replay
+  batch), and `resume()` rebinds that step to a new task in between, so a completion from
+  before the resume settled the generation after it FAILED. The step's bound task is now
+  re-read as the chain's generation marker and a superseded completion is dropped
+- **A chain that failed, resumed and failed again dispatched no second hook.** The
+  `WorkflowHookDispatch` row is keyed on `(workflow, hook_type)` and knows nothing of
+  generations, so the first failure's row suppressed the second's hook. `resume()` now
+  clears the chain's dispatch rows with `settled_at`
+- **A rolled-back transition still emitted its counter.** Counters at the settlement,
+  resolution, retry and reap points fired inside `transaction.atomic()`, so a savepoint
+  that rolled back left a count with no row change behind it. They now ride
+  `transaction.on_commit`, as the signals already did
+- **`QraftTask.progress` could be attributed to a superseded attempt.** The snapshot's
+  "no newer attempt" guard and the next attempt's insert were not serialised. Both now
+  take the task's row lock, so a report racing its own retry finds the newer attempt and
+  is refused
+- **`report_progress()` raised on a UUID against Postgres.** The Postgres merge builds its
+  payload with raw SQL and used a plain `json.dumps`, so a call that worked on SQLite
+  raised `TypeError` there. Both paths now use the encoder the JSON columns declare
+- **A worker thread carried the finished attempt's context into the next task.** The
+  logging context vars and the OpenTelemetry span attached on the worker thread were never
+  cleared — `end_span()` runs on the heartbeat thread, which cannot reach the worker
+  thread's token — so a pool thread logged the previous attempt's ids and an untraced
+  attempt enqueued its work inside a finished span. Both are cleared in the worker's
+  `finally`
+- **`metrics_gauges` was inherited by every `ALT_CLUSTERS` entry.** Setting it on the base
+  entry made every alt cluster a second reporter of the same fleet-wide backlog. An alt
+  cluster now gets the flag only by declaring it, as the documentation already said
+- **Queue gauges counted leased messages as ready.** `qraft.queue.depth` and
+  `qraft.queue.oldest_ready_age` read every `OrmQ` row, including the ones a worker had
+  already leased, so depth repeated the in-flight work the active gauge reports and the
+  oldest reading was dragged below the true age. Both now read the ready set, the same one
+  django_q's own `queue_size()` counts. A cluster that owns the gauges but cannot read its
+  queue (a non-ORM broker) now says so once at startup instead of publishing nothing
+- **A whole dispatch batch shared one enqueue timestamp.** `enqueued_at` came from the
+  pass's due cutoff, so every attempt after the first in a slow batch was backdated and
+  its measured queue wait inflated. Each attempt is stamped when it is claimed. An attempt
+  with no cluster of its own also now records the cluster that actually took it, so its
+  start and pickup metrics carry a cluster label and the active gauge counts it
+- **A cancelled fan-out's hook lost the counters.** An opted-in `on_cancelled` hook
+  received only the workflow id, type and outcome, while a completion's hook received the
+  counts. How much had finished when the cancel landed is what the hook is for, so cancel
+  and completion now build the same context
+- **Retention could delete a live run's evidence through the workflow pass.** Membership
+  of a run that has not settled was protected only in the task pass, but deleting an iter
+  or batch cascades to its member tasks, so a completed batch under an open run lost its
+  rows. Both passes now exclude open runs, terminal runs are pruned after their members
+  with their stages cascading, and the `summary` written at settlement is what survives
+- **Workflow settlement could fire hooks on an already terminal workflow.** A chain's
+  final step never advances `current_step_index`, so a replayed completion passed the
+  index check and re-entered the success path, and `_complete_chain` had no
+  already-terminal check at all. Each workflow model now carries `settled_at` and
+  settlement is one conditional update on it: the final-step replay, the already-terminal
+  completion, a `cancel()` racing a completion and a replay against a pre-1.4 row all
+  match zero rows. `resume()` clears the column, so a resumed chain settles again as it
+  should
+- **A redelivered message re-stamped the attempt start.** `stamp_start()` updated by
+  `q2_task_id` unconditionally; it is now conditional on `date_started` being null, so
+  `task_started` and the pickup histogram fire once per attempt while a second delivery
+  still refreshes the heartbeat
+- Documentation drift: `docs/retry.md` described retries as Django-Q2 `Schedule` rows,
+  which owned scheduling replaced in 1.3.0; coverage figures disagreed between README and
+  `docs/development.md`; README claimed an unsourced "8-10x" throughput number that its own
+  table contradicted; `docs/roadmap.md` motivated the absorption plan with upstream
+  stagnation rather than with the capability gaps it actually targets
+
+### Changed
+- **`usage["cost"]` is stored as a decimal string, not a float.** Previously only a
+  `Decimal` took the exact path and a caller passing floats kept float arithmetic, so two
+  calls recording `0.1` and `0.2` totalled `0.30000000000000004`. Money now takes the
+  `Decimal` path whatever the caller passes. Read it with `Decimal(usage["cost"])`, or use
+  `qraft.pricing.cost()`, which returns a `Decimal` either way
+
 ### Planned
 - Coroutine tasks on the `django.tasks` backend
 - Nested workflow support

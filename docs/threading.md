@@ -183,7 +183,7 @@ Worker Process
   │     └─► Thread executes task
   │           │
   │           ├─► close_old_connections() before
-  │           ├─► result = func(*args, **kwargs)
+  │           ├─► qraft.runner.run_task(...) -> call_target()
   │           ├─► close_old_connections() after
   │           │
   │           ├─► Publish result to result_queue
@@ -263,6 +263,10 @@ for i in range(20):
 | 4 workers, threads=8 | 32 | 10-15x | Heavy I/O |
 | 4 workers, threads=16 | 64 | 15-25x | Extreme I/O |
 
+These are modelled ceilings for tasks that are almost entirely I/O wait, not measured
+results. `python manage.py demo perf` in the demo app measures your own workload against a
+threaded and a non-threaded cluster.
+
 **Note:** Actual speedup depends on:
 - I/O wait time (higher = better speedup)
 - Number of I/O operations per task
@@ -338,13 +342,13 @@ Total connections: workers * threads
 Django-Qraft automatically calls `close_old_connections()` before and after each task:
 
 ```python
-# In threaded_worker.py
-def execute_task(task_dict):
-    close_old_connections()  # Clean up stale connections
+# qraft/worker.py
+def _execute_task_in_thread(task_dict):
+    close_old_connections()
     try:
-        result = func(*args, **kwargs)
+        result = qraft.runner.call_target(...)
     finally:
-        close_old_connections()  # Release connection
+        close_old_connections()
 ```
 
 This prevents:
@@ -609,6 +613,20 @@ autostart=true
 autorestart=true
 stdout_logfile=/var/log/qraft/cpu.log
 ```
+
+## Reporting from several threads
+
+`report_progress()` and `record_usage()` are safe to call from more than one thread inside
+the same attempt — a fan-out inside a threaded task, or a coroutine gathering several
+provider calls. The merge is one statement on Postgres (`jsonb ||`, with the advanced
+timestamp set by a `CASE`) and a read-modify-write inside `select_for_update()` elsewhere,
+so no reporter overwrites another's keys and no increment is lost.
+
+What they do not do is coordinate *meaning*. Two threads reporting `current=` for
+different sub-tasks will overwrite each other's number, because "current" is one value.
+Report one dimension per attempt, or give each thread its own key.
+
+See [AI Workloads](ai-workloads.md#usage-and-progress).
 
 ## Best Practices
 
