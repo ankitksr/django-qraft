@@ -463,3 +463,76 @@ class TestCurrentNode:
         from qraft import context
 
         assert context.current_node() is None
+
+
+class TestOverdue:
+    """A graph running past its threshold is flagged, never failed."""
+
+    def _running_graph(self, started_at=None):
+        builder = build_graph(started_at=started_at)
+        add_node(builder, "ingest")
+        return builder.start()
+
+    def test_flags_once_and_only_past_the_threshold(
+        self, settings, signal_log, django_capture_on_commit_callbacks
+    ):
+        settings.QRAFT_GRAPH_OVERDUE_AFTER = 60
+        fresh = self._running_graph()
+        stale = self._running_graph(
+            started_at=timezone.now() - timezone.timedelta(minutes=5)
+        )
+
+        with django_capture_on_commit_callbacks(execute=True):
+            assert graphs.flag_overdue() == 1
+            assert graphs.flag_overdue() == 0
+
+        assert QraftGraph.objects.get(id=stale).overdue_flagged_at is not None
+        assert QraftGraph.objects.get(id=fresh).overdue_flagged_at is None
+        # Observation only: an overdue graph keeps running.
+        assert QraftGraph.objects.get(id=stale).status == GraphStatus.RUNNING
+        assert len(signal_log["graph_overdue"]) == 1
+
+    def test_unset_threshold_sweeps_nothing(self, settings):
+        settings.QRAFT_GRAPH_OVERDUE_AFTER = None
+        settings.QRAFT_RUN_OVERDUE_AFTER = None
+        self._running_graph(started_at=timezone.now() - timezone.timedelta(days=1))
+        assert graphs.flag_overdue() == 0
+
+    def test_the_reaper_sweep_runs_it(self, settings):
+        from qraft.reaper import reap_orphans
+
+        settings.QRAFT_GRAPH_OVERDUE_AFTER = 60
+        graph_id = self._running_graph(
+            started_at=timezone.now() - timezone.timedelta(minutes=5)
+        )
+
+        reap_orphans(stale_after=60)
+
+        assert QraftGraph.objects.get(id=graph_id).overdue_flagged_at is not None
+
+
+class TestSummary:
+    def test_summary_snapshots_every_node_and_the_graph_duration(
+        self, django_capture_on_commit_callbacks
+    ):
+        builder = build_graph()
+        add_node(builder, "ingest")
+        add_node(builder, "rules", after=("ingest",))
+        graph_id = builder.start()
+
+        # Skipped while still pending: the stage nothing can run.
+        graphs.skip(graph_id, "rules", reason="no ACTIVE ruleset versions")
+        with django_capture_on_commit_callbacks(execute=True):
+            complete_node(graph_id, "ingest")
+
+        summary = QraftGraph.objects.get(id=graph_id).summary
+        assert summary["outcome"] == GraphStatus.SUCCEEDED
+        assert summary["duration_s"] >= 0
+        by_key = {node["key"]: node for node in summary["nodes"]}
+        assert set(by_key) == {"ingest", "rules"}
+        assert by_key["ingest"]["outcome"] == NodeStatus.SUCCEEDED
+        assert by_key["ingest"]["duration_s"] >= 0
+        assert by_key["rules"]["outcome"] == NodeStatus.SKIPPED
+        assert by_key["rules"]["skip_reason"] == "no ACTIVE ruleset versions"
+        # A skipped node never ran, so it has no task and no duration.
+        assert by_key["rules"]["task_id"] is None

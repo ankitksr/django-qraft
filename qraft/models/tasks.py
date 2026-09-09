@@ -436,12 +436,6 @@ class QraftTaskAttempt(models.Model):
         help_text="When the attempt completed",
     )
 
-    output_committed_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        help_text="When a transactional node published its receipt (phase 3)",
-    )
-
     # Worker identity, stamped from inside the executing process at
     # pre_execute time (see qraft.lease.stamp_start). `cluster` above already
     # carries the routing target, which is also the cluster that actually ran
