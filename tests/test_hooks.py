@@ -226,9 +226,7 @@ class TestHookDispatcher:
         assert dispatch.hook_type == hook_type
         assert dispatch.hook_path == f"test.hooks.on_{hook_type}"
 
-    def test_dispatch_no_hook_configured(
-        self, qraft_task, qraft_task_attempt, mock_q2_task_success
-    ):
+    def test_dispatch_no_hook_configured(self, qraft_task, qraft_task_attempt):
         """Test dispatch when no hooks are configured."""
         qraft_task.success_hook = None
         qraft_task.failure_hook = None
@@ -240,9 +238,7 @@ class TestHookDispatcher:
         assert not HookDispatch.objects.filter(qraft_task=qraft_task).exists()
 
     @patch("qraft.hooks.q2_async_task")
-    def test_call_hook_async(
-        self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success
-    ):
+    def test_call_hook_async(self, mock_q2_async, qraft_task, qraft_task_attempt):
         """Test async hook dispatching."""
         mock_q2_async.return_value = "hook-task-123"
 
@@ -274,7 +270,7 @@ class TestHookDispatcher:
 
     @patch("qraft.hooks.q2_async_task")
     def test_call_hook_async_idempotency(
-        self, mock_q2_async, qraft_task, qraft_task_attempt, mock_q2_task_success
+        self, mock_q2_async, qraft_task, qraft_task_attempt
     ):
         """Test that hooks are only dispatched once (idempotency)."""
         mock_q2_async.return_value = "hook-task-123"
@@ -303,9 +299,7 @@ class TestHookDispatcher:
         mock_q2_async.assert_not_called()
 
     @patch("qraft.hooks.import_string")
-    def test_call_hook_sync(
-        self, mock_import, qraft_task, qraft_task_attempt, mock_q2_task_success
-    ):
+    def test_call_hook_sync(self, mock_import, qraft_task, qraft_task_attempt):
         """Test synchronous hook calling."""
         mock_hook = Mock()
         mock_import.return_value = mock_hook

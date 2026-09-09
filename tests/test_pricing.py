@@ -67,7 +67,7 @@ class TestResolver:
         assert (price.currency, price.revision) == ("USD", "2026-09")
         assert resolver.price("who-knows") is None
 
-    def test_a_call_with_no_model_records_no_entry(self, priced):
+    def test_a_call_with_no_model_records_no_entry(self):
         assert pricing.usage_entry({"input_tokens": 10}) is None
 
 
@@ -116,7 +116,7 @@ class TestEntries:
         assert (entry["currency"], entry["pricing_revision"]) == ("USD", "2026-09")
         assert entry["provider"] == "mockprovider"
 
-    def test_caller_supplied_cost_wins_over_the_table(self, priced):
+    def test_caller_supplied_cost_wins_over_the_table(self):
         entry = pricing.usage_entry(
             {
                 "model": "mock-nano",
@@ -145,7 +145,7 @@ class TestCostSummary:
         entry.update(overrides)
         return entry
 
-    def test_complete_coverage_sums_as_decimal_and_reports_estimated(self, priced):
+    def test_complete_coverage_sums_as_decimal_and_reports_estimated(self):
         summary = cost({"entries": [self._entry(), self._entry()]})
 
         assert isinstance(summary, CostSummary)
@@ -156,13 +156,13 @@ class TestCostSummary:
             True,
         )
 
-    def test_caller_only_entries_are_not_estimated(self, priced):
+    def test_caller_only_entries_are_not_estimated(self):
         summary = cost(
             {"entries": [self._entry(cost_source="caller", estimated_cost="1.25")]}
         )
         assert (summary.amount, summary.estimated) == (Decimal("1.25"), False)
 
-    def test_an_unpriceable_entry_makes_coverage_partial(self, priced):
+    def test_an_unpriceable_entry_makes_coverage_partial(self):
         summary = cost(
             {
                 "entries": [
@@ -183,7 +183,7 @@ class TestCostSummary:
         assert summary.amount == Decimal("0.00005")
         assert (summary.coverage, summary.estimated) == ("complete", True)
 
-    def test_no_entries_and_no_cost_is_zero_with_no_coverage(self, priced):
+    def test_no_entries_and_no_cost_is_zero_with_no_coverage(self):
         summary = cost({})
         assert (summary.amount, summary.coverage, summary.currency) == (
             Decimal(0),
@@ -191,7 +191,7 @@ class TestCostSummary:
             None,
         )
 
-    def test_a_pre_entries_usage_dict_reports_its_own_cost(self, priced):
+    def test_a_pre_entries_usage_dict_reports_its_own_cost(self):
         summary = cost({"cost": "0.42", "currency": "USD", "input_tokens": 10})
         assert (summary.amount, summary.coverage, summary.estimated) == (
             Decimal("0.42"),
@@ -199,7 +199,7 @@ class TestCostSummary:
             False,
         )
 
-    def test_as_dict_is_json_safe(self, priced):
+    def test_as_dict_is_json_safe(self):
         import json
 
         payload = cost({"entries": [self._entry()]}).as_dict()
