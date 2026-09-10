@@ -469,9 +469,9 @@ QraftBatch(on_success='myapp.hooks.batch_done', hook_context=True)
 moment the cancel took effect. How much of a fan-out had already finished is the
 question that hook exists to answer.
 
-A run's `on_settled` hook always receives a `context` — it has no caller-frozen arguments
-to protect — carrying the run's ids, outcome and per-stage outcomes. See
-[Runs](workflows.md#the-durable-completion-event).
+A graph's `on_settled` hook always receives a `context` — it has no caller-frozen
+arguments to protect — carrying the graph's ids, outcome and per-node outcomes. See
+[the durable completion event](workflows.md#the-durable-completion-event).
 
 ### Success Hook Arguments
 

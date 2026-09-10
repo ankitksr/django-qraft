@@ -76,7 +76,7 @@ python manage.py migrate
 ```
 
 This creates the Qraft tables: tasks and their attempts, hook dispatch tracking,
-the workflow models (chain, iter, batch), runs and run stages, and rate buckets
+the workflow models (chain, iter, batch), graphs and their nodes, and rate buckets
 for throttling. See [Architecture](architecture.md) for the full schema.
 
 ## Starting the Cluster
