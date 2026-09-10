@@ -449,7 +449,7 @@ def state(request):
                 if next_due
                 else None
             ),
-            # Pre-2.0 retries lived in django-q2 Schedules; nonzero only on
+            # Pre-1.3 retries lived in django-q2 Schedules; nonzero only on
             # databases that still carry them.
             "legacy_scheduled": Schedule.objects.count(),
             "filters": filters,

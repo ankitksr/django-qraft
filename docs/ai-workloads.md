@@ -82,16 +82,22 @@ Postgres only for concurrent correctness: the refill-and-drain runs under `selec
 
 ## Request budgets
 
-A token bucket answers "how fast", not "how much". It refills, so a pipeline that keeps retrying keeps being allowed to spend. A budget is the other half: a fixed allowance one run may ask of a provider, across every stage and every retry of every stage.
+A token bucket answers "how fast", not "how much". It refills, so a pipeline that keeps retrying keeps being allowed to spend. A budget is the other half: a fixed allowance one graph may ask of a provider, across every node and every retry of every node.
 
-Declare it on the run and spend it one request at a time:
+Declare it on the graph and spend it one request at a time:
 
 ```python
-run_id = runs.start(
-    ("worksheet", 4117),
-    stages=["ingest", "rules", "ai"],
+from qraft import graphs
+
+graph = graphs.Graph(
+    subject=("worksheet", 4117),
+    kind="scoring",
     budgets={"openai_requests": 40},
 )
+graph.node("ingest", "myapp.tasks.ingest", 4117, recovery="transactional")
+graph.node("rules", "myapp.tasks.rules", 4117, after=["ingest"], recovery="transactional")
+graph.node("ai", "myapp.tasks.score", 4117, after=["ingest"], recovery="idempotent")
+graph_id = graph.start()
 ```
 
 ```python
@@ -110,17 +116,17 @@ def score_chunk(chunk_id):
 
 **One request is one `consume_budget()` call before the call and one `record_usage()` call after it.** Spending before means a crash between the two costs the budget one request rather than losing the accounting for a request the provider already billed.
 
-`consume_budget(key, n=1, run_id=None)` decrements atomically — one guarded `UPDATE ... RETURNING` on Postgres, a locked read-modify-write elsewhere — and returns what is left. A decrement that would take the key below zero matches no row, so two workers cannot both spend the last request; the loser gets `BudgetExhausted`. `remaining_budget(key)` reads without spending.
+`consume_budget(key, n=1, graph_id=None)` decrements atomically — one guarded `UPDATE ... RETURNING` on Postgres, a locked read-modify-write elsewhere — and returns what is left. A decrement that would take the key below zero matches no row, so two workers cannot both spend the last request; the loser gets `BudgetExhausted`. `remaining_budget(key, graph_id=None)` reads without spending.
 
-The budget lives on the run because that is the scope worth bounding. Combine the two: `throttled()` keeps the fleet inside the provider's rate limit, `consume_budget()` keeps one worksheet inside its own cost ceiling.
+The budget lives on the graph because that is the scope worth bounding. Combine the two: `throttled()` keeps the fleet inside the provider's rate limit, `consume_budget()` keeps one worksheet inside its own cost ceiling.
 
-A key the run does not declare is unmetered and `consume_budget()` returns `None` — Qraft does not invent a limit the application never asked for. Outside a run it is a no-op, the same as `record_usage()`. Budget values are whole counts of requests; `runs.start()` refuses a fractional one rather than rounding it.
+A key the graph does not declare is unmetered and `consume_budget()` returns `None` — Qraft does not invent a limit the application never asked for. Outside a graph it is a no-op, the same as `record_usage()`. Budget values are whole counts of requests; `Graph.start()` raises `GraphError` on a fractional one rather than rounding it.
 
 `BudgetExhausted` is an ordinary task failure: the attempt resolves failed and the retry policy applies, so list it under `skip_exceptions` if a retry should not burn attempts on a ceiling that will not move.
 
-### A retry re-runs the whole stage
+### A retry re-runs the whole node
 
-Qraft retries an attempt, not the part of it that had not finished. A metered stage that fails on its last chunk re-executes from the top on attempt 2 and asks the provider for every chunk again, unless the task itself skips work it has already persisted. The pattern is to make the unit of work durable and to check for it first:
+Qraft retries an attempt, not the part of it that had not finished. A metered node that fails on its last chunk re-executes from the top on attempt 2 and asks the provider for every chunk again, unless the task itself skips work it has already persisted. The pattern is to make the unit of work durable and to check for it first:
 
 ```python
 def score_chunk(worksheet_id, chunk_id):
@@ -130,7 +136,7 @@ def score_chunk(worksheet_id, chunk_id):
     ...
 ```
 
-The run's budget is what bounds the cost when that pattern is not in place: the retry spends from the same allowance, so a stage that keeps failing runs out of budget instead of out of money.
+The graph's budget is what bounds the cost when that pattern is not in place: the retry spends from the same allowance, so a node that keeps failing runs out of budget instead of out of money.
 
 ## Usage and progress
 
@@ -187,17 +193,17 @@ A chunk-heavy task can throttle its writes with `progress_min_interval` (seconds
 `total` changed, or the caller passes `force=True`. The default keeps the pre-1.4
 behaviour of writing on every call.
 
-Aggregate across retries, a workflow, a run, or a subject:
+Aggregate across retries, a workflow, a graph, or a subject:
 
 ```python
 from qraft.context import (
     aggregate_usage, aggregate_workflow_usage,
-    aggregate_run_usage, aggregate_subject_usage,
+    aggregate_graph_usage, aggregate_subject_usage,
 )
 
 aggregate_usage(qraft_task)              # summed over every attempt
 aggregate_workflow_usage(chain_model)    # summed over a chain/iter/batch
-aggregate_run_usage(run_id)              # summed over every task in a run
+aggregate_graph_usage(graph_id)          # summed over every task in a graph
 aggregate_subject_usage('worksheet', 4117)
 ```
 
@@ -282,14 +288,14 @@ Every aggregate carries the same summary under `cost_summary`, beside the token 
 
 ```python
 aggregate_usage(qraft_task)["cost_summary"]
-aggregate_run_usage(run_id)["cost_summary"]
+aggregate_graph_usage(graph_id)["cost_summary"]
 aggregate_subject_usage('worksheet', 4117)["cost_summary"]
 ```
 
 It is a separate key from `usage["cost"]`, which stays the caller's own running total.
-A run's `summary` snapshot carries it too, so a pruned run still knows what it cost. The
+A graph's `summary` snapshot carries it too, so a pruned graph still knows what it cost. The
 dashboard's usage panel shows it with its coverage word and an `est` marker, and honours
-the same subject and run filters as the rest of the page.
+the same subject and graph filters as the rest of the page.
 
 ### Writing your own resolver
 
@@ -353,7 +359,7 @@ Reaped attempts are marked failed and handed to the retry policy; with no policy
 
 `qraft.runner.run_task` stamps `returned_at` and stops the heartbeat the moment the target returns or raises, before the result is handed back to Django-Q2. That closes a gap the lease could not otherwise see: kill the monitor and it dies holding the result queue's write lock, the worker blocks in `result_queue.put()` with the task already finished, and the heartbeat thread keeps the lease fresh for work that is over. The reaper then reads the attempt as alive — correctly, and uselessly. Ending the lease where the function ends makes the heartbeat mean "the attempt is progressing" rather than "the process exists".
 
-Put `ResultLost` in `retry_exceptions` only for a stage that is safe to run twice. The retry is usually cheap for an idempotent one — it re-does work whose writes are already there — and it is what lets the run settle instead of staying open.
+Put `ResultLost` in `retry_exceptions` only for a node that is safe to run twice. The retry is usually cheap for an idempotent one — it re-does work whose writes are already there — and it is what lets the graph settle instead of staying open.
 
 The trade this makes: a monitor that is merely slow, not dead, now has the grace period to record a result rather than forever. Past it the attempt is reaped and retried, and when the real completion finally arrives the hook handler's `success IS NULL` compare-and-swap drops it as a late duplicate. That is the same window a dead worker already had, and the grace is `max(3 * heartbeat_interval, min_heartbeat_grace)` — 90s by default, against a monitor that records results in milliseconds when it is healthy. Lower `min_heartbeat_grace` deliberately, not casually: it is the whole margin between "the result is still coming" and "the result is never coming".
 
@@ -376,7 +382,7 @@ reap_orphans(stale_after=300)   # returns the number of attempts reaped
 
 `reap_stale_after` is now only the fallback for attempts that never reached `pre_execute`; running tasks are governed by the heartbeat. Lower `heartbeat_interval` to detect dead workers sooner, at the cost of one small `UPDATE` per task per interval.
 
-Detection latency is `max(3 * heartbeat_interval, min_heartbeat_grace)`, and the floor is what usually decides it: at the default `heartbeat_interval` of 30s the formula gives 90s either way. Lowering `heartbeat_interval` alone changes nothing below 30s. For a pipeline of sub-second stages, 90s of lost work per crash can cost more than a rare false reap of a briefly-paused worker, and `min_heartbeat_grace` is what to lower — deliberately, together with `heartbeat_interval`:
+Detection latency is `max(3 * heartbeat_interval, min_heartbeat_grace)`, and the floor is what usually decides it: at the default `heartbeat_interval` of 30s the formula gives 90s either way. Lowering `heartbeat_interval` alone changes nothing below 30s. For a pipeline of sub-second nodes, 90s of lost work per crash can cost more than a rare false reap of a briefly-paused worker, and `min_heartbeat_grace` is what to lower — deliberately, together with `heartbeat_interval`:
 
 ```python
 QRAFT_CLUSTER = {
@@ -387,7 +393,7 @@ QRAFT_CLUSTER = {
 
 ### One attempt, one execution
 
-Django-Q2 redelivers any message it never got an acknowledgement for. After a monitor crash that means re-running a task whose attempt row is still unresolved — and because every re-run refreshed the lease heartbeat, the reaper's liveness test answered "alive" for a task stuck in a redelivery loop. Nothing above resolved it; runs stayed `OPEN` until an operator cancelled them.
+Django-Q2 redelivers any message it never got an acknowledgement for. After a monitor crash that means re-running a task whose attempt row is still unresolved — and because every re-run refreshed the lease heartbeat, the reaper's liveness test answered "alive" for a task stuck in a redelivery loop. Nothing above resolved it; graphs stayed running until an operator cancelled them.
 
 Every attempt Qraft enqueues now runs through `qraft.runner.run_task`, which claims the delivery before calling anything. The claim is a compare-and-swap on `QraftTaskAttempt.execution_count`: at most `max_executions_per_attempt` deliveries (default 1) are admitted, and an attempt that already has an outcome admits none. A refused delivery does not call the function, does not refresh the lease, counts `qraft.attempt.redelivered`, and raises `qraft.runner.RedeliveredAttempt` — so the attempt resolves through the normal failure path with `exception_class="RedeliveredAttempt"`, and the retry policy, not the broker's delivery loop, decides whether there is an attempt N+1.
 

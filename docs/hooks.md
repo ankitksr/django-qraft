@@ -447,8 +447,8 @@ def on_ingested(context=None, **kwargs):
 ```
 
 `context` is a plain dict with `task_id`, `attempt_id`, `attempt_number`, `outcome`
-(`succeeded`, `failed` or `orphaned`), `exception_class`, `run_id`, `stage`,
-`subject_type`, `subject_id`, `result_ref` (the Django-Q2 task id whose `result` holds
+(`succeeded`, `failed` or `orphaned`), `exception_class`, `graph_id`, `node_key`,
+`generation`, `subject_type`, `subject_id`, `result_ref` (the Django-Q2 task id whose `result` holds
 the return value), `traceparent`, `date_started` and `date_completed`. It is assembled in
 the hook handler from rows it already holds and frozen into the hook task's arguments, so
 it survives the same crashes the `HookDispatch` row does.
@@ -811,7 +811,8 @@ def on_task_settled(sender, payload, **kwargs):
 | `task_settled` | a task reaches SUCCEEDED, FAILED or EXHAUSTED | monitor |
 | `workflow_settled` | a chain, iter or batch settles | monitor, or the web process that cancelled |
 | `attempt_stall_suspected` | the reaper flags an attempt | monitor |
-| `run_settled`, `run_overdue` | a run settles or is flagged overdue | monitor |
+| `node_settled` | a graph node records its outcome | monitor |
+| `graph_settled`, `graph_overdue` | a graph settles or is flagged overdue | monitor |
 
 There is no `attempt_failed`: a receiver that only wants failures reads `outcome` on
 `attempt_finished`.
@@ -820,8 +821,9 @@ There is no `attempt_failed`: a receiver that only wants failures reads `outcome
 
 Every signal sends `sender=` the model class and one `payload` keyword argument: an
 immutable mapping holding `task_id`, `attempt_id`, `attempt_number`, `func`, `status`,
-`outcome`, `exception_class`, `run_id`, `stage`, `subject_type`, `subject_id`, `cluster`,
-and the attempt's timestamps as ISO strings. A model instance captured before commit and
+`outcome`, `exception_class`, `graph_id`, `node_key`, `generation`, `subject_type`,
+`subject_id`, `cluster`, `execution_count`, `redelivered`, and the attempt's timestamps as
+ISO strings. A model instance captured before commit and
 handed to a receiver after it is a snapshot that may already be stale; ids are what a
 receiver looks up when it needs more.
 
