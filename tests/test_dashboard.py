@@ -429,7 +429,7 @@ class TestSubjectFilterAndProgress:
             progress_advanced_at=now - timedelta(seconds=20),
         )
         other = _task(subject_type="worksheet", subject_id="2")
-        other.progress = {"current": 1, "total": 2}  # pre-1.4 snapshot only
+        other.progress = {"current": 1, "total": 2}  # snapshot with no attempt id
         other.save()
         _attempt(other)
         _task()
@@ -526,7 +526,6 @@ class TestGraphsPanel:
         unknown = "00000000-0000-0000-0000-000000000000"
         assert client.post(f"/qraft/graphs/{unknown}/cancel/").status_code == 404
         assert client.post(f"/qraft/graphs/nope/{graph_id}/").status_code == 404
-
 
     def test_resume_action_carries_a_preview_and_reruns(self, db, client):
         from qraft import graphs

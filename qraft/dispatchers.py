@@ -49,7 +49,8 @@ def settle_workflow(model, workflow_id, status: str, workflow_type: str):
 
     One conditional update on `settled_at`: a final-step redelivery, an
     already-terminal `_complete_chain`, a cancel racing a completion and a
-    replay against a pre-1.4 row (terminal status, null `settled_at`) all
+    replay against a row from before the column existed (terminal status, null
+    `settled_at`) all
     match zero rows. `workflow_settled` and the `workflow.settled` counter
     fire only when the update matched; the caller dispatches the workflow
     hook on the same condition, with `WorkflowHookDispatch` as the second

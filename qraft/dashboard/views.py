@@ -174,7 +174,8 @@ def _current_progress(task, latest) -> dict:
     to it unconditionally reports a superseded attempt's numbers as the running
     one's: attempt 1 stops at 9/10 and fails, attempt 2 starts and has not
     reported yet. The snapshot is only shown when it names that latest attempt -
-    or names none at all, which is what a pre-1.4 row looks like.
+    or names none at all, which is what a row from before the column existed
+    looks like.
     """
     if latest is not None and latest.progress:
         return latest.progress
