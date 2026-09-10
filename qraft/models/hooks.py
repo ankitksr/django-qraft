@@ -67,25 +67,25 @@ class WorkflowHookDispatch(models.Model):
     """
     Tracks workflow-level hooks dispatched as async tasks.
 
-    Ensures workflow hooks (chain/iter/batch completion) are only dispatched
-    once per workflow, providing idempotency at the workflow level.
+    Ensures workflow hooks (chain/iter/batch completion, graph settlement) are
+    only dispatched once per workflow, providing idempotency at the workflow level.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
 
     workflow_type = models.CharField(
         max_length=10,
-        help_text="Type of workflow: 'chain', 'iter', or 'batch'",
+        help_text="Type of workflow: 'chain', 'iter', 'batch', or 'graph'",
     )
 
     workflow_id = models.UUIDField(
         db_index=True,
-        help_text="UUID of the workflow (chain/iter/batch)",
+        help_text="UUID of the workflow (chain/iter/batch/graph)",
     )
 
     hook_type = models.CharField(
         max_length=10,
-        help_text="Type of hook: 'success' or 'failure'",
+        help_text="Type of hook: 'success', 'failure', or 'settled'",
     )
 
     hook_path = models.CharField(

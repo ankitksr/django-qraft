@@ -15,10 +15,10 @@ Two invariants shape what is safe to delete:
 - A workflow is pruned as a unit. Deleting a member task out from under a live
   workflow would leave its counters pointing at rows that no longer exist, so
   member tasks are only pruned once their workflow is terminal (or gone).
-- Run membership is protected in every pass, not just the task pass. Deleting
-  an iter or batch cascades to its member tasks, so a completed batch under an
-  open run would lose its rows through the workflow pass alone. Terminal runs
-  are pruned after the task pass and their stages cascade with them; the
+- Graph membership is protected in every pass, not just the task pass. Deleting
+  an iter or batch cascades to its member tasks, so a completed batch under a
+  running graph would lose its rows through the workflow pass alone. Terminal
+  graphs are pruned after the task pass and their nodes cascade with them; the
   `summary` written at settlement is what makes that safe.
 
 Deletion runs in bounded batches: a first sweep over a table with millions of
