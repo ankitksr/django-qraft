@@ -1015,9 +1015,7 @@ def replay_settled_hooks(grace: float) -> int:
 def flag_overdue() -> int:
     from django.conf import settings
 
-    after = getattr(settings, "QRAFT_GRAPH_OVERDUE_AFTER", None) or getattr(
-        settings, "QRAFT_RUN_OVERDUE_AFTER", None
-    )
+    after = getattr(settings, "QRAFT_GRAPH_OVERDUE_AFTER", None)
     if not after:
         return 0
 

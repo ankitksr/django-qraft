@@ -29,14 +29,21 @@ today offers Canvas-depth workflows or AI-workload primitives.
   the heartbeat when the target returns, so a task whose result is stranded by a dead
   monitor stops looking alive. Reaped as `ResultLost`, which a retry policy can treat
   differently from `OrphanedTask`.
-- **Observability** ([future/observability.md](future/observability.md)). Subjects on
+- **Observability.** Subjects on
   every task and workflow; progress owned by the attempt, with reported and advanced
   timestamps; signals Qraft emits about its own transitions; a metrics sink with an
   OpenTelemetry implementation, a logging filter and trace propagation; durable hook
   context.
-- **Runs.** `qraft.runs` gives a pipeline whose stages enqueue each other one row that
-  spans them: declared stages, one completion unit per stage, settlement by derivation, a
-  durable `on_settled` hook, and one number for report-to-ready.
+- **Execution graphs** ([workflows.md](workflows.md#graphs)). `graphs.Graph(...)` declares
+  nodes with explicit `after` edges and Qraft dispatches every node whose dependencies are
+  met, rather than the application enqueueing the next stage. The graph settles once, on
+  quiescence, with a durable `on_settled` hook and a `summary` snapshot. Selective resume
+  reruns named nodes and their downstream closure under a new generation; a completion
+  receipt makes the "kept" claim exact; approval gates park a node until a person decides.
+  A graph may start without a subject and bind it once the node that creates the subject
+  has run, and `budgets=` with `context.consume_budget()` bounds what one graph may ask of
+  a provider across every node and every retry — the question a refilling token bucket
+  cannot answer.
 - **Cost from usage.** An optional `QRAFT_PRICING` resolver turns recorded tokens into
   money, priced per increment so a corrected table never re-prices a billed call.
   `cost()` answers with coverage and estimated flags, never a bare number.
@@ -50,11 +57,6 @@ today offers Canvas-depth workflows or AI-workload primitives.
 - **One attempt, one execution.** A compare-and-swap on `execution_count` refuses a broker
   redelivery of an attempt that already ran, so the retry policy — not the delivery loop —
   decides what happens next.
-- **Late subject bind.** A run may start without a subject and name it once the stage that
-  creates the subject has run, with every already-bound member backfilled.
-- **Request budgets.** `runs.start(..., budgets=...)` and `context.consume_budget()` bound
-  what one pipeline may ask of a provider across every stage and every retry — the
-  question a refilling token bucket cannot answer.
 
 ## Shipped in 1.3.0
 
@@ -95,6 +97,22 @@ Nothing remains from the original plan; what landed after 1.3.0 is listed above.
 (`TaskContext` and deferred tasks shipped in 1.2.1; priority routing for scheduled
 retries shipped in 1.3.0 with owned scheduling.)
 
+## Open questions on graphs
+
+- **How many nodes is too many?** No ceiling exists today. One would keep the frontier
+  scan and the graph lock honest, but the number should come from a wide fan-in
+  measurement rather than intuition.
+- **Should a node carry a timeout?** A scheduled attempt runs under its cluster's timeout,
+  so today the answer is a cluster per timeout class. Reconsider only for a consumer whose
+  node durations differ by an order of magnitude within one cluster.
+- **Does a graph need a concurrency cap?** Backpressure today is worker count, throttles
+  and budgets. Dispatch through scheduled rows makes a cap a small later change with no
+  new state, so deferring costs nothing.
+- **Should `QraftChain` and `QraftBatch` become facades over the graph?** A chain is nodes
+  with one `after` edge each and a batch is nodes with none, so both would gain resume by
+  construction. Breaking, and gated on somebody needing it. `QraftIter` is not re-based:
+  ten thousand rows of one function with a counter is the right shape for an iter.
+
 ## Architecture direction
 
 Incremental absorption of Django-Q2, one owned subsystem per phase: execution
@@ -109,8 +127,16 @@ Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
   exist; DBOS already owns the generic version of this play.
 - **asyncio worker** — threading already covers I/O-bound concurrency; revisit only on
   demonstrated demand (`docs/future/asyncio-worker.md` holds the design).
-- **Run timeouts that fail a run automatically** — a run open too long is flagged, never
-  failed. Which of skip, cancel and abandon is right is an application decision.
+- **Graph timeouts that fail a graph automatically** — a graph running too long is
+  flagged, never failed. Whether to skip a node or cancel the graph is an application
+  decision.
+- **Dynamic node expansion, result passing between nodes, a node that is itself a
+  workflow, cross-graph edges** — the topology is sealed at `start()` and Qraft does not
+  own application outputs.
+- **Automatic resume** — the retry policy owns attempts, and a resume is a decision made
+  with a preview in front of it.
+- **A graph renderer beyond a layered list** — a picture is not what an incident needs
+  first.
 - **Automatically resolving a suspected stall** — gated on cooperative cancellation. The
   original attempt keeps running and keeps writing, so a retry would double-write.
 - **Broker work beyond Postgres** — throughput races with Redis/RabbitMQ queues are not

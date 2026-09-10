@@ -494,7 +494,6 @@ class TestOverdue:
 
     def test_unset_threshold_sweeps_nothing(self, settings):
         settings.QRAFT_GRAPH_OVERDUE_AFTER = None
-        settings.QRAFT_RUN_OVERDUE_AFTER = None
         self._running_graph(started_at=timezone.now() - timezone.timedelta(days=1))
         assert graphs.flag_overdue() == 0
 

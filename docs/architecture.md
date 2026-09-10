@@ -4,13 +4,9 @@ This document describes Django-Qraft's internal architecture, design patterns, a
 
 ## Design Philosophy
 
-**Core principle**: Drop-in enhancement of Django-Q2 via selective inheritance, not a fork.
-
-Django-Qraft extends Django-Q2 at specific points to add features while preserving compatibility:
-- Uses Django-Q2's broker system unchanged
-- Reuses Django-Q2's monitor and pusher unchanged
-- Selectively overrides cluster and worker spawning
-- Enhances hook handling via interception
+**Core principle**: drop-in enhancement of Django-Q2 by selective inheritance, not a fork.
+Qraft overrides cluster and worker spawning and intercepts hook handling; the broker,
+monitor and pusher run unchanged.
 
 ## System Overview
 
@@ -207,18 +203,19 @@ All other Django-Q2 components (pusher, monitor, broker) remain unchanged.
 - `advanced_at` moves only when `current`/`total` change, so a task narrating a hang
   cannot look busy
 
-**7. A Run Spans Stages That Enqueue Each Other**
-- `QraftRun` declares the stages a pipeline expects; `QraftRunStage` binds each to
-  exactly one completion unit (a task or a workflow) and records how it ended
-- `QraftTask` and the three workflow models gain `run` (`SET_NULL`) and `stage` through
-  `RunMemberMixin` — correlation only. Deleting a run must never delete work, and a
-  member of a workflow carries the pair without ever settling a stage
-- The run settles by derivation over its declared stages, not by an explicit close call:
-  the code that knows a pipeline is done is the last stage's success path, the one place
-  a crash loses the call
-- `runs.note_unit_settled()` is called from inside the window the attempt's `routed` flag
-  protects, so `reaper.replay_unrouted()` recovers a crash between a unit settling and
-  its stage being recorded
+**7. A Graph Owns the Plan and the Dispatch**
+- `QraftGraph` holds one execution of a plan; `QraftGraphNode` holds each node, its
+  `after` edges and the one task bound to it. The whole plan is written at `start()` and
+  the topology is sealed there — no node adds nodes
+- Qraft dispatches every node whose dependencies are met, through a scheduled attempt
+  (`graphs._dispatch_node`). The application never enqueues the next step, so no crash
+  between two stages can strand a pipeline
+- `QraftTask` and the three workflow models gain `graph` (`SET_NULL`) and `node` through
+  `GraphMemberMixin` — correlation only. Deleting a graph must never delete work, and a
+  workflow's members carry the pair without ever settling a node
+- `graphs.handle_node_completion()` runs from the monitor's completion routing, inside
+  the window the attempt's `routed` flag protects, so `reaper.replay_unrouted()` recovers
+  a crash between a task settling and its node being recorded
 
 **8. Stall Observation Is a Column, Not a Retry Setting**
 - `QraftTask.stall_after` and `QraftTaskAttempt.stall_suspected_at`. `stall_after` is a
@@ -251,9 +248,9 @@ All other Django-Q2 components (pusher, monitor, broker) remain unchanged.
 - The refusal is raised from `qraft.runner.run_task`, not from the `pre_execute` receiver:
   django_q's worker wraps no try/except around that send, so a raise there would be lost
 
-**12. The Subject May Be Named After the Run Starts**
-- The stage that creates a run's domain object is often the run's own first stage
-- `runs.bind_subject()` is allowed once, under the run's row lock, and backfills every
+**12. The Subject May Be Named After the Graph Starts**
+- The node that creates a graph's domain object is often the graph's own first node
+- `graphs.bind_subject()` is allowed once, under the graph's row lock, and backfills every
   member already bound; a member insert takes the same lock, so neither side can leave a
   member unlabelled
 
@@ -314,49 +311,43 @@ PENDING ──────┐
 
 ### Lifecycle Example
 
-**Scenario**: Task fails twice, succeeds on attempt 3
+**Scenario**: a task fails twice and succeeds on attempt 3, under
+`qraft_options={'max_attempts': 3}`.
 
 ```python
-# User creates task
 task_id = async_task('myapp.tasks.flaky', qraft_options={'max_attempts': 3})
 
-# QraftTask: id=UUID-1, status=PENDING, retry_policy={max_attempts:3}
+# QraftTask: id=UUID-1, status=PENDING, retry_policy={max_attempts: 3}
 # QraftTaskAttempt: qraft_task=UUID-1, attempt_number=1, q2_task_id="abc123"
 ```
 
-**Attempt 1**: Task fails
+**Attempt 1 fails**
 ```
-1. Worker executes, raises exception
-2. Hook handler called by Django-Q2 monitor
-3. Lookup QraftTaskAttempt by q2_task_id="abc123" → found
-4. Update: QraftTaskAttempt.success=False, exception_class="ValueError"
-5. Update: QraftTask.status=FAILED
-6. Check retry policy: should_retry=True (1 < 3)
-7. Schedule retry: create Schedule with task_name="qraft:UUID-1:2", next_run=+30s
-8. Call failure_hook? No (still retrying)
-```
-
-**Attempt 2**: Task fails again
-```
-1. Scheduler queues task from Schedule
-2. Worker executes, raises exception
-3. Hook handler: q2_task_id lookup fails (task wasn't created via async_task)
-4. Fallback: parse task_name="qraft:UUID-1:2" → extract UUID-1, attempt=2
-5. get_or_create QraftTaskAttempt(qraft_task=UUID-1, attempt_number=2)
-6. Update: success=False, exception_class="ConnectionError"
-7. Check retry policy: should_retry=True (2 < 3)
-8. Schedule retry: create Schedule for attempt 3, next_run=+60s
+1. The worker executes run_task, the target raises ValueError
+2. The monitor's hook handler resolves the attempt by q2_task_id="abc123"
+3. Resolution update: success=False, exception_class="ValueError"
+4. The retry policy allows attempt 2, so scheduler.schedule_attempt writes a
+   SCHEDULED QraftTaskAttempt with not_before=+30s
+5. QraftTask.status stays PENDING — the task has not failed, an attempt has
+6. No failure hook: the task is still retrying
 ```
 
-**Attempt 3**: Task succeeds
+**Attempt 2 fails**
 ```
-1. Worker executes, returns result
-2. Hook handler: parse task_name="qraft:UUID-1:3"
-3. get_or_create QraftTaskAttempt(qraft_task=UUID-1, attempt_number=3)
-4. Update: success=True
-5. Update: QraftTask.status=SUCCEEDED
-6. Check retry policy: N/A (succeeded)
-7. Call success_hook('myapp.hooks.on_success')
+1. scheduler.dispatch_due() claims the SCHEDULED row by compare-and-swap at its
+   exact due time, enqueues run_task and stamps q2_task_id on that same row
+2. The worker executes, the target raises ConnectionError
+3. The hook handler resolves the attempt by q2_task_id — the same one path
+4. The retry policy allows attempt 3: a SCHEDULED row with not_before=+60s
+```
+
+**Attempt 3 succeeds**
+```
+1. dispatch_due() claims and enqueues the row as before
+2. The worker executes, the target returns
+3. The hook handler resolves the attempt: success=True
+4. QraftTask.status=SUCCEEDED
+5. The success hook is dispatched through its HookDispatch row
 ```
 
 ## Hook Dispatching Flow
@@ -432,8 +423,9 @@ qraft_hook_handler()
 | `attempt_finished`, `task_settled` | `hooks.qraft_hook_handler`, `reaper._reap_one` | the `success__isnull=True` resolution update matching |
 | `workflow_settled` | `dispatchers.settle_workflow`, `base.cancel` | the `settled_at__isnull=True` update matching |
 | `attempt_stall_suspected` | `reaper.flag_stalls`, after the orphan sweep | the `stall_suspected_at` compare-and-swap matching |
-| `run_settled` | `runs._settle`, from the hook handler, the dispatchers, the reaper and the explicit transitions | the run's `settled_at` compare-and-swap matching |
-| `run_overdue` | `runs.flag_overdue` in the reaper thread | the `overdue_flagged_at` compare-and-swap matching |
+| `node_settled` | `graphs.handle_node_completion` | the node's `settled_at` compare-and-swap matching |
+| `graph_settled` | `graphs._settle`, from the completion routing and the explicit transitions | the graph's `settled_at` compare-and-swap matching |
+| `graph_overdue` | `graphs.flag_overdue` in the reaper thread | the `overdue_flagged_at` compare-and-swap matching |
 
 Every send is registered with `transaction.on_commit` from inside the transaction that
 performs the transition, and every send is `send_robust()` — a receiver that raises is
@@ -445,27 +437,34 @@ The window this does not cover is a crash between commit and the `on_commit` cal
 The row still records the transition; anything an application must not miss goes through
 a hook, whose `HookDispatch` row survives the crash and whose replay the reaper owns.
 
-### Run settlement
+### Graph settlement
 
-`qraft/runs.py` holds the whole surface: `start`, `bind`, `skip`, `cancel`, `abandon`,
-`note_unit_settled` and `flag_overdue`. Two compare-and-swaps carry it. The stage's
-`settled_at` decides whether a unit's outcome is recorded at all — which is also what
-keeps a workflow *member* out, since the update matches on the stage's `unit_id`. The
-run's own `settled_at` decides whether the derived transition takes effect. Both run
-under `select_for_update()` on the run row, so a bind racing a cancel and two stages
+`qraft/graphs.py` holds the whole surface: `Graph.start`, `get`, `skip`, `cancel`,
+`resume`, `preview_resume`, `approve`, `reject`, `publish`, `bind_subject`, `snapshot`,
+`flag_overdue` and `replay_settled_hooks`. Two compare-and-swaps carry settlement. The
+node's `settled_at` decides whether a task's outcome is recorded at all — which is also
+what keeps a workflow *member* out, since the update matches on the node's bound
+`task_id`. The graph's own `settled_at` decides whether the transition takes effect. Both
+run under `select_for_update()` on the graph row, so a bind racing a cancel and two nodes
 finishing at once each produce one decision rather than two.
 
-Retention protects run membership in every pass. The workflow pass matters as much as
+A graph settles on quiescence, not on first failure: while any node is running or ready
+to dispatch, the graph stays running, and only when nothing can advance does the outcome
+derive from the node statuses — failed, then cancelled, then succeeded when every node
+succeeded or was skipped. A node parked at an approval gate moves the graph to
+`WAITING_APPROVAL`, which is not terminal.
+
+Retention protects graph membership in every pass. The workflow pass matters as much as
 the task pass: deleting an iter or batch cascades to its member tasks, so a completed
-batch under an open run would otherwise lose its rows through the workflow pass alone.
-Terminal runs are pruned after their members, and the `summary` written at settlement is
-what makes that safe.
+batch under a running graph would otherwise lose its rows through the workflow pass
+alone. Terminal graphs are pruned after their members, and the `summary` written at
+settlement is what makes that safe.
 
 ### Metrics
 
 `qraft/metrics/__init__.py` resolves `QRAFT_CLUSTER["metrics_sink"]` once per process and
-wraps every emission: labels are checked against a forbidden set (`subject_id`, `run_id`,
-`task_id`, `attempt_id`, `revision`, `metadata`) and a sink that raises is caught,
+wraps every emission: labels are checked against a forbidden set (`subject_id`, `graph_id`,
+`graph`, `task_id`, `attempt_id`, `revision`, `metadata`, `generation`) and a sink that raises is caught,
 counted and throttled to one log line a minute. `qraft/metrics/gauges.py` holds the
 backlog gauges, emitted from the dispatcher loop only on the one cluster flagged
 `metrics_gauges=True`.
@@ -496,30 +495,16 @@ log record, and `current_attempt_id()` exposes the attempt id to task code.
 ### Settings Hierarchy
 
 ```
-1. Django settings.QRAFT_CLUSTER (primary)
-2. Django settings.Q_CLUSTER (fallback, with warning)
-3. Environment variable Q_CLUSTER_NAME (selects ALT_CLUSTERS entry)
-4. Pydantic defaults
+1. Django settings.QRAFT_CLUSTER
+2. Environment variable Q_CLUSTER_NAME (selects the ALT_CLUSTERS entry to merge)
+3. Pydantic defaults
 ```
 
-### Custom Django Settings Source
-
-```python
-class DjangoSettingsSource:
-    """Load settings from Django's settings.QRAFT_CLUSTER or Q_CLUSTER"""
-
-    def __call__(self):
-        # 1. Try QRAFT_CLUSTER
-        if hasattr(django_settings, "QRAFT_CLUSTER"):
-            return django_settings.QRAFT_CLUSTER
-
-        # 2. Fallback to Q_CLUSTER
-        if hasattr(django_settings, "Q_CLUSTER"):
-            logger.warning("Using Q_CLUSTER (deprecated). Use QRAFT_CLUSTER.")
-            return django_settings.Q_CLUSTER
-
-        return {}
-```
+`Q_CLUSTER` is not a fallback source. The one value Qraft reads from it is an explicit
+`save_limit`, which becomes `retention_max_tasks` when no retention key is set in
+`QRAFT_CLUSTER` — a user who bounded Django-Q2's history has already said Qraft's tables
+should be bounded too. Django-Q2's own default of 250 is deliberately not mirrored, since
+that would prune the history of a user who never asked for pruning.
 
 ### ALT_CLUSTERS Pattern
 
@@ -629,23 +614,10 @@ Worker Process
 
 ## Performance Characteristics
 
-### Threading Overhead
-
-- ThreadPoolExecutor creation: one-time per worker process
-- Semaphore acquire/release: ~microseconds per task
-- Extra DB query for attempt lookup: ~1ms per task completion
-- Connection management: ~1ms per task (open/close)
-
-### Expected Speedup (I/O-bound)
-
-See [Threading](threading.md#performance-characteristics) for the throughput table and the caveat that
-those numbers are modelled ceilings, not measurements.
-
-### No Speedup For:
-
-- CPU-bound tasks (Python GIL prevents true parallelism)
-- Tasks with many DB writes (DB becomes bottleneck)
-- Tasks that block on locks or shared resources
+See [Threading](threading.md#performance-characteristics) for the throughput table and the
+caveat that those numbers are modelled ceilings, not measurements. Threading buys nothing
+for CPU-bound work (the GIL), for write-heavy tasks (the database is the bottleneck), or
+for tasks that block on a shared lock.
 
 ## Key Extension Points
 
@@ -684,34 +656,6 @@ the original pickle. The pickle stays on the initial enqueue path.
 Phase 3 of the [absorption plan](future/q2-absorption.md) — a Qraft-owned queue table —
 would let the initial enqueue drop pickle too, which is a security benefit and not only an
 architectural one.
-
-## Common Pitfalls
-
-1. **A pre-1.3 retry has no attempt row**
-   - Owned scheduling creates the `SCHEDULED` attempt row before the retry is enqueued,
-     so the hook handler resolves it by `q2_task_id` like any other attempt
-   - Solution: the marker-parsing fallback (`qraft:{id}:{attempt}`) remains for one
-     release, to resolve pre-1.3 `Schedule` deliveries still in flight across an upgrade
-
-2. **Threading != parallelism for CPU-bound**
-   - Python GIL prevents true parallelism
-   - Solution: Use standard workers (threads=1) for CPU tasks
-
-3. **Process-level timeouts with threading**
-   - One stuck thread terminates entire worker process
-   - Solution: Keep tasks under timeout, or use standard workers
-
-4. **Database connections per thread**
-   - Each thread needs a connection
-   - Solution: Size connection pool ≥ workers × threads
-
-5. **Hook recursion**
-   - Hooks must use `hook=None` to prevent infinite loops
-   - Solution: Framework enforces this automatically
-
-6. **task_name preservation**
-   - User's task_name is preserved, not overwritten
-   - Solution: Use `q2_task_id` for linkage, not task_name parsing
 
 ## Related Documentation
 
