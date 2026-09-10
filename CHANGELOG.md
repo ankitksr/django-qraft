@@ -37,12 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `previous_graph` lineage. Per-node cluster, retry policy, `stall_after` and
   success/failure hooks; `qraft.context.current_node()` for correlation from inside a
   node; `graphs.snapshot()` as the visibility contract. `graphs.skip()` and
-  `graphs.cancel()` are the explicit transitions, and every edge rule — an unknown
-  dependency, a self-edge, a cycle, a duplicate key, a terminal graph — raises at
-  `start()`. Members inherit `graph` and `node` for correlation and never settle a node.
+  `graphs.cancel()` are the explicit transitions, and every topology rule — an unknown
+  dependency, a self-edge, a cycle, a duplicate key — raises at `start()`, while
+  correlating work onto a terminal graph raises at the enqueue. Members inherit
+  `graph` and `node` for correlation and never settle a node.
   New `graph_settled`, `node_settled` and `graph_overdue` signals, `qraft.graph.*` /
   `qraft.node.*` metrics, an overdue sweep behind `QRAFT_GRAPH_OVERDUE_AFTER`, a
-  dashboard graph panel, and a read-only `QraftGraphAdmin`. Migrations `0016`-`0018`
+  dashboard graph panel, and a read-only `QraftGraphAdmin`. Migrations `0016`-`0019`
 
   A graph may `start()` without a subject and name it later with
   `graphs.bind_subject()`, which updates the graph and every member already bound to it

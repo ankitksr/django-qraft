@@ -208,14 +208,21 @@ All other Django-Q2 components (pusher, monitor, broker) remain unchanged.
   `after` edges and the one task bound to it. The whole plan is written at `start()` and
   the topology is sealed there — no node adds nodes
 - Qraft dispatches every node whose dependencies are met, through a scheduled attempt
-  (`graphs._dispatch_node`). The application never enqueues the next step, so no crash
-  between two stages can strand a pipeline
+  (`graphs._dispatch_node`). The application never enqueues the next step, so a crash
+  between two nodes cannot strand a pipeline. `resume()` is the one exception: it commits
+  the reset before dispatching the frontier, so a crash in that window leaves pending
+  nodes with nothing queued
 - `QraftTask` and the three workflow models gain `graph` (`SET_NULL`) and `node` through
-  `GraphMemberMixin` — correlation only. Deleting a graph must never delete work, and a
-  workflow's members carry the pair without ever settling a node
+  `GraphMemberMixin` — correlation only, so deleting a graph never deletes correlated
+  work. Membership is the other relation: `QraftTask.graph_node` is `CASCADE`, so a
+  node's own execution tasks go with the graph. A workflow's members carry the
+  correlation pair without ever settling a node
 - `graphs.handle_node_completion()` runs from the monitor's completion routing, inside
   the window the attempt's `routed` flag protects, so `reaper.replay_unrouted()` recovers
-  a crash between a task settling and its node being recorded
+  a crash between a task settling and its node being recorded. Receipt-based recovery
+  (`reaper._resolve_committed`) is outside that window — it sets `routed=True` in the same
+  breath as scheduling the completion, so a crash before the `on_commit` callback is not
+  replayed
 
 **8. Stall Observation Is a Column, Not a Retry Setting**
 - `QraftTask.stall_after` and `QraftTaskAttempt.stall_suspected_at`. `stall_after` is a
@@ -258,9 +265,10 @@ All other Django-Q2 components (pusher, monitor, broker) remain unchanged.
 
 ### Linking a Django-Q2 task to its Qraft attempt
 
-Every attempt — the first and every retry — has a `QraftTaskAttempt` row before it is
-enqueued, and the row carries the `q2_task_id`. The hook handler looks it up by that id.
-There is no second path.
+Every attempt — the first and every retry — has a `QraftTaskAttempt` row carrying its
+`q2_task_id`, and the hook handler looks it up by that id. There is no second path. A
+retry's row exists before the message is enqueued; the first attempt's row is written
+just after `q2_async_task()` returns the id, inside the same transaction.
 
 **Initial task** (`async_task`)
 ```
@@ -280,8 +288,9 @@ There is no second path.
 ```
 
 The user's `task_name` is preserved throughout. Dispatched attempts still carry the
-`qraft:{id}:{attempt}` marker name, but only a Django-Q2 `Schedule` row written by a
-pre-1.3 release and fired after an upgrade resolves through parsing it.
+`qraft:{id}:{attempt}` marker name, and `lease` parses it whenever the `q2_task_id`
+lookup finds no attempt — the pre-1.3 `Schedule` row fired after an upgrade, and the
+delivery that beats the dispatcher's own commit of the id on an external broker.
 
 ### State Transitions
 
@@ -311,24 +320,34 @@ PENDING ──────┐
 
 ### Lifecycle Example
 
-**Scenario**: a task fails twice and succeeds on attempt 3, under
-`qraft_options={'max_attempts': 3}`.
+**Scenario**: a task fails twice and succeeds on attempt 3.
 
 ```python
-task_id = async_task('myapp.tasks.flaky', qraft_options={'max_attempts': 3})
+task_id = async_task(
+    'myapp.tasks.flaky',
+    qraft_options={
+        'max_attempts': 3,
+        'jitter': False,                       # so the ETAs below are exact
+        'success_hook': 'myapp.hooks.on_success',
+    },
+)
 
-# QraftTask: id=UUID-1, status=PENDING, retry_policy={max_attempts: 3}
+# QraftTask: id=UUID-1, status=RUNNING, retry_policy={max_attempts: 3, ...}
 # QraftTaskAttempt: qraft_task=UUID-1, attempt_number=1, q2_task_id="abc123"
 ```
+
+A task is created `RUNNING`, not `PENDING`: the message is on the broker and the row
+describes work in flight. `PENDING` is where a task waits for a *scheduled* attempt.
 
 **Attempt 1 fails**
 ```
 1. The worker executes run_task, the target raises ValueError
 2. The monitor's hook handler resolves the attempt by q2_task_id="abc123"
 3. Resolution update: success=False, exception_class="ValueError"
-4. The retry policy allows attempt 2, so scheduler.schedule_attempt writes a
-   SCHEDULED QraftTaskAttempt with not_before=+30s
-5. QraftTask.status stays PENDING — the task has not failed, an attempt has
+4. QraftTask.status=FAILED for the moment the resolution holds it there
+5. The retry policy allows attempt 2, so scheduler.schedule_attempt writes a
+   SCHEDULED QraftTaskAttempt with not_before=+30s and puts the task back to
+   PENDING — an attempt failed, the task has not
 6. No failure hook: the task is still retrying
 ```
 
@@ -347,8 +366,11 @@ task_id = async_task('myapp.tasks.flaky', qraft_options={'max_attempts': 3})
 2. The worker executes, the target returns
 3. The hook handler resolves the attempt: success=True
 4. QraftTask.status=SUCCEEDED
-5. The success hook is dispatched through its HookDispatch row
+5. The configured success hook is dispatched through its HookDispatch row
 ```
+
+With the default `jitter=True`, 30s and 60s are the base delays and the real ETAs are
+randomised below them.
 
 ## Hook Dispatching Flow
 
@@ -419,16 +441,17 @@ qraft_hook_handler()
 
 | Signal | Sent from | Guarded by |
 |---|---|---|
-| `task_started` | `lease._on_pre_execute_lease` → `stamp_start` (worker) | the `date_started__isnull=True` update matching |
+| `task_started` | `lease._on_pre_execute_lease` → `claim_delivery` → `_announce_start` (worker) | the `date_started__isnull=True` update matching |
 | `attempt_finished`, `task_settled` | `hooks.qraft_hook_handler`, `reaper._reap_one` | the `success__isnull=True` resolution update matching |
 | `workflow_settled` | `dispatchers.settle_workflow`, `base.cancel` | the `settled_at__isnull=True` update matching |
 | `attempt_stall_suspected` | `reaper.flag_stalls`, after the orphan sweep | the `stall_suspected_at` compare-and-swap matching |
-| `node_settled` | `graphs.handle_node_completion` | the node's `settled_at` compare-and-swap matching |
+| `node_settled` | `graphs.handle_node_completion`, and `graphs.skip` for a pending node | the node's `settled_at` compare-and-swap matching |
 | `graph_settled` | `graphs._settle`, from the completion routing and the explicit transitions | the graph's `settled_at` compare-and-swap matching |
 | `graph_overdue` | `graphs.flag_overdue` in the reaper thread | the `overdue_flagged_at` compare-and-swap matching |
 
-Every send is registered with `transaction.on_commit` from inside the transaction that
-performs the transition, and every send is `send_robust()` — a receiver that raises is
+Every send is registered with `transaction.on_commit` and is `send_robust()`. Most
+transitions run inside an explicit transaction, so the callback fires at its commit;
+`flag_overdue` and the lease's claim run in autocommit, where the callback fires at once — a receiver that raises is
 logged, not propagated into the monitor's completion routing. Payloads are immutable
 mappings of ids and ISO timestamps, never model instances: an instance captured before
 commit is a snapshot that may already be stale by the time a receiver reads it.
@@ -442,11 +465,14 @@ a hook, whose `HookDispatch` row survives the crash and whose replay the reaper 
 `qraft/graphs.py` holds the whole surface: `Graph.start`, `get`, `skip`, `cancel`,
 `resume`, `preview_resume`, `approve`, `reject`, `publish`, `bind_subject`, `snapshot`,
 `flag_overdue` and `replay_settled_hooks`. Two compare-and-swaps carry settlement. The
-node's `settled_at` decides whether a task's outcome is recorded at all — which is also
-what keeps a workflow *member* out, since the update matches on the node's bound
-`task_id`. The graph's own `settled_at` decides whether the transition takes effect. Both
-run under `select_for_update()` on the graph row, so a bind racing a cancel and two nodes
-finishing at once each produce one decision rather than two.
+node's `settled_at` decides whether a task's outcome is recorded at all. A workflow
+*member* never reaches it, because completion routing reads `graph_node` and a member
+carries only the correlation pair; a task from a superseded generation is dropped by the
+separate check that the node is still bound to it. The graph's own `settled_at` decides
+whether the transition takes effect. Completion routing takes `select_for_update()` on
+the graph row, so a bind racing a completion and two nodes finishing at once each produce
+one decision rather than two; `cancel()` settles through the same compare-and-swap
+without taking that lock.
 
 A graph settles on quiescence, not on first failure: while any node is running or ready
 to dispatch, the graph stays running, and only when nothing can advance does the outcome
@@ -454,11 +480,13 @@ derive from the node statuses — failed, then cancelled, then succeeded when ev
 succeeded or was skipped. A node parked at an approval gate moves the graph to
 `WAITING_APPROVAL`, which is not terminal.
 
-Retention protects graph membership in every pass. The workflow pass matters as much as
-the task pass: deleting an iter or batch cascades to its member tasks, so a completed
-batch under a running graph would otherwise lose its rows through the workflow pass
-alone. Terminal graphs are pruned after their members, and the `summary` written at
-settlement is what makes that safe.
+Retention protects the membership of a **running** graph in every pass. The workflow
+pass matters as much as the task pass: deleting an iter or batch cascades to its member
+tasks, so a completed batch under a running graph would otherwise lose its rows through
+the workflow pass alone. Every other graph is pruned after its members once it falls
+outside the window, and the `summary` written at settlement is what makes that safe for a
+settled one. A graph parked at `WAITING_APPROVAL` is not running and not settled, and is
+currently pruned like a terminal one.
 
 ### Metrics
 

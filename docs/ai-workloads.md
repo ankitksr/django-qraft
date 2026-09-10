@@ -120,7 +120,7 @@ def score_chunk(chunk_id):
 
 The budget lives on the graph because that is the scope worth bounding. Combine the two: `throttled()` keeps the fleet inside the provider's rate limit, `consume_budget()` keeps one worksheet inside its own cost ceiling.
 
-A key the graph does not declare is unmetered and `consume_budget()` returns `None` — Qraft does not invent a limit the application never asked for. Outside a graph it is a no-op, the same as `record_usage()`. Budget values are whole counts of requests; `Graph.start()` raises `GraphError` on a fractional one rather than rounding it.
+A key the graph does not declare is unmetered and `consume_budget()` returns `None` — Qraft does not invent a limit the application never asked for. Outside a graph it is a no-op; `record_usage()` is a no-op only outside a task, and records for a plain task with no graph. Budget values are whole counts of requests; `Graph.start()` raises `GraphError` on a fractional one rather than rounding it.
 
 `BudgetExhausted` is an ordinary task failure: the attempt resolves failed and the retry policy applies, so list it under `skip_exceptions` if a retry should not burn attempts on a ceiling that will not move.
 
@@ -190,8 +190,7 @@ attempt row and does the read-modify-write inside that lock. Two reporters in on
 
 A chunk-heavy task can throttle its writes with `progress_min_interval` (seconds,
 `QRAFT_CLUSTER`, default 0): a call inside the interval is skipped unless `current` or
-`total` changed, or the caller passes `force=True`. The default keeps the pre-1.4
-behaviour of writing on every call.
+`total` changed, or the caller passes `force=True`. The default of 0 writes on every call.
 
 Aggregate across retries, a workflow, a graph, or a subject:
 
@@ -293,7 +292,7 @@ aggregate_subject_usage('worksheet', 4117)["cost_summary"]
 ```
 
 It is a separate key from `usage["cost"]`, which stays the caller's own running total.
-A graph's `summary` snapshot carries it too, so a pruned graph still knows what it cost. The
+A graph's `summary` snapshot carries it too, so a graph whose members have been pruned still knows what it cost. The
 dashboard's usage panel shows it with its coverage word and an `est` marker, and honours
 the same subject and graph filters as the rest of the page.
 
@@ -502,6 +501,6 @@ async_task('myapp.tasks.answer', query, qraft_options={'priority': 'high'})
 async_task('myapp.tasks.reindex', qraft_options={'priority': 'low'})
 ```
 
-Without `broker_class`, high and low tasks are still enqueued into their lanes but a stock ORM broker never drains them. Set it on every cluster that consumes the queue.
+Without `broker_class` there are no lanes to enqueue into: `broker_for_cluster()` declines an unavailable lane and the task goes to the default queue. Set it on every cluster that consumes the queue.
 
-Current limitation: scheduled retries go through the default path and are not re-routed by priority.
+A scheduled retry keeps its task's priority: the dispatcher rebuilds the lane from the task's own priority and its target cluster.

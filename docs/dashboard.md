@@ -45,10 +45,10 @@ QRAFT_DASHBOARD = {"public": True}
   chip deep-links to the task bound to it and a failed node carries its
   exception class, so a node that failed before the subject existed — an
   ingest that never made the worksheet — is legible on the graph row rather
-  than nowhere. A failed graph carries a resume preview naming the nodes a
-  resume would re-run, so the button is a decision rather than a guess. Like
-  the task ids above, a link degrades to plain text when the admin is not
-  mounted.
+  than nowhere. A failed graph carries a resume button whose tooltip names the
+  nodes a resume would re-run and the ones it would keep, so the click is a
+  decision rather than a guess. Like the task ids above, a link degrades to
+  plain text when the admin is not mounted.
 - **Workflows** — chain/iter/batch cards with member chips, counters, subject,
   and a gated indicator for approval steps.
 - **Dead letters** — FAILED/EXHAUSTED tasks with a requeue button.
@@ -79,8 +79,9 @@ subject filter.
 ## Actions
 
 All actions are POST, CSRF-protected, and staff-gated like everything else.
-Unknown ids answer 404; invalid states (e.g. requeueing a live task,
-approving a chain that is not parked) answer 409 without side effects.
+An unknown graph or task answers 404; every other refusal — an unknown node
+key, requeueing a live task, approving a chain that is not parked — answers
+409 without side effects.
 
 - Requeue a dead letter (`qraft.dlq.requeue`)
 - Approve / reject a chain parked at `WAITING_APPROVAL`
@@ -88,8 +89,8 @@ approving a chain that is not parked) answer 409 without side effects.
   or reject on an already-cancelled workflow answers 200 with `"already": true`
 - Cancel a running graph (`qraft.graphs.cancel`). It does not revoke work
   already in flight: tasks finish and their outcomes are recorded on their node
-  rows, which no longer move the settled graph. Cancelling a terminal graph
-  answers 409
+  rows, which no longer move the settled graph. Cancelling a terminal graph, or
+  one parked at `WAITING_APPROVAL`, answers 409
 - Resume a failed graph (`qraft.graphs.resume`), which re-runs its failed nodes
   and everything downstream of them under a new generation
 - Skip a pending node of a running graph (`qraft.graphs.skip`)

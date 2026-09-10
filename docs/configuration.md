@@ -851,9 +851,14 @@ because `ORM.get_connection()` re-reads `Conf.ORM` on every call.
 Configuration is loaded in the following order (later sources override earlier):
 
 1. **Pydantic defaults** - Built-in defaults from `qraft/conf.py`
-2. **Django settings** - `QRAFT_CLUSTER` (or `Q_CLUSTER` as fallback)
-3. **Environment variables** - `Q_CLUSTER_NAME` selects ALT_CLUSTERS entry
-4. **Runtime overrides** - Via `get_conf()` function
+2. **Django settings** - `QRAFT_CLUSTER`
+3. **Environment variables** - `Q_CLUSTER_NAME` selects the ALT_CLUSTERS entry merged
+   over it
+
+`Q_CLUSTER` is not a fallback source. The one value read from it is an explicit
+`save_limit`, inherited as `retention_max_tasks` when no retention key is set.
+`get_conf()` is an accessor, not an override layer: it returns the settings cached for
+the current `Q_CLUSTER_NAME`.
 
 ### Implementation
 
@@ -1039,10 +1044,10 @@ INSTALLED_APPS = [
 **Check setting name:**
 
 ```python
-# Correct
+# Qraft reads this
 QRAFT_CLUSTER = {...}
 
-# Wrong (but works with warning)
+# Django-Q2's own settings. Qraft reads only an explicit save_limit from it
 Q_CLUSTER = {...}
 ```
 
