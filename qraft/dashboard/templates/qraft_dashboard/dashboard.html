@@ -281,14 +281,20 @@ function renderState(state) {
   const graphs = state.graphs || [];
   $("graph-count").textContent = graphs.length;
   $("graphs").innerHTML = graphs.map((graph) => {
-    const actions = graph.can_cancel
-      ? `<button data-graph-cancel="${esc(graph.id)}">cancel</button>` : "";
+    const preview = graph.resume_preview
+      ? `re-runs ${graph.resume_preview.rerun.join(", ") || "nothing"} · keeps ${graph.resume_preview.kept.join(", ") || "nothing"}`
+      : "";
+    const actions = [
+      graph.can_cancel ? `<button data-graph-cancel="${esc(graph.id)}">cancel</button>` : "",
+      graph.can_resume ? `<button data-graph-resume="${esc(graph.id)}" title="${esc(preview)}">resume</button>` : "",
+    ].join("");
     return `<div class="wf">
       <div class="wf-head"><span class="kind">${esc(graph.kind || "graph")}</span>
         <span class="faint">${esc(graph.short)}</span>${chip(graph.status)}
         <span class="faint">g${esc(graph.generation)}</span>
         ${graph.subject_type ? `<span class="faint" title="subject">${esc(graph.subject_type)}:${esc(graph.subject_id)}</span>` : ""}
         ${graph.overdue ? `<span class="overdue" title="running past QRAFT_GRAPH_OVERDUE_AFTER">⚠ overdue</span>` : ""}
+        ${graph.revision ? `<span class="faint" title="revision">${esc(graph.revision)}</span>` : ""}
         ${graph.previous_graph ? `<span class="faint" title="reruns ${esc(graph.previous_graph_id)}">↩ ${esc(graph.previous_graph)}</span>` : ""}
         <span class="spacer"></span>${actions}
         <span class="muted">${graph.elapsed}s</span></div>
@@ -305,6 +311,7 @@ function renderState(state) {
     </div>`;
   }).join("") || `<div class="empty">none</div>`;
   wire("[data-graph-cancel]", (id) => post(`graphs/${id}/cancel/`));
+  wire("[data-graph-resume]", (id) => post(`graphs/${id}/resume/`));
   wire("[data-graph-skip]", (pair) => {
     const [id, key] = pair.split(":");
     return post(`graphs/${id}/nodes/${encodeURIComponent(key)}/skip/`);
@@ -379,8 +386,10 @@ function wire(selector, action) {
   document.querySelectorAll(selector).forEach((button) => {
     button.onclick = async () => {
       button.disabled = true;
-      await action(button.dataset.approve || button.dataset.reject ||
-                   button.dataset.cancel || button.dataset.requeue);
+      // Each action button carries exactly one data-* attribute, and its value
+      // is the id the endpoint needs. Naming them one by one silently passed
+      // undefined for every attribute the list had not been taught.
+      await action(Object.values(button.dataset)[0]);
       pollState();
       pollMetrics();
     };
