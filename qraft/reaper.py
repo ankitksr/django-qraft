@@ -27,6 +27,7 @@ from .retry import handle_task_retry
 
 logger = logging.getLogger("qraft")
 
+
 def _heartbeat_grace(heartbeat_interval: float) -> float:
     """Seconds a heartbeat may go unrefreshed before the worker counts as dead."""
     return max(3 * heartbeat_interval, get_conf().min_heartbeat_grace)
