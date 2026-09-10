@@ -376,7 +376,7 @@ def state(request):
             "now": now.isoformat(),
             "counts": counts,
             "queued": OrmQ.objects.count(),
-            # Qraft-owned SCHEDULED attempts plus any legacy pre-2.0 Schedules.
+            # Qraft-owned SCHEDULED attempts plus any legacy pre-1.3 Schedules.
             "scheduled": QraftTaskAttempt.objects.filter(
                 state=QraftTaskAttempt.AttemptState.SCHEDULED
             ).count()
