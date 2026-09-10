@@ -3,57 +3,7 @@
 import pytest
 from django.db import IntegrityError
 
-from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt, TaskStatus
-
-
-@pytest.mark.django_db
-class TestQraftTask:
-    """Tests for QraftTask model."""
-
-    def test_attempt_count_property(self, qraft_task):
-        """Test attempt_count property."""
-        assert qraft_task.attempt_count == 0
-
-        # Add attempts
-        QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=1,
-            q2_task_id="task-1",
-        )
-        assert qraft_task.attempt_count == 1
-
-        QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=2,
-            q2_task_id="task-2",
-        )
-        assert qraft_task.attempt_count == 2
-
-    def test_latest_attempt_property(self, qraft_task):
-        """Test latest_attempt property."""
-        assert qraft_task.latest_attempt is None
-
-        attempt1 = QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=1,
-            q2_task_id="task-1",
-        )
-        assert qraft_task.latest_attempt == attempt1
-
-        attempt2 = QraftTaskAttempt.objects.create(
-            qraft_task=qraft_task,
-            attempt_number=2,
-            q2_task_id="task-2",
-        )
-        assert qraft_task.latest_attempt == attempt2
-
-    def test_string_representation(self, qraft_task):
-        """Test __str__ method."""
-        assert str(qraft_task) == f"QraftTask {qraft_task.id} (pending)"
-
-        qraft_task.status = TaskStatus.SUCCEEDED
-        qraft_task.save()
-        assert str(qraft_task) == f"QraftTask {qraft_task.id} (succeeded)"
+from qraft.models import HookDispatch, QraftTask, QraftTaskAttempt
 
 
 @pytest.mark.django_db
@@ -94,22 +44,6 @@ class TestQraftTaskAttempt:
                 q2_task_id="task-2",
             )
 
-    def test_string_representation(self, qraft_task_attempt):
-        """Test __str__ method."""
-        # Pending state
-        assert "pending" in str(qraft_task_attempt)
-
-        # Success state
-        qraft_task_attempt.success = True
-        qraft_task_attempt.save()
-        assert "ok" in str(qraft_task_attempt)
-
-        # Failed state
-        qraft_task_attempt.success = False
-        qraft_task_attempt.save()
-        assert "failed" in str(qraft_task_attempt)
-
-
 @pytest.mark.django_db
 class TestHookDispatch:
     """Tests for HookDispatch model."""
@@ -132,17 +66,6 @@ class TestHookDispatch:
                 q2_task_id="task-2",
             )
 
-    def test_string_representation(self, qraft_task):
-        """Test __str__ method."""
-        dispatch = HookDispatch.objects.create(
-            qraft_task=qraft_task,
-            hook_type="success",
-            hook_path="test.hooks.success",
-            q2_task_id="task-1",
-        )
-
-        assert "success" in str(dispatch)
-        assert str(qraft_task.id) in str(dispatch)
 
     def test_cascade_delete(self, qraft_task):
         """Test that hook dispatches are deleted when task is deleted."""

@@ -44,26 +44,19 @@ class TestRetryDefaultsSettings:
         assert retry_defaults.jitter is False
         assert retry_defaults.jitter_max == 0.5
 
-    def test_validation_max_attempts(self):
-        """Test validation of max_attempts."""
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("max_attempts", 0),
+            ("max_attempts", 11),
+            ("delay", -1.0),
+            ("jitter_max", -0.1),
+            ("jitter_max", 1.5),
+        ],
+    )
+    def test_the_declared_bounds_are_enforced(self, field, value):
         with pytest.raises(ValidationError):
-            RetryDefaultsSettings(max_attempts=0)
-
-        with pytest.raises(ValidationError):
-            RetryDefaultsSettings(max_attempts=11)
-
-    def test_validation_delay(self):
-        """Test validation of delay."""
-        with pytest.raises(ValidationError):
-            RetryDefaultsSettings(delay=-1.0)
-
-    def test_validation_jitter_max(self):
-        """Test validation of jitter_max."""
-        with pytest.raises(ValidationError):
-            RetryDefaultsSettings(jitter_max=-0.1)
-
-        with pytest.raises(ValidationError):
-            RetryDefaultsSettings(jitter_max=1.5)
+            RetryDefaultsSettings(**{field: value})
 
 
 class TestQraftSettings:
@@ -101,24 +94,15 @@ class TestQraftSettings:
         assert settings.retry_defaults.max_attempts == 3
         assert settings.retry_defaults.delay == 30.0
 
+    @pytest.mark.parametrize(
+        "cluster",
+        [{"threads": 0}, {"max_inflight": 0}, {"grace_period": -1.0}],
+    )
     @patch("qraft.conf.django_settings")
-    def test_validation_threads(self, mock_django_settings):
-        """Test validation of threads."""
-        mock_django_settings.QRAFT_CLUSTER = {"threads": 0}
-        with pytest.raises(ValidationError):
-            QraftSettings()
-
-    @patch("qraft.conf.django_settings")
-    def test_validation_max_inflight(self, mock_django_settings):
-        """Test validation of max_inflight."""
-        mock_django_settings.QRAFT_CLUSTER = {"max_inflight": 0}
-        with pytest.raises(ValidationError):
-            QraftSettings()
-
-    @patch("qraft.conf.django_settings")
-    def test_validation_grace_period(self, mock_django_settings):
-        """Test validation of grace_period."""
-        mock_django_settings.QRAFT_CLUSTER = {"grace_period": -1.0}
+    def test_a_setting_outside_its_bound_refuses_to_load(
+        self, mock_django_settings, cluster
+    ):
+        mock_django_settings.QRAFT_CLUSTER = cluster
         with pytest.raises(ValidationError):
             QraftSettings()
 
