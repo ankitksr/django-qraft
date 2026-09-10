@@ -29,12 +29,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_settled` again. Refused while the graph is running -- the reason settlement waits for
   quiescence -- and on a cancelled graph. A succeeded graph must name its nodes explicitly.
   The dashboard carries the preview on the resume button
-- **Execution graphs (phase 1).** `QraftRun` / `QraftRunStage` evolve into `QraftGraph` /
-  `QraftGraphNode` with explicit `after` edges, scheduler-owned dispatch,
-  quiescent settlement, per-node hooks, `qraft.context.current_node()`,
-  `graphs.snapshot()`, dashboard cancel/skip, and signal/metric renames to
-  `graph_settled`, `node_settled`, and `qraft.graph.*` / `qraft.node.*`. Migration
-  `0016_graphs`. No resume yet (`generation` and `recovery` columns exist for phase 2/3).
+- **Execution graphs.** A graph is one execution of a plan over a subject:
+  `graphs.Graph(...)` declares nodes with explicit `after` edges, `start()` writes the
+  whole plan in one transaction, and Qraft dispatches every node whose dependencies are
+  met through a scheduled attempt. The graph settles once, on quiescence, under a
+  `settled_at` compare-and-swap, with a durable `on_settled` hook, a `summary` snapshot
+  and `previous_graph` lineage. Per-node cluster, retry policy, `stall_after` and
+  success/failure hooks; `qraft.context.current_node()` for correlation from inside a
+  node; `graphs.snapshot()` as the visibility contract. `graphs.skip()` and
+  `graphs.cancel()` are the explicit transitions, and every edge rule — an unknown
+  dependency, a self-edge, a cycle, a duplicate key, a terminal graph — raises at
+  `start()`. Members inherit `graph` and `node` for correlation and never settle a node.
+  New `graph_settled`, `node_settled` and `graph_overdue` signals, `qraft.graph.*` /
+  `qraft.node.*` metrics, an overdue sweep behind `QRAFT_GRAPH_OVERDUE_AFTER`, a
+  dashboard graph panel, and a read-only `QraftGraphAdmin`. Migrations `0016`-`0018`
+
+  A graph may `start()` without a subject and name it later with
+  `graphs.bind_subject()`, which updates the graph and every member already bound to it
+  under the graph's row lock — for a pipeline whose first node creates the domain object
+  the graph is about. `graphs.Graph(..., budgets={"openai_requests": 40})` declares a
+  provider allowance that `qraft.context.consume_budget()` spends atomically across every
+  node and every retry, which is the question a refilling token bucket cannot answer
+
 - **A finished task stops heartbeating, and says when it finished.**
   `qraft.runner.run_task` stamps the new `QraftTaskAttempt.returned_at` and stops the
   lease heartbeat as soon as the target returns or raises, rather than at the monitor's
@@ -44,26 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Such an attempt is now reaped as `ResultLost` rather than `OrphanedTask`: the work
   ran and a retry re-does it, which a retry policy may treat differently. New migration
   `0015`
-- **Late subject bind on runs.** `runs.start()` may omit the subject, and
-  `runs.bind_subject(run_id, subject)` (also `QraftRun.bind_subject(type, id)`) names it
-  once afterwards, while the run is OPEN and the subject is unset. It updates the run and
-  every member already bound to it — tasks, chains, iters and batches — in one transaction
-  under the run's row lock, which is the lock a member insert now also takes, so a member
-  created concurrently either lands before the bind or reads the bound subject. The
-  pipeline this exists for is one whose first stage creates the domain object the run is
-  about; before this such a run had to key on whatever row existed beforehand, splitting
-  one worksheet across two subject types and halving the dashboard's subject filter
-- **Request budgets for metered stages.** `runs.start(..., budgets={"openai_requests":
-  40})` declares an allowance and `qraft.context.consume_budget(key, n=1)` spends it
-  atomically — one guarded `UPDATE ... RETURNING` on Postgres, a locked read-modify-write
-  elsewhere — raising `BudgetExhausted` rather than letting the balance go below zero.
-  `remaining_budget(key)` reads without spending. It answers what a token bucket cannot:
-  a bucket refills, so it bounds how fast a fleet may call a provider, not how much one
-  pipeline may spend across every stage and every retry. A key the run does not declare is
-  unmetered. New `QraftRun.budgets` JSON column
-- **Stage links on the dashboard run rows.** A bound stage's chip deep-links to the task or
-  workflow that owns it, and a failed task stage carries its exception class on the chip.
-  A stage that failed before its subject existed shows up nowhere but the run
 - **Redelivery guard: an attempt executes at most once.** Django-Q2 redelivers a message
   it never got an acknowledgement for, so a monitor crash re-ran a task whose attempt row
   was still unresolved, and each re-run refreshed the heartbeat so the reaper read it as
@@ -121,22 +117,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and while the hook handler would drop its reported result, nothing drops its database
   writes or its provider charges. `qraft.context.current_attempt_id()` is the supported
   way to act on the flag — put the attempt id in the same statement as the write
-- **Runs** (`qraft.runs`, `QraftRun`, `QraftRunStage`): one row spanning a pipeline whose
-  stages enqueue each other, which a chain models badly because a chain owns its steps
-  before execution. `runs.start(subject=..., stages=[...])` declares the stages; a task or
-  workflow enqueued with `run` and `stage` becomes that stage's one completion unit, at
-  enqueue for a task and at `run()` for a workflow. The run settles by derivation — a
-  failed or cancelled stage fails it, every stage succeeded or skipped succeeds it — under
-  a `settled_at` compare-and-swap, so it settles exactly once and is never mutated
-  afterwards; a rerun is a new run linked by `previous_run`. `runs.skip`, `runs.cancel`
-  and `runs.abandon` are the explicit transitions, and every edge rule (a terminal run, a
-  stage that already has a unit, a stage the run never declared, a subject that differs
-  from the run's) raises at the bind. Members inherit `run` and `stage` for correlation
-  and never settle a stage. New: a durable `on_settled` hook keyed `(run_id, "settled")`,
-  a `summary` snapshot written at settlement, `run_settled` and `run_overdue` signals,
-  `qraft.run.settled`/`duration`/`report_to_ready`/`open_age_max` metrics, an overdue
-  sweep behind `QRAFT_RUN_OVERDUE_AFTER`, a dashboard run panel with cancel and abandon,
-  and a read-only `QraftRunAdmin`
 - **Subjects.** `async_task(..., qraft_options={"subject": ("worksheet", 4117)})` records
   the domain entity a task is for as an indexed `(subject_type, subject_id)` string pair;
   workflow constructors take `subject=` and copy it onto every member. Retries inherit it.
@@ -152,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `progress_min_interval` coalesces writes from chunk-heavy tasks. New
   `areport_progress()` and `arecord_usage()` for coroutine tasks
 - **Signals** (`qraft/signals.py`): `task_started`, `attempt_finished`, `task_settled`,
-  `workflow_settled`, `attempt_stall_suspected`, `run_settled` and `run_overdue`. Every
+  `workflow_settled`, `attempt_stall_suspected`, `node_settled`, `graph_settled`
+  and `graph_overdue`. Every
   send is `send_robust()` from `transaction.on_commit` inside the transaction that
   performs the transition, and every payload is an immutable mapping of ids, outcomes and
   ISO timestamps rather than a model instance. Signals are best-effort observers; anything
@@ -162,7 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default `NullSink`). `qraft.metrics.otel.OpenTelemetrySink` records through
   `opentelemetry-api` only, installed by the new `django-qraft[otel]` extra; the host owns
   the SDK. Backlog gauges are emitted by the one cluster flagged `metrics_gauges=True`, so
-  a consumer cannot sum the same backlog once per replica. No subject id, run id, task id,
+  a consumer cannot sum the same backlog once per replica. No subject id, graph id, task id,
   revision or metadata is ever a label. A sink that raises is logged once a minute and
   counted in `api/state/`'s `metrics_health`, never disabled
 - **Enqueue time on the attempt** (`QraftTaskAttempt.enqueued_at`), so queue wait is
@@ -255,17 +236,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   received only the workflow id, type and outcome, while a completion's hook received the
   counts. How much had finished when the cancel landed is what the hook is for, so cancel
   and completion now build the same context
-- **Retention could delete a live run's evidence through the workflow pass.** Membership
-  of a run that has not settled was protected only in the task pass, but deleting an iter
-  or batch cascades to its member tasks, so a completed batch under an open run lost its
-  rows. Both passes now exclude open runs, terminal runs are pruned after their members
-  with their stages cascading, and the `summary` written at settlement is what survives
+- **Retention could delete a live graph's evidence through the workflow pass.** Membership
+  of a graph that has not settled was protected only in the task pass, but deleting an iter
+  or batch cascades to its member tasks, so a completed batch under a running graph lost its
+  rows. Both passes now exclude running graphs, terminal graphs are pruned after their members
+  with their nodes cascading, and the `summary` written at settlement is what survives
 - **Workflow settlement could fire hooks on an already terminal workflow.** A chain's
   final step never advances `current_step_index`, so a replayed completion passed the
   index check and re-entered the success path, and `_complete_chain` had no
   already-terminal check at all. Each workflow model now carries `settled_at` and
   settlement is one conditional update on it: the final-step replay, the already-terminal
-  completion, a `cancel()` racing a completion and a replay against a pre-1.4 row all
+  completion, a `cancel()` racing a completion and a replay against a row from before this release all
   match zero rows. `resume()` clears the column, so a resumed chain settles again as it
   should
 - **A redelivered message re-stamped the attempt start.** `stamp_start()` updated by
