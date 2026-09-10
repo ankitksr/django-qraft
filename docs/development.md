@@ -779,43 +779,30 @@ cat qraft/migrations/0003_new_migration.py
 
 ### Migration Guidelines
 
-1. **Test migrations both ways:**
+1. Generate the migration with `makemigrations`. Do not write a migration file by hand.
+2. Apply the migration forward:
 
    ```bash
-   # Forward
    python manage.py migrate qraft
-
-   # Backward
-   python manage.py migrate qraft 0002_previous_migration
    ```
 
-2. **Ensure backward compatibility:**
+3. Apply the migration backward to the previous one:
 
-   - Don't remove fields that existing tasks reference
-   - Use default values for new required fields
-   - Add migration for data transformation if needed
-
-3. **Document breaking changes:**
-
-   ```python
-   # migrations/0003_breaking_change.py
-   """
-   BREAKING CHANGE: Removes deprecated field `old_field`.
-
-   Before upgrading:
-   1. Ensure all tasks using `old_field` are completed
-   2. Run: python manage.py migrate_old_field_data
-   """
+   ```bash
+   python manage.py migrate qraft 0018_node_approval
    ```
+
+4. Make each new column nullable or give it a default. Use `db_default` if a Python
+   default does not apply to rows that the previous release writes.
+5. Do not remove a field that a released version reads.
+6. If the change is not backward compatible, write the procedure in the migration
+   docstring. Give the steps to do before the upgrade.
 
 ### Migration History
 
-See "Database Migrations" in `CLAUDE.md` for the annotated list of migrations.
-
-Generate a migration with `makemigrations`; never hand-author one. Every column
-added since 1.3.0 is nullable or defaulted (`db_default` where a Python default
-would not survive it), so a rolling deploy — where the previous release is
-still inserting rows on the old schema — keeps working.
+See "Database Migrations" in `CLAUDE.md` for the annotated list of migrations. Every
+column added since 1.3.0 is nullable or defaulted, so a rolling deploy — where the
+previous release is still inserting rows on the old schema — keeps working.
 
 ## Performance Testing
 

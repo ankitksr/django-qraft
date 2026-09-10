@@ -1,16 +1,15 @@
 # Workflow Primitives
 
-Django-Qraft provides three workflow primitives for orchestrating complex task patterns:
+Qraft has four ways to orchestrate more than one task. Three own their members up front:
 
-- **QraftChain** — Sequential execution (pipeline)
-- **QraftIter** — Parallel same-function execution (map)
-- **QraftBatch** — Parallel different-function execution (fork-join)
+- **QraftChain** — sequential execution (pipeline)
+- **QraftIter** — parallel same-function execution (map)
+- **QraftBatch** — parallel different-function execution (fork-join)
 
-All workflows support:
-- Workflow-level success/failure hooks
-- Cancellation
-- Progress tracking (parallel workflows)
-- Rich result objects
+Each takes workflow-level success and failure hooks, cancels as a unit, and returns a
+result object; the parallel two track progress. The fourth, an execution **graph**,
+declares a topology instead of a sequence and lets Qraft dispatch each node as its
+dependencies are met — see [Graphs](#graphs).
 
 ## QraftChain
 
