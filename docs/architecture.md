@@ -472,7 +472,7 @@ separate check that the node is still bound to it. The graph's own `settled_at` 
 whether the transition takes effect. Completion routing takes `select_for_update()` on
 the graph row, so a bind racing a completion and two nodes finishing at once each produce
 one decision rather than two; `cancel()` settles through the same compare-and-swap
-without taking that lock.
+without taking that lock, and reaches a graph parked at a gate as well as a running one.
 
 A graph settles on quiescence, not on first failure: while any node is running or ready
 to dispatch, the graph stays running, and only when nothing can advance does the outcome
@@ -480,13 +480,12 @@ derive from the node statuses — failed, then cancelled, then succeeded when ev
 succeeded or was skipped. A node parked at an approval gate moves the graph to
 `WAITING_APPROVAL`, which is not terminal.
 
-Retention protects the membership of a **running** graph in every pass. The workflow
+Retention protects the membership of a graph that has not settled, in every pass. The workflow
 pass matters as much as the task pass: deleting an iter or batch cascades to its member
 tasks, so a completed batch under a running graph would otherwise lose its rows through
-the workflow pass alone. Every other graph is pruned after its members once it falls
-outside the window, and the `summary` written at settlement is what makes that safe for a
-settled one. A graph parked at `WAITING_APPROVAL` is not running and not settled, and is
-currently pruned like a terminal one.
+the workflow pass alone. A graph parked at `WAITING_APPROVAL` is live for the same reason.
+Terminal graphs are pruned after their members, and the `summary` written at settlement is
+what makes that safe.
 
 ### Metrics
 

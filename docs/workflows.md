@@ -333,11 +333,10 @@ graphs.reject(graph_id, "publish", reason="numbers look wrong")
 
 Once its dependencies are met the node goes to `WAITING_APPROVAL` instead of dispatching.
 The gate stops that node and nothing else: siblings on the same frontier still run. The
-graph itself reads `WAITING_APPROVAL` once a node completes and leaves the graph with
-nothing running and nothing to dispatch — it is not settled and not failed, and the
-overdue sweep leaves it alone, because waiting on a person is not running late. A graph
-whose *root* nodes are all gated is still `RUNNING`, since nothing has completed to
-re-derive its status, and the overdue sweep can flag it.
+graph itself reads `WAITING_APPROVAL` whenever nothing is running and nothing can
+dispatch — including at `start()`, when every root is gated. It is not settled and not
+failed, the overdue sweep leaves it alone because waiting on a person is not running
+late, and retention leaves its members alone for the same reason.
 
 `approve()` dispatches the node under the graph's lock, so a cancel arriving afterwards
 finds either a parked node or a dispatched one and never the gap between them. `reject()`
@@ -351,10 +350,9 @@ Each is enforced where the mistake is cheap. All raise `graphs.GraphError`.
 1. `graphs.skip(graph_id, node_key, reason)` marks a `PENDING` node `SKIPPED`; skipping a
    running or settled node raises. Skipped dependencies unblock descendants the same way
    successful ones do.
-2. `graphs.cancel(graph_id)` settles a `RUNNING` graph `CANCELLED`. A second call
-   raises, and so does cancelling a graph parked at `WAITING_APPROVAL` — approve or
-   reject the gate first. Work already in flight is not revoked; nodes still record
-   their outcomes.
+2. `graphs.cancel(graph_id)` settles a live graph `CANCELLED`, whether it is running or
+   parked at a gate. A second call raises. Work already in flight is not revoked; nodes
+   still record their outcomes.
 3. Correlating work onto a terminal graph raises.
 4. A settled graph is mutated only by `resume()`, which clears its settlement and summary
    and re-runs nodes under a new generation. A changed plan is a new graph with
@@ -504,13 +502,13 @@ transaction — and settles once it is quiescent:
 ```
 RUNNING → SUCCEEDED                          (every node succeeded or skipped)
         → FAILED → RUNNING                   (resume, under a new generation)
-        → CANCELLED                          (graphs.cancel, RUNNING only)
+        → CANCELLED                          (graphs.cancel)
         → WAITING_APPROVAL → RUNNING         (approve dispatches the node)
                            → CANCELLED       (reject cancels the node; the graph
                                               settles CANCELLED on quiescence,
                                               or FAILED if a node had failed)
 ```
 
-`WAITING_APPROVAL` is not terminal and is not swept as overdue: the graph is waiting for a
-person. Its nodes move `PENDING → RUNNING → SUCCEEDED | FAILED`, with `SKIPPED` from
+`WAITING_APPROVAL` is not terminal. It is not swept as overdue and its members are not
+pruned: the graph is waiting for a person, not running late and not finished. Its nodes move `PENDING → RUNNING → SUCCEEDED | FAILED`, with `SKIPPED` from
 `graphs.skip()` and `WAITING_APPROVAL` for a gated node.

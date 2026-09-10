@@ -181,6 +181,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaustion, DLQ requeue, chain ordering, iter counting, and `threaded_worker`
 
 ### Fixed
+- **A graph waiting on a person could be pruned, and could not be cancelled.** Retention
+  protected only `RUNNING` graphs, so a graph parked at `WAITING_APPROVAL` — live, not
+  settled — was swept with its members, and `_settle` accepted only `RUNNING`, so
+  `graphs.cancel()` refused a parked graph and a sibling's failure could not settle one
+  either. Both now treat a parked graph as live. A graph whose roots are all gated also
+  parks at `start()` rather than sitting `RUNNING`, which is what kept the overdue sweep
+  flagging it for waiting
+- **The dashboard's graph buttons posted `graphs/undefined/`.** `wire()` read four named
+  dataset keys, so cancel and skip sent no id; the view tests call the endpoints directly,
+  which is why nothing caught it. It now reads the button's own attribute, and the graph
+  panel gained the resume button and revision it already had the data for
 - **A reaped task never fired its failure hook.** `reaper._reap_one` called
   `route_workflow_completion()` and discarded the answer, so a task with a `failure_hook`
   and no workflow — a task whose worker was OOM-killed, or whose result the monitor lost —

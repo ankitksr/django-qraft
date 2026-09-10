@@ -17,7 +17,8 @@ Two invariants shape what is safe to delete:
   member tasks are only pruned once their workflow is terminal (or gone).
 - Graph membership is protected in every pass, not just the task pass. Deleting
   an iter or batch cascades to its member tasks, so a completed batch under a
-  running graph would lose its rows through the workflow pass alone. Terminal
+  live graph would lose its rows through the workflow pass alone. A graph that
+  has not settled is live whether it is running or parked at a gate. Terminal
   graphs are pruned after the task pass and their nodes cascade with them; the
   `summary` written at settlement is what makes that safe.
 
@@ -32,7 +33,7 @@ from django.utils import timezone
 
 from .conf import get_conf
 from .models import (
-    GraphStatus,
+    TERMINAL_GRAPH_STATUSES,
     QraftBatchModel,
     QraftChainModel,
     QraftGraph,
@@ -151,9 +152,9 @@ def _live_workflow_ids(model) -> list:
 
 
 def _open_graph_ids() -> list:
-    """Ids of graphs still running, whose members are evidence and must be kept."""
+    """Ids of graphs that have not settled, whose members are evidence."""
     return list(
-        QraftGraph.objects.filter(status=GraphStatus.RUNNING).values_list(
+        QraftGraph.objects.exclude(status__in=TERMINAL_GRAPH_STATUSES).values_list(
             "id", flat=True
         )
     )
@@ -237,7 +238,7 @@ def sweep_retention(
         deleted["QraftTask"] = count
 
     count = _delete_in_batches(
-        QraftGraph.objects.exclude(status=GraphStatus.RUNNING)
+        QraftGraph.objects.filter(status__in=TERMINAL_GRAPH_STATUSES)
         .filter(date_updated__lt=cutoff)
         .exclude(qrafttask_members__status__in=live_member),
         batch_size,

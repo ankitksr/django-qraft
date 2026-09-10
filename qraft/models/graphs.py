@@ -10,7 +10,12 @@ from .mixins import SubjectMixin
 
 
 class GraphStatus(models.TextChoices):
-    """Where a graph sits. Everything but RUNNING is terminal and never mutated."""
+    """
+    Where a graph sits.
+
+    RUNNING and WAITING_APPROVAL are live; the other three are terminal, and a
+    terminal graph is mutated only by `graphs.resume()`.
+    """
 
     RUNNING = "running", "Running"
     SUCCEEDED = "succeeded", "Succeeded"

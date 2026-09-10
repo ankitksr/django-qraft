@@ -87,10 +87,10 @@ key, requeueing a live task, approving a chain that is not parked — answers
 - Approve / reject a chain parked at `WAITING_APPROVAL`
 - Cancel a chain, iter, or batch (`BaseWorkflow.cancel`); repeating a cancel
   or reject on an already-cancelled workflow answers 200 with `"already": true`
-- Cancel a running graph (`qraft.graphs.cancel`). It does not revoke work
+- Cancel a live graph (`qraft.graphs.cancel`). It does not revoke work
   already in flight: tasks finish and their outcomes are recorded on their node
-  rows, which no longer move the settled graph. Cancelling a terminal graph, or
-  one parked at `WAITING_APPROVAL`, answers 409
+  rows, which no longer move the settled graph. A graph parked at a gate can be
+  cancelled too; cancelling a terminal graph answers 409
 - Resume a failed graph (`qraft.graphs.resume`), which re-runs its failed nodes
   and everything downstream of them under a new generation
 - Skip a pending node of a running graph (`qraft.graphs.skip`)

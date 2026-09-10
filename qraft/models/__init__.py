@@ -3,6 +3,7 @@
 # Task models
 # Hook tracking models
 from .graphs import (
+    TERMINAL_GRAPH_STATUSES,
     GraphStatus,
     NodeStatus,
     QraftGraph,
@@ -49,6 +50,7 @@ __all__ = [
     "GraphStatus",
     "NodeStatus",
     "RecoveryMode",
+    "TERMINAL_GRAPH_STATUSES",
     # Workflows
     "QraftChainModel",
     "QraftChainStep",

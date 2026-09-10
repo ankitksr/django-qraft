@@ -335,8 +335,8 @@ than the threshold: `overdue_flagged_at` is set once by compare-and-swap, the
 `graph_overdue` signal fires, and the dashboard shows a badge. Nothing is failed
 automatically — `graphs.skip` and `graphs.cancel` are the tools for deciding what a
 stuck graph deserves. `qraft.graph.open_age_max` reports the oldest running graph per
-subject type. A graph parked at an approval gate is not swept: it is waiting for a
-person, not overdue.
+subject type. A graph parked at an approval gate reads `WAITING_APPROVAL`, not
+`RUNNING`, so it is never swept: it is waiting for a person, not overdue.
 
 ### Pricing
 

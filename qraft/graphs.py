@@ -188,6 +188,10 @@ class Graph:
                 )
             QraftGraphNode.objects.bulk_create(node_rows)
             _dispatch_frontier(graph.id)
+            # A graph whose every root is gated has nothing running and nothing
+            # to dispatch. Without this it would sit RUNNING until someone
+            # approved, and the overdue sweep would flag it for waiting.
+            _maybe_settle(graph, timezone.now())
 
         _logger.debug(
             "Started QraftGraph %s for %s:%s with %d nodes",
@@ -847,7 +851,11 @@ def _maybe_settle(graph: QraftGraph, now):
 def _settle(graph: QraftGraph, status: str, now):
     summary = build_summary(graph, status, now)
     settled = QraftGraph.objects.filter(
-        pk=graph.pk, settled_at__isnull=True, status=GraphStatus.RUNNING
+        pk=graph.pk,
+        settled_at__isnull=True,
+        # A graph parked at a gate is live, not terminal: a cancel must reach
+        # it, and a sibling failing while it waits must still settle it.
+        status__in=(GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL),
     ).update(status=status, settled_at=now, summary=summary, date_updated=now)
     if not settled:
         return None
