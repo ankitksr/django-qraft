@@ -189,9 +189,9 @@ graph_id = builder.start()
 node. Each dispatch creates a `QraftTask`, binds it to the node row, and enqueues the
 first attempt through `scheduler.schedule_attempt()` — the same path retries use.
 
-Every node must declare `recovery` (`transactional`, `idempotent`, or `manual`). The
-column exists for phase-2 resume; today it is recorded on the node and surfaced in
-`snapshot()`.
+Every node must declare `recovery` (`transactional`, `idempotent`, or `manual`). Qraft
+records it and shows it in `snapshot()` and the admin; nothing enforces it. It is a
+declaration to the operator deciding a resume, not a switch.
 
 `start()` returns the graph id. A graph implies its subject: correlated work that names
 the graph and no subject inherits it, and one that names a different subject raises.
@@ -299,6 +299,11 @@ exists to avoid.
 Outside a graph node the block is an ordinary transaction that records nothing, so the
 same function is callable from a plain task.
 
+**Reading a receipt back.** `snapshot(graph_id)` carries each node's `receipt`, which is
+what makes a resume decision legible — the kept nodes say what they produced. From the
+ORM it is `QraftGraphNode.receipt` with `receipt_attempt_id` naming the attempt that wrote
+it; both are cleared when the node is re-run.
+
 **Publication authority.** The block locks the node row and refuses an attempt the node is
 no longer bound to. A straggler from before a resume therefore fails at the boundary
 rather than writing behind the resume's back, and a node can publish only once per
@@ -376,9 +381,9 @@ mode. It is the visibility contract for dashboards and consumers.
 `budgets` on the builder declares request allowances; `qraft.context.consume_budget(key)`
 spends them atomically.
 
-`QRAFT_GRAPH_OVERDUE_AFTER` (seconds, default None; falls back to `QRAFT_RUN_OVERDUE_AFTER`)
-turns on a reaper sweep: a `RUNNING` graph older than the threshold gets
-`overdue_flagged_at` set once and `graph_overdue` is sent. Nothing fails automatically —
+`QRAFT_GRAPH_OVERDUE_AFTER` (seconds, default None) turns on a reaper sweep: a `RUNNING`
+graph older than the threshold gets `overdue_flagged_at` set once and `graph_overdue` is
+sent. A graph parked at an approval gate is not swept. Nothing fails automatically —
 `skip` and `cancel` are the tools for it.
 
 At settlement the graph writes a `summary`: per-node task id, outcome, dispatch and settle
@@ -419,8 +424,8 @@ Each workflow model therefore carries `settled_at`, and settlement is one condit
 update on it. `workflow_settled` and the workflow hook fire only when that update matched
 a row; `resume()` clears the column in the same transaction that moves the chain back to
 RUNNING, so the next settlement is a genuinely new one and fires again. A workflow that
-settled before 1.4.0 has a terminal status with a null `settled_at`, and the update
-excludes terminal statuses, so a replay against an old row sends nothing.
+settled before the column existed has a terminal status with a null `settled_at`, and the
+update excludes terminal statuses, so a replay against such a row sends nothing.
 
 Resuming also starts a new *generation*, which two more rules follow. The chain's
 `WorkflowHookDispatch` rows are cleared with `settled_at`, so the next settlement's hook
@@ -468,7 +473,15 @@ All three workflow models carry `subject_type`, `subject_id`, `graph`, `node` an
 `settled_at`; `QraftTask` carries the same four correlation columns. `graph` is `SET_NULL`
 on both: deleting a graph must never delete work.
 
+Two managers filter by subject and their signatures differ:
+`QraftTask.objects.for_subject('worksheet', 4117)` takes the pair as two arguments, while
+`QraftGraph.objects.for_subject(('worksheet', 4117))` takes the tuple Qraft passes around
+elsewhere. `graphs.get(graph_id)` fetches one graph and raises `GraphError` for an unknown
+id.
+
 ## Status Lifecycle
+
+Chain, iter and batch:
 
 ```
 PENDING → RUNNING → SUCCEEDED
@@ -477,3 +490,20 @@ PENDING → RUNNING → SUCCEEDED
                                      → CANCELLED (reject)
          → CANCELLED (from PENDING or RUNNING)
 ```
+
+A graph starts RUNNING — `start()` writes the plan and dispatches the roots in one
+transaction — and settles once it is quiescent:
+
+```
+RUNNING → SUCCEEDED                          (every node succeeded or skipped)
+        → FAILED → RUNNING                   (resume, under a new generation)
+        → CANCELLED                          (graphs.cancel)
+        → WAITING_APPROVAL → RUNNING         (approve dispatches the node)
+                           → CANCELLED       (reject cancels the node; the graph
+                                              settles CANCELLED on quiescence,
+                                              or FAILED if a node had failed)
+```
+
+`WAITING_APPROVAL` is not terminal and is not swept as overdue: the graph is waiting for a
+person. Its nodes move `PENDING → RUNNING → SUCCEEDED | FAILED`, with `SKIPPED` from
+`graphs.skip()` and `WAITING_APPROVAL` for a gated node.

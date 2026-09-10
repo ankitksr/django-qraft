@@ -1105,6 +1105,9 @@ def snapshot(graph_id) -> dict:
                     node.dispatched_at.isoformat() if node.dispatched_at else None
                 ),
                 "settled_at": node.settled_at.isoformat() if node.settled_at else None,
+                # A resume decision is made against what the kept nodes already
+                # published, so the receipt travels with the node.
+                "receipt": node.receipt,
                 "attempts": attempts_out,
                 "usage": aggregate_usage(node.task) if node.task_id else {},
                 "blocked_by": blocked,

@@ -1,6 +1,6 @@
 # Django-Qraft Tests
 
-Comprehensive unit test suite for django-qraft using modern Python testing practices.
+The django-qraft test suite: pytest, in-memory SQLite by default, Postgres for the row-lock races.
 
 ## Quick Start
 
@@ -59,8 +59,8 @@ tests/
 ├── test_conf.py                  # Settings and ALT_CLUSTERS
 ├── test_dashboard.py             # Bundled monitoring dashboard
 │
-│   # Runs and observability
-├── test_runs.py                  # Binding rules, derived settlement, replay paths
+│   # Graphs and observability
+├── test_graphs.py                # Topology, dispatch, settlement, resume, receipts, gates
 ├── test_signals.py               # Send sites, id payloads, send_robust isolation
 ├── test_metrics.py               # Emission points, label sets, gauge ownership
 ├── test_logging.py               # QraftContextFilter inside and outside a task
@@ -68,8 +68,6 @@ tests/
 │
 │   # Whole-path tests
 ├── test_e2e.py                   # Real broker + worker + monitor, nothing stubbed
-├── test_integration.py           # Cross-cutting flows with the enqueue seam mocked
-├── test_workflow_integration.py  # Workflow flows (integration marker)
 └── test_postgres_concurrency.py  # Row-lock races; skipped unless run on Postgres
 ```
 
@@ -92,52 +90,6 @@ uv run pytest tests/test_models.py::TestQraftTask::test_create_minimal_task
 
 # Run tests matching a pattern
 uv run pytest -k "retry"
-```
-
-### Parallel Execution
-
-```bash
-# Run tests in parallel using all CPU cores
-uv run pytest -n auto
-
-# Run tests using 4 workers
-uv run pytest -n 4
-```
-
-### Coverage Reports
-
-```bash
-# Run tests with coverage
-uv run pytest --cov=qraft
-
-# Generate HTML coverage report
-uv run pytest --cov=qraft --cov-report=html
-
-# View coverage report
-open htmlcov/index.html
-```
-
-### Verbose Output
-
-```bash
-# Show detailed test output
-uv run pytest -v
-
-# Show even more detail (print statements, etc.)
-uv run pytest -vv -s
-```
-
-### Debugging
-
-```bash
-# Stop on first failure
-uv run pytest -x
-
-# Drop into debugger on failure
-uv run pytest --pdb
-
-# Show local variables in tracebacks
-uv run pytest -l
 ```
 
 ## Test Organization
@@ -180,7 +132,6 @@ Tests for workflow primitives:
 - **QraftChain**: sequential execution, resume from failed step, chain-level hooks
 - **QraftIter**: parallel fan-out, atomic counters, completion detection
 - **QraftBatch**: fork-join, per-task retry policies, `add()` deprecation shim
-- `test_workflow_integration.py` covers end-to-end flows (marked `integration`)
 
 ### Configuration Tests (`test_conf.py`)
 
@@ -195,14 +146,15 @@ Tests for settings management:
 `test_signals.py` asserts each send site fires once with an immutable id-only payload,
 that a raising receiver is isolated by `send_robust`, and that a replayed transition sends
 nothing. `test_metrics.py` drives a `RecordingSink` through every emission point and
-asserts no label is ever a subject, run, task or attempt id. `test_logging.py` covers the
+asserts no label is ever a subject, graph, task or attempt id. `test_logging.py` covers the
 filter's attributes inside and outside a task.
 
-`test_runs.py` covers the run surface: the nine edge rules, settlement on a success, on a
-failed unit, with a skipped stage and with a workflow unit, `cancel` and `abandon`,
-`on_settled` dispatched once, the summary's contents, the overdue sweep, the late subject
-bind, and the three replay paths a settlement can arrive through twice
-(`replay_unrouted`, a duplicate completion delivery, a replayed workflow settlement).
+`test_graphs.py` covers the graph surface: the topology rules refused at `start()`,
+frontier dispatch, settlement on quiescence for each outcome, `skip` and `cancel`, a
+superseded generation's completion being dropped, `on_settled` dispatched once and its
+replay, the summary's contents, the overdue sweep, the late subject bind, request-key
+idempotency, `current_node()`, selective resume with its preview, published receipts
+surviving a lost result, and approval gates.
 
 `test_brokers.py` covers both jobs of that module: the priority lanes, and the per-cluster
 resolver — each broker key selecting its class in django_q's own order, the cache and its
@@ -253,16 +205,6 @@ Common fixtures available in all tests (defined in `conftest.py`):
 - `mock_q2_task_failure`: Mock failed Django-Q2 task
 - `retry_policy`: Test RetryPolicy instance
 
-## Testing Philosophy
-
-### Modern Practices
-
-1. **pytest over unittest**: We use pytest for better readability and powerful fixtures
-2. **Fixtures over setUp/tearDown**: Composable dependency injection
-3. **Minimal mocking**: Test real behavior; mock only external dependencies
-4. **Fast tests**: In-memory SQLite database, optimized for speed
-5. **Isolated tests**: Each test is independent and can run in any order
-
 ### Database Testing
 
 All database tests use `@pytest.mark.django_db`:
@@ -290,10 +232,12 @@ the locking behaviour of a change to those files.
 
 Set `QRAFT_TEST_DATABASE_URL` and the whole suite runs against Postgres instead of
 in-memory SQLite. The `postgres` marker selects the cases that need real row locks — a duplicate completion
-delivery racing the live handler, concurrent progress reports, two run stages settling at
-once, a stage bind racing a run cancel, a stall flag racing a progress advance, two
-deliveries of one attempt, a member insert racing `bind_subject`, and two workers spending
-the last of a budget — they are skipped automatically on SQLite, so `uv run pytest` never fails for want of a server.
+delivery racing the live handler, concurrent progress reports, two nodes settling a graph
+at once, a stall flag racing a progress advance, two deliveries of one attempt, a member
+insert racing `bind_subject`, two workers spending the last of a budget, a resume outside
+a transaction, a chain advance race, a parallel counter race and a throttle race — they
+are skipped automatically on SQLite, so `uv run pytest` never fails for want of a
+server.
 
 ```bash
 QRAFT_TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/qraft_test uv run pytest
@@ -342,37 +286,6 @@ These tests are designed to run in CI environments:
 # CI-friendly command
 uv run pytest --cov=qraft --cov-report=xml --cov-report=term -n auto
 ```
-
-## Contributing
-
-When adding new features:
-
-1. Write tests first (TDD approach recommended)
-2. Ensure all tests pass: `uv run pytest`
-3. Check coverage: `uv run pytest --cov=qraft`
-4. Run linter: `uv run ruff check qraft/`
-
-## Troubleshooting
-
-### Import Errors
-
-If you get import errors, ensure the package is installed:
-
-```bash
-uv pip install -e .
-```
-
-### Database Errors
-
-If you get database errors, try recreating the test database:
-
-```bash
-uv run pytest --create-db
-```
-
-### Fixture Not Found
-
-Ensure `conftest.py` is in the tests directory and pytest can discover it.
 
 ## Resources
 
