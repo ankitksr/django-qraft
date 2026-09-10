@@ -134,29 +134,34 @@ so an attempt that calls two models is not billed at one rate.
 
 [Learn more →](docs/ai-workloads.md)
 
-### 🔭 Subjects, Runs and Signals
-Every task can name the domain entity it is for, and a run gives a pipeline whose stages
-enqueue each other one row that spans them — with a durable completion hook and one number
+### 🔭 Subjects, Graphs and Signals
+Every task can name the domain entity it is for, and a graph declares a whole pipeline up
+front — nodes with explicit `after` edges, dispatched by Qraft as their dependencies are
+met, settling once when nothing can advance, with a durable completion hook and one number
 for end-to-end latency.
 
 ```python
-from qraft import runs
+from qraft import graphs
 
-run_id = runs.start(subject=('worksheet', 4117), stages=['ingest', 'rules', 'ai'],
-                    on_settled='revenue.hooks.worksheet_ready')
-
-async_task('revenue.tasks.ingest', 4117,
-           qraft_options={'run': run_id, 'stage': 'ingest'})
+builder = graphs.Graph(subject=('worksheet', 4117),
+                       on_settled='revenue.hooks.worksheet_ready')
+builder.node('ingest', 'revenue.tasks.ingest', 4117, recovery='transactional')
+builder.node('rules', 'revenue.tasks.rules_pass', 4117,
+             after=('ingest',), recovery='idempotent')
+graph_id = builder.start()
 
 QraftTask.objects.for_subject('worksheet', 4117)   # every task for one entity
 ```
 
-Qraft also emits signals about its own transitions (`task_settled`, `workflow_settled`,
-`run_settled`, …), all `send_robust` and all carrying ids rather than model instances, plus
-an optional OpenTelemetry metrics sink, a logging filter and W3C trace propagation across
-the enqueue boundary.
+A failed graph resumes selectively: `graphs.resume(graph_id)` re-runs the failed nodes and
+everything downstream, and `preview_resume()` says what that would be before you do it.
 
-[Learn more →](docs/workflows.md#runs)
+Qraft also emits signals about its own transitions (`task_settled`, `workflow_settled`,
+`graph_settled`, …), all `send_robust` and all carrying ids rather than model instances,
+plus an optional OpenTelemetry metrics sink, a logging filter and W3C trace propagation
+across the enqueue boundary.
+
+[Learn more →](docs/workflows.md#graphs)
 
 ### ⏱️ Exact-Delay Scheduling
 Delayed work (retries, requeues, `run_after` tasks) is a Qraft-owned row dispatched at its due time — a 2-second backoff fires in about 2 seconds, not on Django-Q2's 30-second scheduler cycle. Priority and target cluster survive the delay.
@@ -286,7 +291,7 @@ task_id = async_task(
 - [Dual-Phase Hooks](docs/hooks.md) - Success and failure hook system
 - [Retry Policies](docs/retry.md) - Backoff strategies and retry configuration
 - [Multithreaded Workers](docs/threading.md) - Concurrency for I/O-bound tasks
-- [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, approval steps, and runs
+- [Workflow Primitives](docs/workflows.md) - Chain, Iter, Batch, approval steps, and graphs
 - [AI Workloads](docs/ai-workloads.md) - Subjects, rate limits, throttling, usage and cost, idempotency, reaper, stall observation, priority lanes
 - [Monitoring Dashboard](docs/dashboard.md) - Bundled staff dashboard with live metrics and JSON endpoints
 - [django.tasks Backend](docs/django-tasks-backend.md) - Qraft as an engine for Django 6.0's Tasks API
@@ -461,7 +466,7 @@ no speedup at all for CPU-bound tasks, because of Python's GIL.
 
 ## Testing
 
-Django-Qraft has a comprehensive test suite at 85% line coverage, with CI gated at 72%. `qraft/admin.py` is excluded and verified manually via the demo app, and `qraft/backend.py` only reports coverage on Django 6.0+, where its tests run. `tests/test_e2e.py` runs the whole path — real broker, real worker, real hook handler — with nothing stubbed.
+Django-Qraft's test suite covers 85% of lines, with CI gated at 72%. `qraft/admin.py` is excluded and verified manually via the demo app, and `qraft/backend.py` only reports coverage on Django 6.0+, where its tests run. `tests/test_e2e.py` runs the whole path — real broker, real worker, real hook handler — with nothing stubbed.
 
 ```bash
 # Run all tests
@@ -516,9 +521,9 @@ Django-Qraft maintains full backward compatibility with Django-Q2:
 - [x] **v1.2.1**: Execution lease with heartbeat, dead letter queue, `TaskContext` and deferred tasks on the `django.tasks` backend
 - [x] **v1.3.0**: Qraft-owned scheduling (exact delays, priority-preserving retries), monitoring dashboard, retention sweep, cluster routing
 - [ ] **Unreleased** (on `main`, not yet tagged): observability — subjects, signals, a
-  metrics sink, log context and trace propagation; runs and stages with derived
-  settlement and request budgets; cost from usage; stall observation; per-cluster
-  brokers; the redelivery guard; coroutine tasks
+  metrics sink, log context and trace propagation; execution graphs with selective
+  resume, completion receipts and approval gates; cost from usage; stall observation;
+  per-cluster brokers; the redelivery guard; coroutine tasks
   ([details](docs/roadmap.md#shipped-after-130-unreleased))
 - [ ] Nested workflow support
 
