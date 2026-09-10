@@ -268,15 +268,17 @@ What is emitted:
 | `qraft.retry.scheduled` | counter | `func`, `exception_class` |
 | `qraft.reaper.action` | counter | `action` |
 | `qraft.workflow.settled` | counter | `workflow_type`, `outcome` |
-| `qraft.run.settled` | counter | `subject_type`, `kind`, `outcome` |
-| `qraft.run.duration` | histogram (s) | `subject_type`, `kind`, `outcome` |
-| `qraft.run.report_to_ready` | histogram (s) | `subject_type`, `kind` |
+| `qraft.graph.settled` | counter | `subject_type`, `kind`, `outcome` |
+| `qraft.graph.duration` | histogram (s) | `subject_type`, `kind`, `outcome` |
+| `qraft.graph.report_to_ready` | histogram (s) | `subject_type`, `kind` |
+| `qraft.node.settled` | counter | `kind`, `key`, `outcome` |
+| `qraft.node.duration` | histogram (s) | `kind`, `key`, `outcome` |
 | `qraft.queue.depth` | gauge | `cluster` |
 | `qraft.queue.oldest_ready_age` | gauge (s) | `cluster` |
 | `qraft.attempt.active` | gauge | `cluster` |
 | `qraft.scheduler.overdue` | gauge | |
 | `qraft.attempt.unrouted_age_max` | gauge (s) | |
-| `qraft.run.open_age_max` | gauge (s) | `subject_type` |
+| `qraft.graph.open_age_max` | gauge (s) | `subject_type` |
 
 `outcome` is `succeeded`, `failed` or `orphaned`, so a fleet whose failures are detected
 by the reaper does not look faster than one whose failures return. Pickup is recorded
@@ -284,7 +286,7 @@ when the attempt starts, not when it finishes: an attempt that is hung right now
 already in the pickup histogram, and its absence from the duration histogram is itself
 the signal.
 
-No subject id, run id, task id, revision or metadata is ever a label. Subject ids are
+No subject id, graph id, task id, generation, revision or metadata is ever a label. Subject ids are
 unbounded; metric cardinality is not. An operator who wants one worksheet's timeline uses
 the dashboard's subject filter, not a metric.
 
@@ -319,25 +321,26 @@ The two queue gauges read `OrmQ` rows, so they need the ORM broker. A gauge owne
 any other broker logs one warning at startup and emits the remaining gauges, which read
 Qraft's own tables.
 
-### Overdue runs
+### Overdue graphs
 
-`QRAFT_RUN_OVERDUE_AFTER` is a plain Django setting, not a `QRAFT_CLUSTER` key, because
+`QRAFT_GRAPH_OVERDUE_AFTER` is a plain Django setting, not a `QRAFT_CLUSTER` key, because
 it describes application work rather than cluster behaviour:
 
 ```python
-QRAFT_RUN_OVERDUE_AFTER = 3600   # seconds; None (the default) turns the sweep off
+QRAFT_GRAPH_OVERDUE_AFTER = 3600   # seconds; None (the default) turns the sweep off
 ```
 
-With it set, the reaper thread flags every `OPEN` run whose `date_started` is older than
-the threshold: `overdue_flagged_at` is set once by compare-and-swap, the `run_overdue`
-signal fires, and the dashboard shows a badge. Nothing is failed automatically — a stage
-that was never enqueued is an application defect, and `runs.skip`, `runs.cancel` and
-`runs.abandon` are the tools for deciding which it was. `qraft.run.open_age_max` reports
-the oldest open run per subject type.
+With it set, the reaper thread flags every `RUNNING` graph whose `date_started` is older
+than the threshold: `overdue_flagged_at` is set once by compare-and-swap, the
+`graph_overdue` signal fires, and the dashboard shows a badge. Nothing is failed
+automatically — `graphs.skip` and `graphs.cancel` are the tools for deciding what a
+stuck graph deserves. `qraft.graph.open_age_max` reports the oldest running graph per
+subject type. A graph parked at an approval gate is not swept: it is waiting for a
+person, not overdue.
 
 ### Pricing
 
-`QRAFT_PRICING` is a plain Django setting, like `QRAFT_RUN_OVERDUE_AFTER`, and turning
+`QRAFT_PRICING` is a plain Django setting, like `QRAFT_GRAPH_OVERDUE_AFTER`, and turning
 tokens into money is entirely optional:
 
 ```python
@@ -384,8 +387,9 @@ LOGGING = {
 ```
 
 The attributes are `qraft_task_id`, `qraft_attempt_id`, `qraft_attempt_number`,
-`qraft_run_id`, `qraft_stage`, `qraft_subject_type` and `qraft_subject_id`. Outside a
-task they are present and empty, so a format string that names them never raises.
+`qraft_graph_id`, `qraft_node_key`, `qraft_generation`, `qraft_subject_type` and
+`qraft_subject_id`. Outside a task they are present and empty, so a format string that
+names them never raises.
 
 ### Trace propagation
 
@@ -430,7 +434,7 @@ QRAFT_CLUSTER = {
 
 Django-Q2 redelivers a message it never got an acknowledgement for, so a monitor crash
 used to re-run a task whose attempt row was still unresolved — and each re-run refreshed
-the heartbeat, so the reaper read it as alive and the run stayed open until somebody
+the heartbeat, so the reaper read it as alive and the graph stayed running until somebody
 cancelled it by hand.
 
 Every attempt Qraft enqueues runs through `qraft.runner.run_task`, which claims the

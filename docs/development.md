@@ -87,7 +87,7 @@ django-qraft/
 │   ├── chain.py                 # QraftChain wrapper for sequential workflows
 │   ├── cluster.py               # QraftCluster and QraftSentinel (Django-Q2 extensions)
 │   ├── conf.py                  # Pydantic settings with DjangoSettingsSource + ALT_CLUSTERS support
-│   ├── context.py                # Per-attempt progress/cost reporting, run request budgets
+│   ├── context.py                # Per-attempt progress/cost reporting, graph request budgets
 │   ├── dashboard/                 # Staff-only monitoring UI and JSON metrics endpoints
 │   │   ├── apps.py
 │   │   ├── metrics.py            # Bounded metric queries for the dashboard
@@ -96,6 +96,7 @@ django-qraft/
 │   │   └── views.py
 │   ├── dispatchers.py             # ChainDispatcher and ParallelDispatcher
 │   ├── dlq.py                      # Dead-letter listing and requeue onto the same attempt series
+│   ├── graphs.py                    # Graph plan, dispatch, settlement, resume, receipts and gates
 │   ├── hooks.py                     # Global hook handler with workflow detection and routing
 │   ├── iter.py                      # QraftIter wrapper for parallel homogeneous workflows
 │   ├── lease.py                     # Execution lease; creates the attempt row for retries/requeues/deferred tasks
@@ -105,21 +106,20 @@ django-qraft/
 │   │   ├── __init__.py              # Sink protocol, NullSink, label guard and health counter
 │   │   ├── gauges.py                 # Backlog gauges
 │   │   └── otel.py                   # OpenTelemetrySink
-│   ├── migrations/                   # 15 migrations — see Database Migrations below
+│   ├── migrations/                   # see Database Migrations below
 │   ├── models/                       # Database schema (modularized in v1.1.0)
 │   │   ├── __init__.py               # Re-exports all
 │   │   ├── hooks.py                   # HookDispatch, WorkflowHookDispatch
-│   │   ├── mixins.py                   # WorkflowStatus enum, SubjectMixin, RunMemberMixin, WorkflowStatusMixin, WorkflowHookMixin
-│   │   ├── runs.py                      # QraftRun, QraftRunStage, RunStatus/StageStatus/UnitType
+│   │   ├── graphs.py                   # QraftGraph, QraftGraphNode, GraphStatus/NodeStatus/RecoveryMode
+│   │   ├── mixins.py                   # WorkflowStatus enum, SubjectMixin, GraphMemberMixin, WorkflowStatusMixin, WorkflowHookMixin
 │   │   ├── tasks.py                     # QraftTask, QraftTaskAttempt, RateBucket
 │   │   └── workflows.py                  # Chain/Iter/Batch models
 │   ├── pricing.py                        # Optional cost resolver over usage entries (schemaless; no migration)
-│   ├── reaper.py                         # Orphan detection, routing replay, stall flagging, run overdue sweep
+│   ├── reaper.py                         # Orphan detection, routing replay, stall flagging, graph overdue sweep
 │   ├── results.py                        # Rich result objects for workflow primitives
 │   ├── retention.py                      # Bounded pruning of settled rows (opt-in via retention_days)
 │   ├── retry.py                          # RetryPolicy with backoff calculations + schedule_retry()
 │   ├── runner.py                         # Worker-side entry point for every attempt
-│   ├── runs.py                           # Run and stage lifecycle: start, bind, skip, cancel, abandon, settlement
 │   ├── scheduler.py                      # Owned scheduling: SCHEDULED attempt rows + the claiming dispatcher
 │   ├── signals.py                        # Signals Qraft emits about its own transitions
 │   ├── tasks.py                          # Enhanced async_task() + _create_workflow_task() helper
@@ -155,14 +155,12 @@ django-qraft/
 │   ├── test_backend.py          # django.tasks backend (skips below Django 6.0)
 │   ├── test_conf.py             # Settings and ALT_CLUSTERS
 │   ├── test_dashboard.py        # Bundled monitoring dashboard
-│   ├── test_runs.py             # Binding rules, derived settlement, replay paths
+│   ├── test_graphs.py           # Topology rules, dispatch, settlement, resume, receipts, gates
 │   ├── test_signals.py          # Send sites, id payloads, send_robust isolation
 │   ├── test_metrics.py          # Emission points, label sets, gauge ownership
 │   ├── test_logging.py          # QraftContextFilter inside and outside a task
 │   ├── test_pricing.py          # Cost resolver, subset formula, coverage flags
 │   ├── test_e2e.py              # Real broker + worker + monitor, nothing stubbed
-│   ├── test_integration.py      # Cross-cutting flows with the enqueue seam mocked
-│   ├── test_workflow_integration.py  # Workflow flows (integration marker)
 │   └── test_postgres_concurrency.py  # Row-lock races; skipped unless run on Postgres
 │
 ├── demo/                  # Integration tests
@@ -501,13 +499,6 @@ def test_retry_reruns_the_task(broker):
     assert QraftTask.objects.get().status == TaskStatus.SUCCEEDED
 ```
 
-### Integration Tests
-
-`tests/test_integration.py` and `tests/test_workflow_integration.py` cover component
-interactions with the enqueue seam mocked, which keeps them fast and lets them assert on
-call arguments. Reach for an end-to-end test instead whenever the thing under test is
-whether the seam itself behaves.
-
 ### Test Database
 
 Tests run against in-memory SQLite, declared in `tests/settings.py` (selected by
@@ -822,7 +813,7 @@ cat qraft/migrations/0003_new_migration.py
 See "Database Migrations" in `CLAUDE.md` for the annotated list of migrations.
 
 Generate a migration with `makemigrations`; never hand-author one. Every column
-added since 1.4.0 is nullable or defaulted (`db_default` where a Python default
+added since 1.3.0 is nullable or defaulted (`db_default` where a Python default
 would not survive it), so a rolling deploy — where the previous release is
 still inserting rows on the old schema — keeps working.
 
