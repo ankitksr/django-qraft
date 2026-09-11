@@ -19,6 +19,16 @@ urlpatterns = [
         name="skip_node",
     ),
     path(
+        "graphs/<uuid:graph_id>/nodes/<str:node_key>/approve/",
+        views.approve_graph_node,
+        name="approve_node",
+    ),
+    path(
+        "graphs/<uuid:graph_id>/nodes/<str:node_key>/reject/",
+        views.reject_graph_node,
+        name="reject_node",
+    ),
+    path(
         "workflows/<str:kind>/<uuid:workflow_id>/cancel/",
         views.cancel_workflow,
         name="cancel",

@@ -693,3 +693,34 @@ class TestGraphNodeLinks:
         assert pending["task_id"] == ""
         assert pending["task_url"] is None
         assert pending["error"] == ""
+
+
+@pytest.mark.django_db
+def test_graph_gate_actions_and_terminal_refusal(client, settings):
+    from qraft import graphs
+    settings.QRAFT_DASHBOARD = {'public': True}
+    builder = graphs.Graph()
+    builder.node('publish:review', 'tests.e2e_tasks.succeed', recovery='idempotent', requires_approval=True)
+    graph_id = builder.start()
+    state = client.get('/qraft/api/state/').json()
+    row = next(g for g in state['graphs'] if g['id'] == graph_id)
+    assert row['can_cancel'] and row['nodes'][0]['can_approve']
+    graphs.cancel(graph_id)
+    response = client.post(f'/qraft/graphs/{graph_id}/nodes/publish:review/approve/')
+    assert response.status_code == 409
+
+
+@pytest.mark.django_db
+def test_graph_panel_queries_do_not_grow_per_failed_graph(django_assert_num_queries):
+    from qraft import graphs
+    from qraft.models import QraftGraph, QraftGraphNode
+    for index in range(5):
+        builder = graphs.Graph()
+        builder.node('failed', 'tests.e2e_tasks.succeed', recovery='idempotent')
+        graph_id = builder.start()
+        QraftGraph.objects.filter(pk=graph_id).update(status='failed')
+        QraftGraphNode.objects.filter(graph_id=graph_id).update(status='failed')
+    with django_assert_num_queries(3):
+        rows = views._graph_rows(timezone.now())
+    assert len(rows) == 5
+    assert all(row['resume_preview']['rerun'] == ['failed'] for row in rows)

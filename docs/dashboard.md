@@ -117,3 +117,15 @@ The page polls two endpoints you can also build on:
 
 Both return a flat JSON object per response; field names match the panels
 above and are intended to stay stable.
+
+
+The overview adapts to the viewport; graphs use multiple columns on wide screens.
+Tasks and dead letters share a tabbed history area, with scrolling inside long tables.
+Workflow details and function/exception breakdowns expand on demand. Empty workflow panels are hidden.
+Graph approval gates expose approve/reject controls, including cancellation while waiting.
+Action failures are shown in the page instead of silently refreshing.
+
+The subject filter scopes task counts, task history, workflows, graphs, usage and dead
+letters. Queue totals and time-window metrics remain global. State refreshes every three
+seconds, metrics every fifteen seconds, and background tabs pause automatic polling.
+No frontend framework, CDN, or build step is required.

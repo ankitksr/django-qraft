@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qraft dashboard</title>
+<link rel="icon" href="data:,">
 <style>
 :root {
   --bg: #0e1116; --panel: #161b22; --panel2: #1c2129; --line: #2a313c;
@@ -136,6 +137,66 @@ a.chip:hover { text-decoration: underline; }
            letter-spacing: .08em; color: var(--faint); }
 
 .empty { padding: 12px; color: var(--faint); }
+
+/* One reading column; wide screens gain columns inside each panel. */
+[hidden] { display: none !important; }
+main { display: flex; flex-direction: column; gap: 16px; max-width: 1920px;
+       margin: 0 auto; padding: 24px clamp(16px, 2.4vw, 48px) 40px; }
+section { margin: 0; min-width: 0; }
+section > h2 { padding: 11px 16px; }
+.overview { display: grid; grid-template-columns: minmax(400px, 1.5fr) minmax(270px, 1fr) minmax(230px, .85fr); gap: 16px; }
+.overview .tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); padding: 16px; }
+.overview .tile { border: 0; background: none; padding: 4px; }
+.tile b { font-size: 24px; margin-bottom: 6px; }
+.tile span, .tile small, .subhead, th { color: var(--dim); }
+.metric-tiles { padding: 14px 16px 0; }
+.metric-tiles .tile { border: 0; background: none; padding: 0 12px; border-left: 2px solid var(--line); }
+.metric-tiles .tile b { font-size: 20px; }
+.workflow-details summary { background: var(--panel2); font-size: 11px; padding: 11px 16px; }
+.workflow-details .count { margin-left: 8px; }
+td.s-failed { border-bottom-color: var(--line); }
+.metric-details { border-top: 1px solid var(--line); }
+summary { cursor: pointer; padding: 10px 16px; color: var(--dim); font-size: 11px; }
+.metric-breakdown { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 0 4px 12px; }
+.spark { height: 42px; }
+.graph-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); max-height: 280px; overflow: auto; }
+.graph-grid .wf { padding: 16px; border-right: 1px solid var(--line); }
+.wf-head { flex-wrap: wrap; gap: 8px; min-width: 0; }
+.wf-head > span { overflow-wrap: anywhere; }
+.members { margin-top: 10px; gap: 6px; align-items: center; }
+.chip { padding: 3px 7px; font-size: 11px; }
+.chip.waiting_approval { color: var(--warn); border-color: var(--warn); }
+.node { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+button { min-height: 28px; padding: 4px 10px; }
+button:focus-visible, a:focus-visible, summary:focus-visible, .scroll:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+input.filter { min-height: 30px; }
+.history-tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.history-tabs button { font-size: 12px; padding: 6px 14px; }
+.table-scroll { max-height: min(60vh, 680px); }
+.table-scroll table { min-width: 940px; }
+th { z-index: 1; box-shadow: 0 1px var(--line); }
+th, td { padding: 9px 16px; vertical-align: top; }
+td.num { white-space: nowrap; }
+td:nth-child(2) { min-width: 180px; overflow-wrap: anywhere; }
+.subject { display: block; font-size: 11px; margin-top: 2px; }
+#usage td, #buckets td { padding: 7px 16px; overflow-wrap: anywhere; }
+#usage .cost-meta { display: block; font-size: 10px; white-space: nowrap; }
+#usage .num { white-space: nowrap; }
+#buckets { max-height: 140px; overflow: auto; }
+#notice { position: fixed; bottom: 20px; right: 20px; max-width: min(480px, 90vw); z-index: 10; padding: 12px 18px; background: var(--panel2); border: 1px solid var(--bad); border-radius: 6px; }
+.empty { padding: 16px; color: var(--dim); }
+@media (min-width: 1700px) { body { font-size: 14px; } }
+@media (max-width: 1100px) { .overview { grid-template-columns: 1fr 1fr; } .overview > section:first-child { grid-column: 1 / -1; } }
+@media (max-width: 640px) {
+  main { padding: 12px; gap: 12px; } header { position: static; gap: 10px; }
+  header .spacer { display: none; } input.filter { width: 100%; order: 2; }
+  .overview { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .overview .tiles { gap: 4px; padding: 12px 8px; }
+  .overview .tile b { font-size: 20px; } .overview .tile span { font-size: 9px; letter-spacing: 0; }
+  .metric-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .metric-breakdown { grid-template-columns: 1fr; }
+  .wf-head .spacer { flex-basis: 100%; } .history-tabs .muted { font-size: 11px; }
+}
 </style>
 </head>
 <body>
@@ -154,24 +215,20 @@ a.chip:hover { text-decoration: underline; }
 </header>
 
 <main>
-  <div>
-    <section>
-      <h2>Tasks by status</h2>
+<div class="overview">    <section>
+      <h2>Tasks by status <span class="count" id="counts-scope">all retained</span></h2>
       <div class="tiles" id="tiles"></div>
+    </section>
+
+    <section>
+      <h2>Usage and cost <span class="count">recent attempts</span></h2>
+      <div id="usage"><div class="empty">none</div></div>
     </section>
 
     <section>
       <h2>Rate buckets</h2>
       <div id="buckets"><div class="empty">none</div></div>
-    </section>
-
-    <section>
-      <h2>Usage and cost</h2>
-      <div id="usage"><div class="empty">none</div></div>
-    </section>
-  </div>
-
-  <div>
+    </section></div>
     <section>
       <h2>Metrics
         <span class="spacer"></span>
@@ -183,41 +240,44 @@ a.chip:hover { text-decoration: underline; }
       <div class="subhead">throughput — completions per bucket</div>
       <div class="spark" id="spark"></div>
       <div class="spark-label" id="spark-label"></div>
-      <div class="subhead">per function</div>
+<details class="metric-details"><summary>Function breakdown & exceptions</summary><div class="metric-breakdown"><div><div class="subhead">per function</div>
       <div class="scroll" id="functions"><div class="empty">no completions in window</div></div>
-      <div class="subhead">exceptions</div>
+</div><div><div class="subhead">exceptions</div>
       <div id="exceptions"><div class="empty">none in window</div></div>
-    </section>
+</div></div></details>    </section>
 
-    <section>
+    <section class="graph-panel">
       <h2>Graphs <span class="count" id="graph-count"></span></h2>
-      <div class="scroll" id="graphs"><div class="empty">none</div></div>
+      <div class="graph-grid" id="graphs"><div class="empty">none</div></div>
     </section>
 
-    <section>
-      <h2>Workflows <span class="count" id="wf-count"></span></h2>
-      <div class="scroll" id="workflows"><div class="empty">none</div></div>
-    </section>
-
-    <section>
-      <h2>Tasks <span class="count" id="task-count"></span></h2>
-      <div class="scroll">
+    <section id="workflow-panel">
+      <details class="workflow-details">
+        <summary>Workflows <span class="count" id="wf-count"></span><span class="muted"> · expand to inspect</span></summary>
+        <div class="scroll" id="workflows"><div class="empty">none</div></div>
+      </details>
+    </section><nav class="history-tabs" role="tablist" aria-label="Task history">
+<button id="tab-tasks" role="tab" aria-selected="true" aria-controls="task-panel" class="on">Tasks</button>
+<button id="tab-dlq" role="tab" aria-selected="false" aria-controls="dlq-panel">Dead letters <span id="dead-total"></span></button>
+<span class="spacer"></span><span class="muted" id="scope-label">All subjects</span>
+</nav>    <section id="task-panel" role="tabpanel" aria-labelledby="tab-tasks">
+      <h2>Recent tasks <span class="count" id="task-count"></span><span class="spacer"></span><span class="count">newest first · up to 60</span></h2>
+      <div class="scroll table-scroll" tabindex="0" aria-label="Task history">
         <table>
           <thead><tr>
-            <th>id</th><th>function</th><th>status</th><th>pri</th>
-            <th class="num">try</th><th class="num">age</th>
-            <th class="num">beat</th><th>progress</th><th class="num">moved</th><th>error</th>
+            <th>id</th><th>function / subject</th><th>status</th><th>priority</th>
+            <th class="num">tries</th><th class="num">elapsed</th>
+            <th class="num">heartbeat</th><th>progress</th><th class="num">moved</th><th>error</th>
           </tr></thead>
           <tbody id="tasks"></tbody>
         </table>
       </div>
     </section>
 
-    <section>
+    <section id="dlq-panel" role="tabpanel" aria-labelledby="tab-dlq" hidden>
       <h2>Dead letters <span class="count" id="dlq-count"></span></h2>
-      <div id="dlq"><div class="empty">nothing dead</div></div>
-    </section>
-  </div>
+      <div id="dlq" class="scroll table-scroll" tabindex="0" aria-label="Dead letters"><div class="empty">nothing dead</div></div>
+    </section><div id="notice" role="status" hidden></div>
 </main>
 
 <script>
@@ -225,7 +285,7 @@ const BASE = "{% url 'qraft_dashboard:dashboard' %}";
 const CSRF = document.querySelector("[name=csrfmiddlewaretoken]").value;
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value == null ? "" : value)
-  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const chip = (status) => `<span class="s s-${esc(status)}">${esc(status)}</span>`;
 const post = (path) => fetch(BASE + path, {
   method: "POST", headers: {"X-CSRFToken": CSRF},
@@ -259,12 +319,16 @@ function renderState(state) {
     `<div class="tile"><b>${state.counts[name] || 0}</b><span>${name}</span></div>`
   ).join("");
 
+  $("workflow-panel").hidden = !state.workflows.length;
+  $("dead-total").textContent = state.dlq.length;
+  $("counts-scope").textContent = $("filter").value.trim() ? "subject filtered" : "all retained";
+  $("scope-label").textContent = $("filter").value.trim() || "All subjects";
   $("task-count").textContent = state.tasks.length;
   $("tasks").innerHTML = state.tasks.map((task) => `<tr>
     <td class="faint">${task.admin_url
       ? `<a href="${esc(task.admin_url)}" target="_blank">${esc(task.short)}</a>`
       : esc(task.short)}</td>
-    <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}${task.subject_type ? ` <span class="faint" title="subject">${esc(task.subject_type)}:${esc(task.subject_id)}</span>` : ""}</td>
+    <td>${esc(task.func)}${task.workflow ? ` <span class="faint">${esc(task.workflow)}</span>` : ""}${task.subject_type ? ` <span class="faint subject" title="subject">${esc(task.subject_type)}:${esc(task.subject_id)}</span>` : ""}</td>
     <td>${chip(task.status)}</td>
     <td class="faint">${task.priority === "default" ? "" : esc(task.priority)}</td>
     <td class="num">${task.attempts}${task.max_attempts ? `<span class="faint">/${task.max_attempts}</span>` : ""}</td>
@@ -275,7 +339,7 @@ function renderState(state) {
       task.stalled ? `<span class="stall${task.stall_recovered ? " recovered" : ""}" title="${task.stall_recovered
         ? "flagged as stalled, has advanced since" : "no progress past stall_after; not retried"}">${
         task.stall_recovered ? " ✓" : " ⚠"}</span>` : ""}</td>
-    <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
+    <td class="s-failed">${esc(task.error || "")}</td>
   </tr>`).join("") || `<tr><td colspan="10" class="empty">no tasks yet</td></tr>`;
 
   const graphs = state.graphs || [];
@@ -306,17 +370,26 @@ function renderState(state) {
         const chipHtml = n.task_url
           ? `<a class="chip ${esc(n.status)}" href="${esc(n.task_url)}" title="${esc(title)}">${label}</a>`
           : `<span class="chip ${esc(n.status)}" title="${esc(title)}">${label}</span>`;
-        return `${chipHtml}${skip}`;
+        const decision = n.can_approve
+          ? `<button data-graph-approve="${esc(graph.id)}:${esc(n.key)}">approve</button><button data-graph-reject="${esc(graph.id)}:${esc(n.key)}">reject</button>` : "";
+        return `<span class="node">${chipHtml}${skip}${decision}</span>`;
       }).join("")}</div>
     </div>`;
   }).join("") || `<div class="empty">none</div>`;
   wire("[data-graph-cancel]", (id) => post(`graphs/${id}/cancel/`));
   wire("[data-graph-resume]", (id) => post(`graphs/${id}/resume/`));
   wire("[data-graph-skip]", (pair) => {
-    const [id, key] = pair.split(":");
+    const [id, ...parts] = pair.split(":");
+    const key = parts.join(":");
     return post(`graphs/${id}/nodes/${encodeURIComponent(key)}/skip/`);
   });
 
+  for (const decision of ["approve", "reject"]) {
+    wire(`[data-graph-${decision}]`, (pair) => {
+      const [id, ...parts] = pair.split(":");
+      return post(`graphs/${id}/nodes/${encodeURIComponent(parts.join(":"))}/${decision}/`);
+    });
+  }
   $("wf-count").textContent = state.workflows.length;
   $("workflows").innerHTML = state.workflows.map((wf) => {
     const c = wf.counters, total = c.total || 1;
@@ -372,7 +445,7 @@ function renderState(state) {
   const costRow = c
     ? `<tr><td class="muted">cost</td><td class="num" title="${esc(c.coverage)} coverage${
         c.estimated ? ", estimated from configured prices" : ", as reported by the caller"}">${
-        esc(c.amount)} ${esc(c.currency || "")}<span class="faint"> ${
+        esc(c.amount)} ${esc(c.currency || "")}<span class="faint cost-meta"> ${
         esc(c.coverage)}${c.estimated ? " est" : ""}</span></td></tr>`
     : "";
   $("usage").innerHTML = usage.length || costRow
@@ -389,9 +462,19 @@ function wire(selector, action) {
       // Each action button carries exactly one data-* attribute, and its value
       // is the id the endpoint needs. Naming them one by one silently passed
       // undefined for every attribute the list had not been taught.
-      await action(Object.values(button.dataset)[0]);
-      pollState();
-      pollMetrics();
+      try {
+        const response = await action(Object.values(button.dataset)[0]);
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || `Action failed (${response.status})`);
+        }
+        $("notice").hidden = true;
+        await pollState();
+        pollMetrics();
+      } catch (error) {
+        $("notice").textContent = error.message;
+        $("notice").hidden = false;
+      } finally { button.disabled = false; }
     };
   });
 }
@@ -461,14 +544,35 @@ function filterQuery() {
   if (rest.length) params.set("subject_id", rest.join(":"));
   return "?" + params.toString();
 }
-$("filter").oninput = () => pollState();
+let filterTimer;
+$("filter").oninput = () => { clearTimeout(filterTimer); filterTimer = setTimeout(pollState, 250); };
+document.querySelectorAll('[role="tab"]').forEach((tab) => {
+  tab.onclick = () => {
+    document.querySelectorAll('[role="tab"]').forEach((other) => {
+      const selected = other === tab;
+      other.classList.toggle("on", selected);
+      other.setAttribute("aria-selected", selected);
+      $(other.getAttribute("aria-controls")).hidden = !selected;
+    });
+  };
+  tab.onkeydown = (event) => {
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const target = event.key === "Home" ? $("tab-tasks") : event.key === "End" ? $("tab-dlq") : tab.id === "tab-tasks" ? $("tab-dlq") : $("tab-tasks");
+      target.click(); target.focus();
+    }
+  };
+});
 
-let failures = 0;
+let failures = 0, stateRequest = 0, metricsRequest = 0;
 async function pollState() {
+  const request = ++stateRequest;
   try {
     const response = await fetch(BASE + "api/state/" + filterQuery());
     if (!response.ok) throw new Error(response.status);
-    renderState(await response.json());
+    const data = await response.json();
+    if (request !== stateRequest) return;
+    renderState(data);
     failures = 0;
     $("beat").textContent = "polling";
     $("beat").classList.add("live");
@@ -479,16 +583,30 @@ async function pollState() {
   }
 }
 async function pollMetrics() {
+  const request = ++metricsRequest;
   try {
     const response = await fetch(BASE + `api/metrics/?window=${windowName}`);
     if (!response.ok) throw new Error(response.status);
-    renderMetrics(await response.json());
+    const data = await response.json();
+    if (request !== metricsRequest) return;
+    renderMetrics(data);
   } catch (error) { /* the state poller owns the offline pill */ }
 }
 pollState();
 pollMetrics();
-setInterval(pollState, 2000);
-setInterval(pollMetrics, 10000);
+async function refreshLoop() {
+  if (!document.hidden) await pollState();
+  setTimeout(refreshLoop, 3000);
+}
+async function metricsLoop() {
+  if (!document.hidden) await pollMetrics();
+  setTimeout(metricsLoop, 15000);
+}
+setTimeout(refreshLoop, 3000);
+setTimeout(metricsLoop, 15000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { pollState(); pollMetrics(); }
+});
 </script>
 </body>
 </html>

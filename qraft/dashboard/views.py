@@ -17,7 +17,7 @@ from functools import wraps
 from django.conf import settings
 from django.contrib.auth.views import redirect_to_login
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Count
+from django.db.models import Count, Prefetch
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.urls import NoReverseMatch, reverse
@@ -35,6 +35,7 @@ from qraft.models import (
     InvalidStatusTransition,
     QraftBatchModel,
     QraftChainModel,
+    QraftChainStep,
     QraftGraph,
     QraftIterModel,
     QraftTask,
@@ -298,6 +299,11 @@ def _graph_rows(now, filters: dict | None = None) -> list[dict]:
                         "task_id": str(node.task_id) if node.task_id else "",
                         "task_url": _task_url(node.task_id),
                         "error": errors.get(str(node.task_id)) or "",
+                        "can_approve": (
+                            graph.status
+                            in (GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL)
+                            and node.status == NodeStatus.WAITING_APPROVAL
+                        ),
                         "can_skip": (
                             graph.status == GraphStatus.RUNNING
                             and node.status == NodeStatus.PENDING
@@ -307,12 +313,13 @@ def _graph_rows(now, filters: dict | None = None) -> list[dict]:
                         graph.nodes.all(), key=lambda n: (n.depth, n.position)
                     )
                 ],
-                "can_cancel": graph.status == GraphStatus.RUNNING,
+                "can_cancel": graph.status
+                in (GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL),
                 "can_resume": graph.status == GraphStatus.FAILED,
                 # The preview is what makes resume a decision rather than a
                 # guess, so it travels with the button.
                 "resume_preview": (
-                    graphs_module.preview_resume(graph.id)
+                    graphs_module._resume_preview(graph)
                     if graph.status == GraphStatus.FAILED
                     else None
                 ),
@@ -323,18 +330,29 @@ def _graph_rows(now, filters: dict | None = None) -> list[dict]:
 
 def _workflow_rows(filters: dict | None = None) -> list[dict]:
     rows = []
+    chain_steps = Prefetch(
+        "steps",
+        queryset=QraftChainStep.objects.select_related("qraft_task").order_by(
+            "step_index"
+        ),
+    )
+    member_prefetch = Prefetch(
+        "tasks",
+        queryset=QraftTask.objects.order_by("-date_created")[:MEMBER_LIMIT],
+        to_attr="dashboard_members",
+    )
     for model, kind in (
         (QraftChainModel, "chain"),
         (QraftIterModel, "iter"),
         (QraftBatchModel, "batch"),
     ):
-        recent = _apply_filters(model.objects.all(), filters or {})
+        recent = _apply_filters(model.objects.all(), filters or {}).prefetch_related(
+            chain_steps if kind == "chain" else member_prefetch
+        )
         for row in recent.order_by("-date_created")[:WORKFLOW_LIMIT]:
             gated = False
             if kind == "chain":
-                steps = list(
-                    row.steps.select_related("qraft_task").order_by("step_index")
-                )
+                steps = list(row.steps.all())
                 members = [
                     {
                         "label": f"{step.step_index}. {_func(step.func)}",
@@ -363,7 +381,7 @@ def _workflow_rows(filters: dict | None = None) -> list[dict]:
             else:
                 members = [
                     {"label": _func(task.func), "status": task.status, "gated": False}
-                    for task in row.tasks.all()[:MEMBER_LIMIT]
+                    for task in row.dashboard_members
                 ]
                 counters = {
                     "completed": row.completed_count,
@@ -403,7 +421,7 @@ def _usage_rollup(filters: dict) -> tuple[dict, dict | None]:
     from qraft.context import _sum_usage
 
     attempts = _apply_filters(
-        QraftTaskAttempt.objects.exclude(usage=None),
+        QraftTaskAttempt.objects.filter(usage__isnull=False),
         filters,
         graph_field="qraft_task__graph_id",
         subject_prefix="qraft_task__",
@@ -426,7 +444,11 @@ def state(request):
     filters = _filters(request)
 
     counts = {status: 0 for status, _ in TaskStatus.choices}
-    for row in QraftTask.objects.values("status").annotate(n=Count("id")):
+    for row in (
+        _apply_filters(QraftTask.objects.all(), filters)
+        .values("status")
+        .annotate(n=Count("id"))
+    ):
         counts[row["status"]] = row["n"]
 
     scheduled_qs = QraftTaskAttempt.objects.filter(state=AttemptState.SCHEDULED)
@@ -466,7 +488,7 @@ def state(request):
                     "attempts": len(task.attempts.all()),
                     "key": task.idempotency_key or "",
                 }
-                for task in dead_letters()[:DLQ_LIMIT]
+                for task in _apply_filters(dead_letters(), filters)[:DLQ_LIMIT]
             ],
             "buckets": [
                 {"key": bucket.key, "tokens": round(bucket.tokens, 2)}
@@ -613,3 +635,30 @@ def cancel_workflow(request, kind, workflow_id):
         return JsonResponse({"error": str(error)}, status=409)
     logger.info("Dashboard cancelled %s %s", kind, workflow_id)
     return JsonResponse({"cancelled": str(workflow_id)})
+
+
+@require_POST
+@staff_required(json=True)
+@csrf_protect
+def approve_graph_node(request, graph_id, node_key):
+    return _decide_graph_node(graph_id, node_key, approve=True)
+
+
+@require_POST
+@staff_required(json=True)
+@csrf_protect
+def reject_graph_node(request, graph_id, node_key):
+    return _decide_graph_node(graph_id, node_key, approve=False)
+
+
+def _decide_graph_node(graph_id, node_key, approve):
+    from qraft import graphs
+
+    try:
+        if approve:
+            graphs.approve(graph_id, node_key)
+        else:
+            graphs.reject(graph_id, node_key, reason="dashboard")
+    except graphs.GraphError as error:
+        return JsonResponse({"error": str(error)}, status=409)
+    return JsonResponse({"node": node_key, "approved": approve})
