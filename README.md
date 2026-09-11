@@ -7,7 +7,7 @@
 
 Durable background jobs and workflows for Django — Postgres only, no extra infra, with primitives for jobs that call metered AI providers.
 
-Django-Qraft is a drop-in enhancement of [Django-Q2](https://django-q2.readthedocs.io/): Django-Q2 supplies the cluster runtime, Qraft owns task state, retries, hooks, and orchestration. Full backward compatibility.
+Django-Qraft is a drop-in enhancement of [Django-Q2](https://django-q2.readthedocs.io/): Django-Q2 supplies the cluster runtime, Qraft owns task state, retries, hooks, and orchestration. Existing Q2 task functions and cluster settings can be reused; Qraft-owned tasks enforce stricter execution options.
 
 ## Features
 
@@ -220,7 +220,7 @@ TASKS = {"default": {"BACKEND": "qraft.backend.QraftTaskBackend"}}
 [Learn more →](docs/django-tasks-backend.md)
 
 ### 🔌 Drop-in Compatible
-Fully compatible with Django-Q2 configuration and behavior. Use existing `Q_CLUSTER` settings or migrate to `QRAFT_CLUSTER`.
+Reuses Django-Q2 configuration and task functions. Use existing `Q_CLUSTER` settings or migrate to `QRAFT_CLUSTER`.
 
 ## Quick Start
 
@@ -403,7 +403,7 @@ QraftCluster (extends Cluster)
 - `QraftCluster.start()` → spawns `QraftSentinel`
 - `QraftSentinel.spawn_worker()` → conditionally spawns threaded workers
 - Hook handler intercepts Django-Q2 task completion
-- All other components unchanged from Django-Q2
+- Qraft owns scheduling, lease tracking, reaping, retention, and completion routing; Django-Q2 supplies the pusher, monitor, and standard worker loop.
 
 [Architecture Guide →](docs/architecture.md)
 
@@ -493,7 +493,7 @@ git clone https://github.com/ankitksr/django-qraft.git
 cd django-qraft
 
 # Install dependencies
-uv pip install -e ".[dev,test]"
+uv sync --group test
 
 # Run tests
 pytest
@@ -506,13 +506,13 @@ ruff check qraft/
 
 ## Compatibility
 
-Django-Qraft maintains full backward compatibility with Django-Q2:
+Django-Qraft reuses Django-Q2 with these compatibility boundaries:
 
 - ✅ All Django-Q2 broker types run Qraft tasks; the ORM broker on PostgreSQL is the only one with full guarantees — every other broker loses delivery receipts and priority lanes, halves the reaper, and makes an enqueue visible before its transaction commits ([what degrades](docs/configuration.md#broker-support))
 - ✅ Existing `Q_CLUSTER` settings keep configuring Django-Q2; Qraft's own settings live in `QRAFT_CLUSTER` ([what Qraft reads from `Q_CLUSTER`](docs/configuration.md#q_cluster-still-belongs-to-django-q2))
 - ✅ Standard `qcluster` command continues to work
 - ✅ Tasks queued via Django-Q2's `async_task` work seamlessly
-- ✅ Drop-in replacement, no breaking changes
+- Qraft tasks reject `sync=True`, `save=False`, cached results, and `ack_failure=False`: durable completion tracking and retry ownership require these restrictions.
 
 ## Roadmap
 

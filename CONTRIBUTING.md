@@ -28,7 +28,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```bash
 uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -e ".[dev,test]"
+uv sync --group test
 ```
 
 4. **Run migrations (for demo app)**
