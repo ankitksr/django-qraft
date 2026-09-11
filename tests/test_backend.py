@@ -304,7 +304,11 @@ class TestCoroutineTasks:
         qraft_task = QraftTask.objects.get()
         assert qraft_task.func == "tests.test_backend.async_task_func"
         assert result.id == str(qraft_task.id)
-        assert mock_q2.call_args[0][0] == "qraft.backend.run_task"
+        from django.utils.module_loading import import_string
+        dispatch_path, *dispatch_args = mock_q2.call_args.args
+        assert import_string(dispatch_path)(*dispatch_args) == (
+            "async-done", (1,), {"k": "v"}
+        )
 
     def test_run_task_awaits_the_coroutine(self):
         from qraft.backend import run_task
