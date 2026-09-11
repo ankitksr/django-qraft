@@ -26,6 +26,7 @@ from qraft.models.graphs import (
     NodeStatus,
     QraftGraph,
     QraftGraphNode,
+    QraftGraphSettlement,
 )
 
 _logger = logging.getLogger("qraft.graphs")
@@ -407,8 +408,8 @@ def cancel(graph_id) -> bool:
 
 
 def _explicit_settlement(graph_id, status: str) -> bool:
-    graph = get(graph_id)
     with transaction.atomic():
+        graph = _locked(graph_id)
         settled = _settle(graph, status, timezone.now())
     if settled is None:
         graph.refresh_from_db()
@@ -510,11 +511,14 @@ def publish():
 
 def preview_resume(graph_id, nodes: list[str] | None = None) -> dict:
     """What `resume()` would re-run and what it would keep, without writing."""
-    graph = get(graph_id)
+    return _resume_preview(get(graph_id), nodes)
+
+
+def _resume_preview(graph, nodes=None):
     rerun = _rerun_closure(graph, nodes)
     kept = [
         node.key
-        for node in graph.nodes.all().order_by("depth", "position")
+        for node in sorted(graph.nodes.all(), key=lambda n: (n.depth, n.position))
         if node.key not in rerun
     ]
     return {"rerun": sorted(rerun), "kept": kept}
@@ -535,7 +539,7 @@ def resume(graph_id, nodes: list[str] | None = None) -> int:
     now = timezone.now()
     with transaction.atomic():
         graph = _locked(graph_id)
-        if graph.status == GraphStatus.RUNNING:
+        if graph.status in (GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL):
             raise GraphError(
                 f"graph {graph_id} is still running; resume is for a settled graph"
             )
@@ -550,6 +554,7 @@ def resume(graph_id, nodes: list[str] | None = None) -> int:
         if not rerun:
             raise GraphError(f"graph {graph_id} has nothing to re-run")
 
+        _record_settlement(graph)
         QraftGraphNode.objects.filter(graph=graph, key__in=rerun).update(
             status=NodeStatus.PENDING,
             task=None,
@@ -569,16 +574,10 @@ def resume(graph_id, nodes: list[str] | None = None) -> int:
             generation=F("generation") + 1,
             date_updated=now,
         )
-        # The next settlement is a genuinely new one, so its durable hook must
-        # dispatch again rather than dedupe against the settlement being
-        # resumed from.
-        from qraft.models import WorkflowHookDispatch
+        _dispatch_frontier(graph_id)
+        graph.refresh_from_db()
+        _maybe_settle(graph, now)
 
-        WorkflowHookDispatch.objects.filter(
-            workflow_type="graph", workflow_id=graph.id
-        ).delete()
-
-    _dispatch_frontier(graph_id)
     return len(rerun)
 
 
@@ -621,6 +620,8 @@ def approve(graph_id, node_key: str) -> None:
     """Release a node parked at its gate and dispatch it."""
     with transaction.atomic():
         graph = _locked(graph_id)
+        if graph.status not in (GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL):
+            raise GraphError(f"graph {graph_id} is {graph.status}; its nodes are final")
         node = _node(graph, node_key)
         if node.status != NodeStatus.WAITING_APPROVAL:
             raise GraphError(
@@ -644,6 +645,8 @@ def reject(graph_id, node_key: str, reason: str | None = None) -> None:
     settled = None
     with transaction.atomic():
         graph = _locked(graph_id)
+        if graph.status not in (GraphStatus.RUNNING, GraphStatus.WAITING_APPROVAL):
+            raise GraphError(f"graph {graph_id} is {graph.status}; its nodes are final")
         node = _node(graph, node_key)
         if node.status != NodeStatus.WAITING_APPROVAL:
             raise GraphError(
@@ -860,6 +863,7 @@ def _settle(graph: QraftGraph, status: str, now):
     if not settled:
         return None
     graph.refresh_from_db()
+    _record_settlement(graph)
 
     signals.send(signals.graph_settled, QraftGraph, graph_payload(graph))
     graph_labels = {
@@ -881,20 +885,45 @@ def _settle(graph: QraftGraph, status: str, now):
     return graph
 
 
-def _dispatch_settled_hook(graph) -> None:
-    if graph is None or not graph.on_settled:
-        return
+def _record_settlement(graph):
+    if not graph.on_settled:
+        return None
+    settlement, _ = QraftGraphSettlement.objects.get_or_create(
+        graph=graph,
+        generation=graph.generation,
+        defaults={
+            "hook_path": graph.on_settled,
+            "hook_kwargs": dict(graph.on_settled_kwargs or {}),
+            "context": hook_context(graph),
+            "date_created": graph.settled_at,
+        },
+    )
+    return settlement
+
+
+def _dispatch_settlement(settlement):
     from qraft.dispatchers import _dispatch_workflow_hook
 
     _dispatch_workflow_hook(
         workflow_type="graph",
-        workflow_id=graph.id,
+        workflow_id=settlement.graph_id,
         hook_type="settled",
-        hook_path=graph.on_settled,
+        hook_path=settlement.hook_path,
         hook_args=[],
-        hook_kwargs=dict(graph.on_settled_kwargs or {}),
-        context=hook_context(graph),
+        hook_kwargs=settlement.hook_kwargs,
+        context=settlement.context,
+        generation=settlement.generation,
     )
+
+
+def _dispatch_settled_hook(graph) -> None:
+    if graph is None or not graph.on_settled:
+        return
+    settlement = QraftGraphSettlement.objects.filter(
+        graph=graph, generation=graph.generation
+    ).first()
+    if settlement is not None:
+        _dispatch_settlement(settlement)
 
 
 def hook_context(graph: QraftGraph) -> dict:
@@ -995,27 +1024,42 @@ def build_summary(
 
 
 def replay_settled_hooks(grace: float) -> int:
+    from django.db.models import Exists, OuterRef
+
     from qraft.models import WorkflowHookDispatch
 
     cutoff = timezone.now() - timedelta(seconds=grace)
-    dispatched = WorkflowHookDispatch.objects.filter(
-        workflow_type="graph", hook_type="settled"
-    ).values("workflow_id")
-    pending = (
+    # Upgrade bridge for graphs settled before the outbox existed. Lock and
+    # recheck so a concurrent resume cannot snapshot a different generation.
+    legacy = (
         QraftGraph.objects.filter(settled_at__lt=cutoff)
+        .exclude(on_settled__in=("",))
         .exclude(on_settled=None)
-        .exclude(on_settled="")
-        .exclude(id__in=dispatched)
+        .filter(settlements__isnull=True)
+    )
+    for graph_id in legacy.values_list("pk", flat=True).iterator():
+        with transaction.atomic():
+            graph = _locked(graph_id)
+            if graph.settled_at is not None:
+                _record_settlement(graph)
+
+    dispatched = WorkflowHookDispatch.objects.filter(
+        workflow_type="graph",
+        hook_type="settled",
+        workflow_id=OuterRef("graph_id"),
+        generation=OuterRef("generation"),
+    )
+    pending = QraftGraphSettlement.objects.filter(date_created__lt=cutoff).filter(
+        ~Exists(dispatched)
     )
     replayed = 0
-    for graph in pending:
+    for settlement in pending.iterator():
         _logger.warning(
-            "Re-offering on_settled for QraftGraph %s; it settled at %s but the "
-            "hook was never dispatched",
-            graph.id,
-            graph.settled_at,
+            "Re-offering graph %s generation %s settlement hook",
+            settlement.graph_id,
+            settlement.generation,
         )
-        _dispatch_settled_hook(graph)
+        _dispatch_settlement(settlement)
         replayed += 1
     return replayed
 

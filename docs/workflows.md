@@ -512,3 +512,14 @@ RUNNING → SUCCEEDED                          (every node succeeded or skipped)
 `WAITING_APPROVAL` is not terminal. It is not swept as overdue and its members are not
 pruned: the graph is waiting for a person, not running late and not finished. Its nodes move `PENDING → RUNNING → SUCCEEDED | FAILED`, with `SKIPPED` from
 `graphs.skip()` and `WAITING_APPROVAL` for a gated node.
+
+
+### Settlement hook history
+
+Migration `0020` adds an immutable settlement payload per graph generation and includes
+that generation in the hook dispatch identity. Settlement records commit with the graph
+transition; replay can therefore deliver an earlier generation's missed hook even after
+resume. Hook context describes that settlement, not the graph's later mutable state.
+Dispatch records remain while their graph exists, so retention cannot accidentally
+make an already-dispatched settlement eligible again. This guarantees durable enqueue
+on the same-database ORM broker, not exactly-once external effects inside a hook.

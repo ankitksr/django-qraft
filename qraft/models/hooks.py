@@ -78,6 +78,8 @@ class WorkflowHookDispatch(models.Model):
         help_text="Type of workflow: 'chain', 'iter', 'batch', or 'graph'",
     )
 
+    generation = models.PositiveIntegerField(default=0)
+
     workflow_id = models.UUIDField(
         db_index=True,
         help_text="UUID of the workflow (chain/iter/batch/graph)",
@@ -118,7 +120,7 @@ class WorkflowHookDispatch(models.Model):
         ordering = ["-date_created"]
         constraints = [
             models.UniqueConstraint(
-                fields=["workflow_type", "workflow_id", "hook_type"],
+                fields=["workflow_type", "workflow_id", "hook_type", "generation"],
                 name="unique_workflow_hook_dispatch",
             )
         ]

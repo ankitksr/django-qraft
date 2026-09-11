@@ -609,3 +609,32 @@ class TestThrottleRace:
 
         assert sorted(verdicts) == [False, True]
         assert RateBucket.objects.get(key="provider-race").tokens == pytest.approx(0.0)
+
+
+class TestGraphGateRace:
+    def test_cancel_and_approval_share_the_graph_lock(self):
+        from qraft import graphs
+        from qraft.models import QraftGraph
+        builder = graphs.Graph()
+        builder.node('publish', 'tests.e2e_tasks.succeed', recovery='idempotent', requires_approval=True)
+        graph_id = builder.start()
+        barrier = threading.Barrier(2)
+        approved = []
+
+        def approve():
+            barrier.wait(timeout=5)
+            try:
+                graphs.approve(graph_id, 'publish')
+                approved.append(True)
+            except graphs.GraphError:
+                approved.append(False)
+
+        def cancel():
+            barrier.wait(timeout=5)
+            graphs.cancel(graph_id)
+
+        run_concurrently(approve, cancel)
+        assert QraftGraph.objects.get(pk=graph_id).status == 'cancelled'
+        assert QraftTask.objects.filter(graph_id=graph_id).count() == int(approved[0])
+        with pytest.raises(graphs.GraphError):
+            graphs.approve(graph_id, 'publish')

@@ -426,3 +426,42 @@ class TestGraphMembership:
         sweep_retention(retention_days=30)
 
         assert QraftGraph.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_live_graph_member_keeps_settlement_deduplication():
+    from unittest.mock import patch
+    from qraft import graphs
+    from qraft.models import QraftGraph, WorkflowHookDispatch
+    from django.utils import timezone
+    builder = graphs.Graph(on_settled='app.hooks.ready')
+    builder.node('slow', 'tests.e2e_tasks.succeed', recovery='idempotent')
+    graph_id = builder.start()
+    with patch('qraft.dispatchers.q2_async_task', return_value='settlement-hook'):
+        graphs.cancel(graph_id)
+    old = timezone.now() - timezone.timedelta(days=10)
+    QraftGraph.objects.filter(pk=graph_id).update(date_updated=old)
+    WorkflowHookDispatch.objects.filter(workflow_id=graph_id).update(date_created=old)
+    sweep_retention(retention_days=1)
+    assert WorkflowHookDispatch.objects.filter(workflow_id=graph_id).exists()
+    assert graphs.replay_settled_hooks(0) == 0
+
+
+@pytest.mark.django_db
+def test_retention_keeps_undispatched_settlement_until_replay():
+    from qraft import graphs
+    from qraft.models import QraftGraph, QraftGraphSettlement
+    builder = graphs.Graph(on_settled='app.hooks.ready')
+    builder.node('gate', 'tests.e2e_tasks.succeed', recovery='idempotent', requires_approval=True)
+    graph_id = builder.start()
+    with patch('qraft.graphs._dispatch_settled_hook'):
+        graphs.cancel(graph_id)
+    old = timezone.now() - timedelta(days=10)
+    QraftGraph.objects.filter(pk=graph_id).update(date_updated=old)
+    QraftGraphSettlement.objects.filter(graph_id=graph_id).update(date_created=old)
+    sweep_retention(retention_days=1)
+    assert QraftGraph.objects.filter(pk=graph_id).exists()
+    with patch('qraft.dispatchers.q2_async_task', return_value='retained-hook'):
+        assert graphs.replay_settled_hooks(0) == 1
+    sweep_retention(retention_days=1)
+    assert not QraftGraph.objects.filter(pk=graph_id).exists()

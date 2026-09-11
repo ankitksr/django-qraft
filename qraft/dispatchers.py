@@ -587,6 +587,7 @@ def _dispatch_workflow_hook(
     hook_args: list,
     hook_kwargs: dict,
     context: dict | None = None,
+    generation: int = 0,
 ):
     """
     Dispatch workflow-level hook with idempotency.
@@ -611,6 +612,7 @@ def _dispatch_workflow_hook(
             "workflow_type": workflow_type,
             "workflow_id": workflow_id,
             "hook_type": hook_type,
+            "generation": generation,
         },
         hook_path,
         lambda: q2_async_task(

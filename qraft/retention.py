@@ -29,6 +29,7 @@ rows must not hold one transaction open or build one enormous id list.
 import logging
 from datetime import timedelta
 
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from .conf import get_conf
@@ -37,6 +38,7 @@ from .models import (
     QraftBatchModel,
     QraftChainModel,
     QraftGraph,
+    QraftGraphSettlement,
     QraftIterModel,
     QraftTask,
     TaskStatus,
@@ -237,19 +239,30 @@ def sweep_retention(
     if count:
         deleted["QraftTask"] = count
 
+    delivered = WorkflowHookDispatch.objects.filter(
+        workflow_type="graph",
+        workflow_id=OuterRef("graph_id"),
+        generation=OuterRef("generation"),
+        hook_type="settled",
+    )
+    pending_settlements = QraftGraphSettlement.objects.filter(~Exists(delivered))
     count = _delete_in_batches(
         QraftGraph.objects.filter(status__in=TERMINAL_GRAPH_STATUSES)
         .filter(date_updated__lt=cutoff)
-        .exclude(qrafttask_members__status__in=live_member),
+        .exclude(qrafttask_members__status__in=live_member)
+        .exclude(pk__in=pending_settlements.values("graph_id")),
         batch_size,
     )
     if count:
         deleted["QraftGraph"] = count
 
     # WorkflowHookDispatch has no FK to its workflow, so nothing cascades to
-    # it; its own age is the only signal available.
+    # it. A graph dispatch must survive for as long as its graph does.
     count = _delete_in_batches(
-        WorkflowHookDispatch.objects.filter(date_created__lt=cutoff), batch_size
+        WorkflowHookDispatch.objects.filter(date_created__lt=cutoff).exclude(
+            workflow_type="graph", workflow_id__in=QraftGraph.objects.values("pk")
+        ),
+        batch_size,
     )
     if count:
         deleted["WorkflowHookDispatch"] = count

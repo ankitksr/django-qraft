@@ -302,6 +302,10 @@ class TestReplaySettledHooks:
         QraftGraph.objects.filter(id=graph_id).update(
             settled_at=timezone.now() - timezone.timedelta(minutes=10)
         )
+        from qraft.models import QraftGraphSettlement
+        QraftGraphSettlement.objects.filter(graph_id=graph_id).update(
+            date_created=timezone.now() - timezone.timedelta(minutes=10)
+        )
         assert not WorkflowHookDispatch.objects.filter(workflow_id=graph_id).exists()
         return graph_id
 
@@ -885,3 +889,66 @@ class TestApproval:
         assert graphs.flag_overdue() == 0
         assert QraftGraph.objects.get(id=graph_id).overdue_flagged_at is None
 
+
+
+class TestSettlementBoundaries:
+    @pytest.mark.parametrize('decision', [graphs.approve, graphs.reject])
+    def test_cancelled_gate_cannot_dispatch_or_change_nodes(self, decision):
+        builder = build_graph()
+        builder.node('publish', TASK, recovery=RECOVERY, requires_approval=True)
+        graph_id = builder.start()
+        graphs.cancel(graph_id)
+        with pytest.raises(graphs.GraphError, match='final'):
+            decision(graph_id, 'publish')
+        assert not QraftTask.objects.filter(graph_id=graph_id).exists()
+        assert graphs.get(graph_id).nodes.get().status == NodeStatus.WAITING_APPROVAL
+
+    def test_live_gate_cannot_be_resumed(self):
+        builder = build_graph()
+        builder.node('publish', TASK, recovery=RECOVERY, requires_approval=True)
+        graph_id = builder.start()
+        with pytest.raises(graphs.GraphError, match='settled'):
+            graphs.resume(graph_id, ['publish'])
+        assert graphs.get(graph_id).generation == 1
+
+    def test_resuming_a_succeeded_gate_parks_it_again(self):
+        builder = build_graph()
+        builder.node('publish', TASK, recovery=RECOVERY, requires_approval=True)
+        graph_id = builder.start()
+        graphs.approve(graph_id, 'publish')
+        complete_node(graph_id, 'publish')
+        graphs.resume(graph_id, ['publish'])
+        assert graphs.get(graph_id).status == GraphStatus.WAITING_APPROVAL
+
+    def test_delayed_old_hook_cannot_suppress_new_generation(self):
+        builder = build_graph(on_settled='app.hooks.ready')
+        add_node(builder, 'ingest')
+        graph_id = builder.start()
+        with patch('qraft.graphs._dispatch_settled_hook'):
+            complete_node(graph_id, 'ingest', success=False)
+        old = graphs.get(graph_id)
+        graphs.resume(graph_id)
+        with patch('qraft.dispatchers.q2_async_task', side_effect=['old-hook', 'new-hook']) as queued:
+            graphs._dispatch_settled_hook(old)
+            complete_node(graph_id, 'ingest')
+            graphs._dispatch_settled_hook(old)
+        assert [call.kwargs['context']['generation'] for call in queued.call_args_list] == [1, 2]
+        assert [call.kwargs['context']['outcome'] for call in queued.call_args_list] == ['failed', 'succeeded']
+        assert queued.call_args_list[0].kwargs['context']['nodes'] == {'ingest': 'failed'}
+
+    def test_replay_keeps_a_missed_settlement_after_resume(self):
+        from qraft.models import QraftGraphSettlement
+        builder = build_graph(on_settled='app.hooks.ready')
+        add_node(builder, 'ingest')
+        graph_id = builder.start()
+        with patch('qraft.graphs._dispatch_settled_hook'):
+            complete_node(graph_id, 'ingest', success=False)
+        graphs.resume(graph_id)
+        QraftGraphSettlement.objects.filter(graph_id=graph_id).update(
+            date_created=timezone.now() - timezone.timedelta(minutes=5)
+        )
+        with patch('qraft.dispatchers.q2_async_task', return_value='replayed') as queued:
+            assert graphs.replay_settled_hooks(60) == 1
+            assert graphs.replay_settled_hooks(60) == 0
+        assert queued.call_args.kwargs['context']['generation'] == 1
+        assert graphs.get(graph_id).status == GraphStatus.RUNNING

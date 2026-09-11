@@ -331,3 +331,23 @@ class QraftGraphNode(models.Model):
                 fields=["graph", "key"], name="unique_node_key_per_graph"
             )
         ]
+
+
+class QraftGraphSettlement(models.Model):
+    """Immutable hook payload for one committed graph generation."""
+
+    graph = models.ForeignKey(
+        QraftGraph, on_delete=models.CASCADE, related_name="settlements"
+    )
+    generation = models.PositiveIntegerField()
+    hook_path = models.CharField(max_length=256)
+    hook_kwargs = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+    context = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+    date_created = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["graph", "generation"], name="unique_graph_settlement"
+            )
+        ]
