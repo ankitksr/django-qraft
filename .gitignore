@@ -221,6 +221,10 @@ secrets.yaml
 
 # AI
 CLAUDE.md
+.claude/
 
 # playwright-cli scratch output
 .playwright-cli/
+
+# Local dashboard visual verification
+/output/playwright/
