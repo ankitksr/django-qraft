@@ -11,7 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - {python-version: "3.10", django: "5.0.*", q2: "==1.8.*"}
+          - {python-version: "3.11", django: "5.1.*", q2: ">=1.8,<2"}
+          - {python-version: "3.12", django: "5.2.*", q2: ">=1.8,<2"}
+          - {python-version: "3.13", django: "6.0.*", q2: ">=1.8,<2"}
 
     steps:
     - uses: actions/checkout@v4
@@ -32,14 +36,15 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync --group test
+        uv pip install "django==${{ matrix.django }}" "django-q2${{ matrix.q2 }}"
 
     - name: Run linter
       run: |
-        uv run ruff check qraft/
+        uv run --no-sync ruff check qraft/
 
     - name: Run tests with coverage
       run: |
-        uv run pytest --cov=qraft --cov-report=xml --cov-report=term --cov-fail-under=72 -n auto
+        uv run --no-sync pytest --cov=qraft --cov-report=xml --cov-report=term --cov-fail-under=72 -n auto
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -84,8 +89,22 @@ jobs:
       run: |
         uv sync --group test
 
-    - name: Run the `postgres`-marked concurrency cases
+    - name: Run the full suite on PostgreSQL
       env:
         QRAFT_TEST_DATABASE_URL: postgresql://qraft:qraft@localhost:5432/qraft
       run: |
-        uv run pytest -m postgres --create-db -p no:xdist
+        uv run pytest --create-db -p no:xdist
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+    - run: uv build
+    - run: |
+        uv venv /tmp/qraft-wheel
+        uv pip install --python /tmp/qraft-wheel/bin/python dist/*.whl
+        /tmp/qraft-wheel/bin/python -I tests/wheel_smoke.py
