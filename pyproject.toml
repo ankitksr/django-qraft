@@ -1,6 +1,6 @@
 [project]
 name = "django-qraft"
-version = "1.3.0"
+version = "1.4.0"
 description = "Django-Qraft is a next-gen distributed task queue for Django"
 authors = [
     {name = "Ankit Singh", email = "ankitksrdev@gmail.com"}
@@ -40,7 +40,7 @@ Issues = "https://github.com/ankitksr/django-qraft/issues"
 Changelog = "https://github.com/ankitksr/django-qraft/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

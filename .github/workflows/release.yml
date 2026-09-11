@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: astral-sh/setup-uv@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+    - run: uv build
+    # The wheel must carry the dashboard template and every migration, which
+    # a source checkout would supply even when the package data is misdeclared.
+    - run: |
+        uv venv /tmp/qraft-wheel
+        uv pip install --python /tmp/qraft-wheel/bin/python dist/*.whl
+        /tmp/qraft-wheel/bin/python -I tests/wheel_smoke.py
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dist
+        path: dist/
+
+  testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist/
+    - uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist/
+    - uses: pypa/gh-action-pypi-publish@release/v1

@@ -107,10 +107,10 @@ django-qraft/
 │   │   ├── gauges.py                 # Backlog gauges
 │   │   └── otel.py                   # OpenTelemetrySink
 │   ├── migrations/                   # see Database Migrations below
-│   ├── models/                       # Database schema (modularized in v1.1.0)
+│   ├── models/                       # Database schema
 │   │   ├── __init__.py               # Re-exports all
 │   │   ├── hooks.py                   # HookDispatch, WorkflowHookDispatch
-│   │   ├── graphs.py                   # QraftGraph, QraftGraphNode, GraphStatus/NodeStatus/RecoveryMode
+│   │   ├── graphs.py                   # QraftGraph, QraftGraphNode, QraftGraphSettlement, GraphStatus/NodeStatus/RecoveryMode
 │   │   ├── mixins.py                   # WorkflowStatus enum, SubjectMixin, GraphMemberMixin, WorkflowStatusMixin, WorkflowHookMixin
 │   │   ├── tasks.py                     # QraftTask, QraftTaskAttempt, RateBucket
 │   │   └── workflows.py                  # Chain/Iter/Batch models
@@ -1017,27 +1017,27 @@ Retry: Handle a missing exception class without crashing the hook handler
 4. **Build package:**
 
    ```bash
-   python -m build
+   uv build
    ```
 
-5. **Test package:**
+5. **Test the built wheel** in a clean environment, the way CI does:
 
    ```bash
-   pip install dist/django_qraft-*.whl
+   uv venv /tmp/qraft-wheel
+   uv pip install --python /tmp/qraft-wheel/bin/python dist/*.whl
+   /tmp/qraft-wheel/bin/python -I tests/wheel_smoke.py
    ```
 
-6. **Create git tag:**
+6. **Push the tag:**
 
    ```bash
-   git tag v1.2.3
-   git push origin v1.2.3
+   git tag v1.4.0
+   git push origin v1.4.0
    ```
 
-7. **Publish to PyPI:**
-
-   ```bash
-   python -m twine upload dist/*
-   ```
+   The tag triggers `.github/workflows/release.yml`. It repeats the build and the wheel
+   smoke test, then publishes to PyPI through Trusted Publishing. Do not upload by hand;
+   the workflow holds the only publishing identity.
 
 ## Related Documentation
 

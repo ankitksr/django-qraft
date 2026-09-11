@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-09-11
 
 ### Added
 - Immutable graph settlement hook payloads and generation-specific dispatch identity
@@ -288,8 +288,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.3.0] - 2026-08-18
 
-Phase 2 of the Django-Q2 absorption plan
-([q2-absorption.md](docs/future/q2-absorption.md)): Qraft owns scheduling.
+Phase 2 of the Django-Q2 absorption plan: Qraft owns scheduling.
 
 ### Added
 - **Qraft-owned scheduling** (`qraft/scheduler.py`): a delayed attempt is a `SCHEDULED`
@@ -720,7 +719,7 @@ extra infra, built for AI workloads.
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
-[Unreleased]: https://github.com/ankitksr/django-qraft/compare/v1.3.0...HEAD
+[1.4.0]: https://github.com/ankitksr/django-qraft/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ankitksr/django-qraft/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ankitksr/django-qraft/compare/v1.1.1...v1.2.0

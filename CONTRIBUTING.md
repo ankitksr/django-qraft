@@ -13,7 +13,7 @@ By participating in this project, you agree to maintain a respectful and collabo
 1. **Clone the repository**
 
 ```bash
-git clone https://github.com/yourusername/django-qraft.git
+git clone https://github.com/ankitksr/django-qraft.git
 cd django-qraft
 ```
 
@@ -342,17 +342,21 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 
 (For maintainers)
 
-1. Update version in `pyproject.toml`
-2. Update CHANGELOG.md with release notes
-3. Create a git tag: `git tag -a v1.0.0 -m "Release 1.0.0"`
-4. Push tag: `git push origin v1.0.0`
-5. Build and publish: `uv build && uv publish`
+1. Update the version in `pyproject.toml`.
+2. Move the `[Unreleased]` section of `CHANGELOG.md` under the new version and date it.
+3. Push a tag: `git tag v1.4.0 && git push origin v1.4.0`.
+
+The tag triggers `.github/workflows/release.yml`, which builds the distributions, installs
+the wheel into a clean environment and runs `tests/wheel_smoke.py` against it, then
+publishes to PyPI through Trusted Publishing. There is no API token to hold.
+
+To rehearse first, run the same workflow from the Actions tab with the target `testpypi`.
 
 ## Getting Help
 
 - **Documentation**: [docs/](docs/)
-- **Issues**: [GitHub Issues](https://github.com/yourusername/django-qraft/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/django-qraft/discussions)
+- **Issues**: [GitHub Issues](https://github.com/ankitksr/django-qraft/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/ankitksr/django-qraft/discussions)
 
 ## License
 
