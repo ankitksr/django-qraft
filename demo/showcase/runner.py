@@ -27,6 +27,7 @@ from showcase.models import ScenarioRun
 _MODULES = (
     "showcase.scenarios.core",
     "showcase.scenarios.workflows",
+    "showcase.scenarios.graphs",
     "showcase.scenarios.durability",
     "showcase.scenarios.ai",
     "showcase.scenarios.djangotasks",
@@ -139,6 +140,10 @@ def run_all(
             log(f"Starting clusters: {', '.join(boot)}")
             manager.ensure(boot)
         for item in scenarios:
+            # Manual profiles must be idle each time, including when the
+            # supplied manager came from an already-running demo server.
+            for name in item.manual_clusters:
+                manager.stop(name)
             results.append(run_one(item, manager, log=log))
     finally:
         for name in manual:
@@ -182,8 +187,10 @@ def matrix(results: list[ScenarioRun]) -> str:
     total_checks = sum(len(item.checks) for item in results)
     passed_checks = sum(item.passed_checks for item in results)
     lines.append("")
+    passed = sum(item.status == ScenarioRun.PASSED for item in results)
+    skipped = sum(item.status == ScenarioRun.SKIPPED for item in results)
     lines.append(
-        f"{len(results) - len(failed)}/{len(results)} scenarios passed, "
+        f"{passed}/{len(results)} scenarios passed ({skipped} skipped), "
         f"{passed_checks}/{total_checks} checks passed"
     )
     if failed:

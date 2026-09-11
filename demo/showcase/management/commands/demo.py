@@ -120,10 +120,9 @@ class Command(BaseCommand):
         runner.load()
         manager = ClusterManager(log=lambda message: self.stdout.write(f"  {message}"))
         self.stdout.write("Starting worker clusters for the dashboard...")
-        # "lanes" is left down: the priority scenario needs to fill the lanes
-        # before a consumer exists and starts that cluster itself. "soak" boots
-        # on demand from the dashboard's soak panel.
-        manager.ensure([name for name in PROFILES if name not in ("lanes", "soak")])
+        # Other profiles boot on demand when a scenario or operator needs
+        # them; serving an idle page should not start every worker process.
+        manager.ensure(["default"])
 
         from showcase import views
 

@@ -98,3 +98,9 @@ def on_progress(
             "pid": os.getpid(),
         },
     )
+
+
+def on_graph_settled(run, context):
+    Event.objects.create(
+        run=run, kind=Event.HOOK, name="graph-settled", payload=context
+    )

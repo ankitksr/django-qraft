@@ -273,3 +273,13 @@ _ERRORS = {
     "RateLimitError": RateLimitError,
     "ValueError": ValueError,
 }
+
+
+def publish_event(run):
+    """Commit an application output in the same transaction as its receipt."""
+    from qraft import graphs
+
+    with graphs.publish() as completion:
+        event = Event.objects.create(run=run, kind=Event.TASK, name="published-output")
+        completion.succeed({"event_id": event.pk})
+    return event.pk

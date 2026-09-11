@@ -33,7 +33,7 @@ in `IMMEDIATE` mode; heavier parallel runs can still contend.
 make demo             # or: uv run python manage.py demo all
 ```
 
-One command. It resets the database, starts the clusters, runs all 33
+One command. It resets the database, starts the clusters, runs all registered
 scenarios, stops the clusters, and prints the matrix:
 
 ```
@@ -64,10 +64,10 @@ uv run python manage.py demo all --keep-clusters  # leave the workers up afterwa
 ## Watch it happen
 
 ```bash
-make ui               # boots the clusters, serves http://127.0.0.1:8000/
+make ui               # boots the default cluster, serves http://127.0.0.1:8000/
 ```
 
-The dashboard polls once a second and shows tasks with their status, attempt
+The dashboard polls every three seconds while visible and shows tasks with their status, attempt
 count, heartbeat age and progress; workflows with their members and counters;
 the dead-letter queue with a requeue button; rate buckets; the token and cost
 rollup; and a live feed of what tasks and hooks recorded. Any scenario can be
@@ -200,3 +200,13 @@ Q_CLUSTER_NAME=threaded uv run python manage.py qraftcluster
   run: qraft calls that hook with no arguments, so it cannot be told which
   workflow was cancelled. `cancel()` does not dispatch it at all — only
   `QraftChain.reject()` does.
+
+
+### Graph verification
+
+`wf.graph-resume` proves selective recovery and one settlement hook per generation;
+`wf.graph-approval` covers approve, reject and cancellation at a gate;
+`wf.graph-receipt` checks that a published application row matches its durable receipt.
+Run them with `uv run python manage.py demo run wf.graph-resume wf.graph-approval wf.graph-receipt`.
+The demo serves with only the default cluster; other profiles start on demand. Scenario
+runs are serialized because they share cluster controls and database evidence.

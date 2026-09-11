@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Qraft monitor</title>
+<title>Qraft demo</title>
+<link rel="icon" href="data:,">
 <style>
 :root {
   --bg: #0e1116; --panel: #161b22; --panel2: #1c2129; --line: #2a313c;
@@ -165,18 +166,40 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
 .wrow { display: flex; gap: 10px; align-items: baseline; padding: 3px 12px 3px 24px; }
 .wrow .pid { color: var(--dim); min-width: 96px; }
 .wrow .m { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+[hidden] { display: none !important; }
+main { max-width: 1920px; margin: 0 auto; padding: 24px; gap: 20px; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); }
+main > div { min-width: 0; }
+main > div:last-child { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-content: start; }
+main > div:last-child > section { margin: 0; min-width: 0; }
+main > div:last-child > .demo-wide { grid-column: 1 / -1; }
+.scroll.compact-scroll { max-height: 310px; }
+td.s-failed { border-bottom-color: var(--line); }
+.wrow, .wgroup-head { flex-wrap: wrap; }
+#dlq { overflow: auto; max-height: 360px; }
+.run summary { flex-wrap: wrap; }
+th { z-index: 1; box-shadow: 0 1px var(--line); }
+th, td { padding: 8px 12px; }
+.wf-head { flex-wrap: wrap; }
+button { min-height: 28px; }
+button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+.scroll { max-height: min(52vh, 560px); }
+#tasks td { white-space: nowrap; }
+@media (max-width: 1200px) { main > div:last-child { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 800px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px; } header { position: static; } }
 </style>
 </head>
 <body>
 {% csrf_token %}
 <header>
-  <h1>QRAFT <span>monitor</span></h1>
+  <h1>QRAFT <span>demo</span></h1>
   <span class="pill" id="clusters">clusters —</span>
   <span class="pill" id="queued">queue —</span>
   <span class="spacer"></span>
   <span class="pill live" id="beat">polling</span>
   <button id="theme">light</button>
-  <a href="/admin/qraft/" target="_blank"><button>qraft admin</button></a>
+  <a href="/qraft/">dashboard ↗</a>
+  <a href="/admin/qraft/" target="_blank">admin ↗</a>
   <button id="reset" title="Wipe all demo data and stop clusters">reset</button>
 </header>
 
@@ -244,34 +267,27 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
       <h2>Usage and cost</h2>
       <div id="usage"><div class="empty">none yet</div></div>
     </section>
-
   </div>
-
   <div>
-    <section>
+    <section class="demo-wide">
       <h2>Queue</h2>
       <div class="tiles" id="tiles"></div>
     </section>
 
     <section>
+      <h2>Scenario results <span class="count" id="run-count"></span></h2>
+      <div class="scroll compact-scroll" id="runs"><div class="empty">nothing has run yet</div></div>
+    </section>
+
+    <section>
       <h2>Workers <span class="count" id="worker-count"></span></h2>
-      <div class="scroll" id="workers"><div class="empty">no worker activity yet</div></div>
+      <div class="scroll compact-scroll" id="workers"><div class="empty">no worker activity yet</div></div>
       <div class="legend">Workers observed from task attempts in the last
       10 minutes — an idle worker only appears here after its first task;
       process liveness is the dot on the Clusters panel.</div>
     </section>
 
-    <section>
-      <h2>Scenario results <span class="count" id="run-count"></span></h2>
-      <div class="scroll" id="runs"><div class="empty">nothing has run yet</div></div>
-    </section>
-
-    <section>
-      <h2>Workflows <span class="count" id="wf-count"></span></h2>
-      <div class="scroll" id="workflows"><div class="empty">none yet</div></div>
-    </section>
-
-    <section>
+    <section class="demo-wide">
       <h2>Tasks <span class="count" id="task-count"></span></h2>
       <div class="scroll">
         <table>
@@ -286,6 +302,11 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
     </section>
 
     <section>
+      <h2>Workflows <span class="count" id="wf-count"></span></h2>
+      <div class="scroll" id="workflows"><div class="empty">none yet</div></div>
+    </section>
+
+    <section>
       <h2>Dead letters <span class="count" id="dlq-count"></span></h2>
       <div id="dlq"><div class="empty">nothing dead</div></div>
     </section>
@@ -293,15 +314,14 @@ details.run .title { flex: 1; color: var(--dim); overflow: hidden;
     <section>
       <h2>Task and hook events</h2>
       <div class="feed" id="events"></div>
-    </section>
-  </div>
+    </section></div>
 </main>
 
 <script>
 const CSRF = document.querySelector("[name=csrfmiddlewaretoken]").value;
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value == null ? "" : value)
-  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const chip = (status) => `<span class="s s-${esc(status)}">${esc(status)}</span>`;
 
 // $("runs") is rebuilt wholesale every poll, which would otherwise reset
@@ -320,34 +340,54 @@ const saved = localStorage.getItem("qraft-theme");
 if (saved) { document.documentElement.dataset.theme = saved;
              $("theme").textContent = saved === "dark" ? "light" : "dark"; }
 
+async function request(path, options = {}) {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed (${response.status})`);
+  }
+  return response.json();
+}
 async function start(key) {
-  await fetch(`/scenarios/${key}/run/`, {
+  await request(`/scenarios/${key}/run/`, {
     method: "POST", headers: {"X-CSRFToken": CSRF},
   });
-  poll();
+  await poll();
 }
 document.querySelectorAll("[data-run]").forEach((button) => {
-  button.onclick = () => start(button.dataset.run);
+  button.onclick = async () => {
+    button.disabled = true;
+    try { await start(button.dataset.run); }
+    catch (error) { alert(error.message); }
+    finally { button.disabled = false; }
+  };
 });
 $("run-all").onclick = async () => {
-  for (const button of document.querySelectorAll("[data-run]")) {
-    await start(button.dataset.run);
-    // One at a time: the scenarios share one database and one set of clusters.
-    await new Promise((resolve) => {
-      const timer = setInterval(async () => {
-        const state = await (await fetch("/api/state/")).json();
-        if (!state.active.length) { clearInterval(timer); resolve(); }
-      }, 1000);
-    });
-  }
+  $("run-all").disabled = true;
+  try {
+    for (const button of document.querySelectorAll("[data-run]")) {
+      await start(button.dataset.run);
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const state = await request("/api/state/");
+        if (!state.active.length) break;
+        if (Date.now() > deadline) throw new Error("Scenario is still running; stopped starting further scenarios.");
+      }
+    }
+  } catch (error) { alert(error.message); }
+  finally { $("run-all").disabled = false; }
 };
 
 document.querySelectorAll("[data-cluster]").forEach((button) => {
   button.onclick = async () => {
     button.disabled = true;
     button.textContent = "…";
-    await fetch(`/clusters/${button.dataset.cluster}/${button.dataset.op}/`,
-                {method: "POST", headers: {"X-CSRFToken": CSRF}});
+    try {
+      await request(`/clusters/${button.dataset.cluster}/${button.dataset.op}/`,
+                    {method: "POST", headers: {"X-CSRFToken": CSRF}});
+    } catch (error) { alert(error.message); }
+    finally { button.disabled = false; button.textContent = button.dataset.op; }
     poll();
   };
 });
@@ -380,7 +420,7 @@ $("soak-start").onclick = async () => {
   const button = $("soak-start");
   button.disabled = true;
   button.textContent = "…";
-  await fetch("/soak/start/", {
+  try { await request("/soak/start/", {
     method: "POST",
     headers: {"X-CSRFToken": CSRF, "Content-Type": "application/json"},
     body: JSON.stringify({
@@ -390,8 +430,8 @@ $("soak-start").onclick = async () => {
       fail_pct: Number($("soak-fail").value),
     }),
   });
-  button.disabled = false;
-  button.textContent = "start";
+  } catch (error) { alert(error.message); }
+  finally { button.disabled = false; button.textContent = "start"; }
   poll();
 };
 
@@ -417,7 +457,7 @@ function render(state) {
     <td class="num faint">${task.heartbeat == null ? "" : task.heartbeat + "s"}</td>
     <td class="faint">${esc(task.worker)}</td>
     <td class="muted">${esc(task.progress)} <span class="faint">${esc(task.message)}</span></td>
-    <td class="s-failed" style="border:0">${esc(task.error || "")}</td>
+    <td class="s-failed">${esc(task.error || "")}</td>
   </tr>`).join("") || `<tr><td colspan="11" class="empty">no tasks yet</td></tr>`;
 
   $("worker-count").textContent = state.workers.reduce((n, c) => n + c.workers.length, 0);
@@ -470,9 +510,12 @@ function render(state) {
   document.querySelectorAll("[data-requeue]").forEach((button) => {
     button.onclick = async () => {
       button.disabled = true;
-      await fetch(`/dlq/${button.dataset.requeue}/requeue/`,
-                  {method: "POST", headers: {"X-CSRFToken": CSRF}});
-      poll();
+      try {
+        await request(`/dlq/${button.dataset.requeue}/requeue/`,
+                      {method: "POST", headers: {"X-CSRFToken": CSRF}});
+        await poll();
+      } catch (error) { alert(error.message); }
+      finally { button.disabled = false; }
     };
   });
 
@@ -542,6 +585,7 @@ let failures = 0;
 async function poll() {
   try {
     const response = await fetch("/api/state/");
+    if (!response.ok) throw new Error(response.status);
     render(await response.json());
     failures = 0;
     $("beat").textContent = "polling";
@@ -554,7 +598,11 @@ async function poll() {
 }
 $("scn-count").textContent = document.querySelectorAll("[data-run]").length;
 poll();
-setInterval(poll, 1500);
+async function refreshLoop() {
+  if (!document.hidden) await poll();
+  setTimeout(refreshLoop, 3000);
+}
+setTimeout(refreshLoop, 3000);
 </script>
 </body>
 </html>

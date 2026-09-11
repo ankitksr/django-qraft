@@ -8,10 +8,12 @@ per-object detail pages here.
 """
 
 import json
+import math
 import random
 import threading
 import uuid
 from datetime import timedelta
+from functools import wraps
 
 from django.db import connection
 from django.db.models import Count, Prefetch, Q
@@ -21,6 +23,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_POST
 from django_q.models import OrmQ, Schedule
 
+from qraft.dashboard.views import _current_progress
 from qraft.dlq import dead_letters, requeue
 from qraft.models import (
     QraftBatchModel,
@@ -44,6 +47,26 @@ _ACTIVE: set[str] = set()
 
 TASK_LIMIT = 60
 EVENT_LIMIT = 40
+
+
+def _exclusive_operation(view):
+    """Reserve shared cluster/data controls against scenarios and each other."""
+
+    @wraps(view)
+    def wrapped(request, *args, **kwargs):
+        with _LOCK:
+            if _ACTIVE:
+                return JsonResponse(
+                    {"error": "Demo operation already running"}, status=409
+                )
+            _ACTIVE.add(view.__name__)
+        try:
+            return view(request, *args, **kwargs)
+        finally:
+            with _LOCK:
+                _ACTIVE.discard(view.__name__)
+
+    return wrapped
 
 
 def _clusters() -> ClusterManager:
@@ -98,7 +121,9 @@ def _workers_panel(now):
     throughput_start = now - timedelta(seconds=THROUGHPUT_WINDOW_SECONDS)
 
     attempts = QraftTaskAttempt.objects.filter(worker_pid__isnull=False).filter(
-        Q(date_started__gte=window_start) | Q(date_completed__gte=window_start)
+        Q(date_started__gte=window_start)
+        | Q(date_completed__gte=window_start)
+        | Q(success__isnull=True)
     )
 
     capacity = {
@@ -116,7 +141,14 @@ def _workers_panel(now):
     )
 
     clusters: dict[str, dict[int, dict]] = {}
-    for attempt in attempts:
+    for attempt in attempts.only(
+        "cluster",
+        "worker_pid",
+        "success",
+        "date_started",
+        "date_completed",
+        "heartbeat_at",
+    ).iterator(chunk_size=500):
         cluster_name = attempt.cluster or "?"
         worker = clusters.setdefault(cluster_name, {}).setdefault(
             attempt.worker_pid,
@@ -240,7 +272,7 @@ def state(request):
         else:
             elapsed = (now - task.date_created).total_seconds()
 
-        progress = task.progress or {}
+        progress = _current_progress(task, latest)
         run_id = (
             task.task_args[0]
             if task.task_args and isinstance(task.task_args[0], str)
@@ -360,7 +392,7 @@ def state(request):
             )
 
     usage: dict[str, float] = {}
-    for values in QraftTaskAttempt.objects.exclude(usage=None).values_list(
+    for values in QraftTaskAttempt.objects.filter(usage__isnull=False).values_list(
         "usage", flat=True
     )[:500]:
         for key, value in (values or {}).items():
@@ -440,8 +472,10 @@ def run_scenario(request, key: str):
     item = scenarios[0]
 
     with _LOCK:
-        if key in _ACTIVE:
-            return JsonResponse({"started": False, "reason": "already running"})
+        if _ACTIVE:
+            return JsonResponse(
+                {"started": False, "error": "Another scenario is running"}, status=409
+            )
         _ACTIVE.add(key)
 
     try:
@@ -482,6 +516,7 @@ def run_scenario(request, key: str):
 
 
 @require_POST
+@_exclusive_operation
 def start_cluster(request, name: str):
     """Boot one worker cluster from the dashboard."""
     if name not in PROFILES:
@@ -491,6 +526,7 @@ def start_cluster(request, name: str):
 
 
 @require_POST
+@_exclusive_operation
 def stop_cluster(request, name: str):
     """Stop one worker cluster from the dashboard."""
     if name not in PROFILES:
@@ -505,6 +541,7 @@ SOAK_MAX_SECONDS = 3600.0
 
 
 @require_POST
+@_exclusive_operation
 def start_soak(request):
     """
     Fan out long fake-API tasks onto the soak cluster.
@@ -517,11 +554,24 @@ def start_soak(request):
 
     try:
         params = json.loads(request.body or "{}")
+        if not isinstance(params, dict):
+            raise ValueError("expected an object")
+        values = [
+            float(params.get(key, default))
+            for key, default in (
+                ("count", 8),
+                ("min_seconds", 180),
+                ("max_seconds", 600),
+                ("fail_pct", 20),
+            )
+        ]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("expected finite values")
         count = min(int(params.get("count", 8)), SOAK_MAX_COUNT)
         low = min(float(params.get("min_seconds", 180)), SOAK_MAX_SECONDS)
         high = min(float(params.get("max_seconds", 600)), SOAK_MAX_SECONDS)
         fail_pct = max(0.0, min(float(params.get("fail_pct", 20)), 100.0))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return HttpResponseBadRequest("count, min_seconds, max_seconds, fail_pct")
     if count < 1 or low <= 0 or high < low:
         return HttpResponseBadRequest("need count >= 1 and 0 < min <= max")
@@ -552,11 +602,15 @@ def requeue_task(request, task_id: str):
         task = QraftTask.objects.get(id=task_id)
     except (QraftTask.DoesNotExist, ValueError) as error:
         raise Http404(task_id) from error
-    requeue(task)
+    try:
+        requeue(task)
+    except ValueError as error:
+        return JsonResponse({"error": str(error)}, status=409)
     return JsonResponse({"requeued": str(task.id)})
 
 
 @require_POST
+@_exclusive_operation
 def reset(request):
     """
     Wipe all demo data for a fresh start.
@@ -568,13 +622,6 @@ def reset(request):
     scenario may even spawn clusters of its own partway through - reset would
     race both. No cancellation machinery here, just an honest "try again".
     """
-    with _LOCK:
-        active = sorted(_ACTIVE)
-    if active:
-        return JsonResponse(
-            {"reset": False, "error": f"scenarios still running: {', '.join(active)}"},
-            status=409,
-        )
     _clusters().stop_all()
     reset_state()
     return JsonResponse({"reset": True})
