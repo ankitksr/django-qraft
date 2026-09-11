@@ -87,8 +87,11 @@ A Qraft-native worker loop on the pattern PostgreSQL queues use
 
 1. One queue table replaces the broker, the pusher, and the pack encoding.
    A worker claims a due attempt directly with `SKIP LOCKED`, updates the
-   lease in-band, executes, and writes the result to the attempt row in the
-   same transaction scope.
+   lease in a short transaction, then commits the claim before executing user
+   code. Completion is another short transaction, fenced by the claim identity.
+   Arbitrary network calls must not hold the claim transaction open. Applications
+   can use a separate publication transaction for database effects and receipts;
+   external effects still require application idempotency.
 2. The monitor process disappears — completion dispatch (hooks, workflow
    routing) runs in the worker immediately after the result is written, or in
    a small dispatch thread. The reaper and heartbeat stay as they are; they
@@ -124,9 +127,12 @@ close the gap to Redis:
 
 1. **`LISTEN`/`NOTIFY` wakeups.** The enqueue transaction sends `NOTIFY` on
    commit; idle workers block on the notification instead of polling. Pickup
-   drops to single-digit milliseconds, idle databases stop receiving poll
-   queries, and the commit-ordering race disappears because `NOTIFY` fires
-   only on commit. Procrastinate has proven this pattern in production.
+   can improve without shortening the polling interval; measure the actual
+   latency before committing to a target. Keep fallback polling for missed
+   notifications and scheduled deadlines. On startup and reconnect, commit
+   `LISTEN`, inspect the queue, then wait: PostgreSQL documents a registration
+   race ([LISTEN](https://www.postgresql.org/docs/current/sql-listen.html)).
+   Notifications are wakeup hints, never the durable delivery record.
 2. **The claim query replaces the transport.** With `SELECT ... FOR UPDATE
    SKIP LOCKED`, the worker claims work directly - no pusher, no pack
    encoding, no broker hop.

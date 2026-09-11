@@ -144,3 +144,15 @@ Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
 - **At-least-once delivery as the retry mechanism** — `max_executions_per_attempt`
   defaults to 1 and the supported retry path is the policy. A broker redelivering until
   something succeeds hides the failure from the attempt record.
+
+
+## Next release: stabilize and measure
+
+Before expanding orchestration, verify graph transitions on PostgreSQL, preserve
+settlement hooks by generation across resume and retention, and exercise the installed
+wheel as well as the source checkout. The bundled dashboard should expose approval,
+rejection and cancellation consistently with the API.
+
+Measure wide fan-out/fan-in, graph lock duration, dashboard query counts and retention
+volume before choosing node ceilings or per-graph concurrency caps. Native-worker
+absorption, nested workflows and a shared asyncio worker remain gated on actual demand.
