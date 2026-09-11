@@ -26,8 +26,7 @@
 ### Additional Resources
 - [Testing Guide](../tests/README.md) - Running and writing tests
 - [Demo Application](../demo/README.md) - Interactive feature demonstrations
-- [Future Features](future/) - Planned enhancements: [asyncio worker](future/asyncio-worker.md),
-  [Django-Q2 absorption plan](future/q2-absorption.md)
+- [Roadmap](roadmap.md) - What is shipped, what is next, and what is deliberately not planned
 
 ## Getting Help
 

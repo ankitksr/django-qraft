@@ -23,7 +23,7 @@ Requests for several of these are open upstream rather than shipped (django-q2#2
 excludes retries, hooks, chaining, and workers from its first pass. No Django-native library
 today offers Canvas-depth workflows or AI-workload primitives.
 
-## Shipped after 1.3.0 (unreleased)
+## Shipped in 1.4.0
 
 - **The lease ends where the function ends.** `run_task` stamps `returned_at` and stops
   the heartbeat when the target returns, so a task whose result is stranded by a dead
@@ -93,7 +93,7 @@ today offers Canvas-depth workflows or AI-workload primitives.
   ORM queue.
 - **Progress reporting.** `report_progress()` writes to `QraftTask.progress`.
 
-Nothing remains from the original plan; what landed after 1.3.0 is listed above.
+Nothing remains from the original plan; what landed in 1.4.0 is listed above.
 (`TaskContext` and deferred tasks shipped in 1.2.1; priority routing for scheduled
 retries shipped in 1.3.0 with owned scheduling.)
 
@@ -118,7 +118,6 @@ retries shipped in 1.3.0 with owned scheduling.)
 Incremental absorption of Django-Q2, one owned subsystem per phase: execution
 state (shipped in 1.2.1, the lease), scheduling (shipped in 1.3.0, the owned
 scheduler), the worker loop (phase 3 — gated, not started).
-Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
 
 ## Deliberately not planned
 
@@ -126,7 +125,7 @@ Design and decision gates: [future/q2-absorption.md](future/q2-absorption.md).
 - **LangGraph/Pydantic-AI adapters** — only worth building on top of §3/§4 once they
   exist; DBOS already owns the generic version of this play.
 - **asyncio worker** — threading already covers I/O-bound concurrency; revisit only on
-  demonstrated demand (`docs/future/asyncio-worker.md` holds the design).
+  demonstrated demand.
 - **Graph timeouts that fail a graph automatically** — a graph running too long is
   flagged, never failed. Whether to skip a node or cancel the graph is an application
   decision.

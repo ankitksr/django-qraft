@@ -537,23 +537,28 @@ that would prune the history of a user who never asked for pruning.
 
 For mixed workloads (CPU + I/O), run multiple clusters with different configs:
 
+A named cluster needs an entry under `ALT_CLUSTERS` in both dictionaries: process count
+is a Django-Q2 setting, thread count is a Qraft setting.
+
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "name": "default",
     "workers": 4,
-    "threads": 1,  # Standard workers
+    "ALT_CLUSTERS": {
+        "io-workers": {"workers": 2},
+        "cpu-workers": {"workers": 8},  # More processes for CPU
+    },
+}
 
+QRAFT_CLUSTER = {
+    "threads": 1,  # Standard workers
     "ALT_CLUSTERS": {
         "io-workers": {
-            "workers": 2,
             "threads": 8,  # Threaded workers
             "max_inflight": 16,
         },
-        "cpu-workers": {
-            "workers": 8,
-            "threads": 1,  # More processes for CPU
-        }
-    }
+        "cpu-workers": {"threads": 1},
+    },
 }
 ```
 
@@ -680,9 +685,9 @@ running the ORM broker. Qraft's own columns are safer: `QraftTask.func` is a dot
 and `task_args`/`task_kwargs` are JSON, so a retry re-enqueues from JSON rather than from
 the original pickle. The pickle stays on the initial enqueue path.
 
-Phase 3 of the [absorption plan](future/q2-absorption.md) — a Qraft-owned queue table —
-would let the initial enqueue drop pickle too, which is a security benefit and not only an
-architectural one.
+A Qraft-owned queue table would let the initial enqueue drop pickle too, which is a
+security benefit and not only an architectural one. It is not built; see the
+[roadmap](roadmap.md).
 
 ## Related Documentation
 
