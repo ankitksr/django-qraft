@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Immutable graph settlement hook payloads and generation-specific dispatch identity
+  (migration `0020`), with replay across resume and retention protection.
+- Graph approve/reject controls, task/dead-letter tabs, responsive overview and graph
+  layout, expandable metric details, visible action errors, and paused background polling.
+- Demo scenarios for selective graph resume, approval/cancellation, and publication receipts.
 - **Approval gates on graph nodes.** `requires_approval=True` parks a node at
   `WAITING_APPROVAL` once its dependencies are met, and `graphs.approve()` /
   `graphs.reject()` release or refuse it. The gate stops its own node, never its siblings,
@@ -25,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nodes and everything downstream that ever ran, keeping every other node's result, and
   `graphs.preview_resume()` answers what it would do without writing. Rerun nodes advance
   a generation and drop their task link, so a completion from before the resume settles
-  nothing; the graph's durable-hook dispatch rows are cleared so the next settlement fires
-  `on_settled` again. Refused while the graph is running -- the reason settlement waits for
+  nothing; each generation retains its own settlement payload and dispatch identity so
+  the next settlement fires `on_settled` again. Refused while the graph is running -- the reason settlement waits for
   quiescence -- and on a cancelled graph. A succeeded graph must name its nodes explicitly.
   The dashboard carries the preview on the resume button
 - **Execution graphs.** A graph is one execution of a plan over a subject:
