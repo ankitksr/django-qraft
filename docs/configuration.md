@@ -26,15 +26,15 @@ for the two places Qraft does read `Q_CLUSTER`.
 
 ```python
 # settings.py
-QRAFT_CLUSTER = {
-    # Standard Django-Q2 settings
+Q_CLUSTER = {
     "name": "default",
     "workers": 4,
     "timeout": 60,
     "retry": 90,  # Broker-level retry timeout
     "orm": "default",  # Use Django ORM as broker
+}
 
-    # Qraft-specific settings
+QRAFT_CLUSTER = {
     "threads": 1,
     "sync_hooks": False,
     "retry_defaults": {
@@ -49,18 +49,20 @@ QRAFT_CLUSTER = {
 **Minimal configuration:**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
     "timeout": 60,
     "orm": "default",
 }
 ```
 
-All Qraft-specific settings have sensible defaults and are optional.
+All Qraft-specific settings have sensible defaults and are optional, so `QRAFT_CLUSTER` can be omitted entirely.
 
 ## Core Settings
 
-Settings inherited from Django-Q2 (full compatibility maintained):
+These are Django-Q2 settings, configured in `Q_CLUSTER`. Qraft does not inherit them — it
+reads `Q_CLUSTER` only for broker resolution and to mirror an explicit `save_limit` into
+`retention_max_tasks` (see [Django-Q2 Compatibility](#django-q2-compatibility)):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
@@ -95,14 +97,18 @@ Control multithreaded worker behavior:
 
 ```python
 # Standard workers (no threading)
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
+}
+QRAFT_CLUSTER = {
     "threads": 1,  # Default
 }
 
 # Threaded workers for I/O-bound tasks
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 2,
+}
+QRAFT_CLUSTER = {
     "threads": 8,  # 2 * 8 = 16 concurrent tasks
     "max_inflight": 16,  # Limit concurrent tasks per worker
     "grace_period": 45.0,  # Wait longer for cleanup
@@ -531,30 +537,42 @@ Run multiple clusters with different configurations for mixed workloads (CPU-bou
 ### Configuration
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     # Default cluster configuration
     "name": "default",
     "workers": 4,
-    "threads": 1,  # Standard workers for CPU-bound tasks
     "timeout": 300,
 
     # Alternative cluster configurations
     "ALT_CLUSTERS": {
         "io-workers": {
             "workers": 2,
-            "threads": 8,           # Threaded workers
-            "max_inflight": 16,
             "timeout": 60,
         },
         "cpu-intensive": {
             "workers": 8,
-            "threads": 1,           # More processes for CPU
             "timeout": 600,         # Longer timeout
         },
         "quick-tasks": {
             "workers": 2,
-            "threads": 4,
             "timeout": 30,
+        },
+    },
+}
+
+QRAFT_CLUSTER = {
+    "threads": 1,  # Standard workers for CPU-bound tasks
+
+    "ALT_CLUSTERS": {
+        "io-workers": {
+            "threads": 8,           # Threaded workers
+            "max_inflight": 16,
+        },
+        "cpu-intensive": {
+            "threads": 1,           # More processes for CPU
+        },
+        "quick-tasks": {
+            "threads": 4,
         },
     },
 }
@@ -641,7 +659,7 @@ async_task('myapp.tasks.quick_update', id, cluster='quick-tasks')
 **3. Different brokers:**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "orm": "default",  # Default uses ORM
     "ALT_CLUSTERS": {
         "redis-queue": {
@@ -656,7 +674,7 @@ QRAFT_CLUSTER = {
 Alternative cluster configs are merged with the base config:
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
     "timeout": 60,
     "orm": "default",
@@ -697,7 +715,10 @@ environment=Q_CLUSTER_NAME=cpu-intensive
 
 ## Django-Q2 Compatibility
 
-Django-Qraft maintains full backward compatibility with Django-Q2:
+Django-Qraft runs on top of Django-Q2 rather than replacing it, but the compatibility is
+partial. `qraft.tasks.async_task()` rejects `sync=True`, `save=False`, `cached`, and
+`ack_failure=False` — Qraft's guarantees depend on the attempt row being written and
+acknowledged itself, so those options cannot be honoured:
 
 ### Q_CLUSTER still belongs to Django-Q2
 
@@ -736,7 +757,7 @@ task rows to be in the same database degrade on every other broker.
 **Supported configuration:**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "orm": "default",
     "broker_class": "qraft.brokers.QraftOrmBroker",  # required for priority lanes
 }
@@ -877,24 +898,28 @@ print(current_conf.threads)
 
 ### Validation
 
-All settings are validated by Pydantic:
+All settings are validated by Pydantic. Retry values are nested under `retry_defaults`:
 
 ```python
 QRAFT_CLUSTER = {
     "threads": -1,  # Error: must be >= 1
-    "max_attempts": 20,  # Error: must be <= 10
-    "backoff": "invalid",  # Error: not a valid backoff strategy
+    "retry_defaults": {
+        "max_attempts": 20,  # Error: must be <= 10
+        "backoff": "invalid",  # Error: not a valid backoff strategy
+    },
 }
 ```
 
-Validation errors are raised at Django startup with clear messages.
+Settings load on first use rather than at Django startup, so a validation error surfaces
+the first time Qraft reads its configuration — enqueuing a task, or starting
+`qraftcluster`. Unknown keys are ignored rather than rejected.
 
 ## Configuration Examples
 
 ### Minimal Setup (ORM Broker)
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
     "timeout": 60,
     "orm": "default",
@@ -904,7 +929,7 @@ QRAFT_CLUSTER = {
 ### Production Setup (ORM Broker on PostgreSQL)
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "name": "production",
     "workers": 8,
     "timeout": 120,
@@ -914,7 +939,9 @@ QRAFT_CLUSTER = {
 
     "orm": "default",
     "broker_class": "qraft.brokers.QraftOrmBroker",
+}
 
+QRAFT_CLUSTER = {
     "threads": 1,
     "retention_days": 30,
     "retry_defaults": {
@@ -928,24 +955,26 @@ QRAFT_CLUSTER = {
 ### I/O-Optimized Setup
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
+    "timeout": 60,
+    "orm": "default",
+}
+
+QRAFT_CLUSTER = {
     "threads": 8,  # High concurrency
     "max_inflight": 20,
     "grace_period": 60.0,
-    "timeout": 60,
-    "orm": "default",
 }
 ```
 
 ### Mixed Workload Setup
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     # Default: balanced
     "name": "default",
     "workers": 4,
-    "threads": 2,
     "timeout": 120,
     "orm": "default",
 
@@ -953,23 +982,41 @@ QRAFT_CLUSTER = {
         # I/O-heavy workloads
         "io-bound": {
             "workers": 2,
-            "threads": 16,
-            "max_inflight": 32,
             "timeout": 60,
         },
 
         # CPU-heavy workloads
         "cpu-bound": {
             "workers": 16,
-            "threads": 1,
             "timeout": 600,
         },
 
         # Quick background tasks
         "background": {
             "workers": 2,
-            "threads": 4,
             "timeout": 30,
+        },
+    },
+}
+
+QRAFT_CLUSTER = {
+    "threads": 2,
+
+    "ALT_CLUSTERS": {
+        # I/O-heavy workloads
+        "io-bound": {
+            "threads": 16,
+            "max_inflight": 32,
+        },
+
+        # CPU-heavy workloads
+        "cpu-bound": {
+            "threads": 1,
+        },
+
+        # Quick background tasks
+        "background": {
+            "threads": 4,
         },
     },
 
@@ -985,13 +1032,16 @@ QRAFT_CLUSTER = {
 ### Development/Testing Setup
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 1,
-    "threads": 1,
     "timeout": 30,
     "orm": "default",
     "save_limit": 50,
     "sync": True,  # Synchronous execution for testing
+}
+
+QRAFT_CLUSTER = {
+    "threads": 1,
     "sync_hooks": True,  # Synchronous hooks for debugging
 }
 ```
@@ -1082,11 +1132,16 @@ QRAFT_CLUSTER = {
 **Check types:**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,       # int, not "4"
     "timeout": 60,      # int, not "60"
+}
+
+QRAFT_CLUSTER = {
     "threads": 1,       # int, not "1"
-    "jitter": True,     # bool, not "true"
+    "retry_defaults": {
+        "jitter": True,  # bool, not "true"
+    },
 }
 ```
 

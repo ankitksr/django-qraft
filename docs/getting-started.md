@@ -33,19 +33,21 @@ INSTALLED_APPS = [
 
 ### 2. Configure the Cluster
 
-Django-Qraft uses `QRAFT_CLUSTER` settings (with fallback to Django-Q2's `Q_CLUSTER` for compatibility):
+Two settings dictionaries, one each way. `Q_CLUSTER` configures Django-Q2: worker
+processes, the task timeout, and the broker. `QRAFT_CLUSTER` configures Qraft. Qraft
+never reads worker or broker keys from `QRAFT_CLUSTER`, and ignores any it finds there.
 
 ```python
 # settings.py
-QRAFT_CLUSTER = {
-    # Standard Django-Q2 settings
+Q_CLUSTER = {
     "name": "default",
     "workers": 4,
     "timeout": 60,
     "retry": 90,  # Django-Q2 broker-level retry timeout
     "orm": "default",  # Use Django ORM as broker
+}
 
-    # Qraft-specific settings
+QRAFT_CLUSTER = {
     "threads": 1,           # Threads per worker (1=disabled, >1 enables)
     "max_inflight": None,   # Max concurrent tasks (default: threads * 2)
     "grace_period": 30.0,   # Seconds to wait on shutdown
@@ -59,10 +61,11 @@ QRAFT_CLUSTER = {
 }
 ```
 
-**Minimal configuration:**
+**Minimal configuration.** Qraft's own defaults are usable as they stand, so the
+minimum is a Django-Q2 entry that names the broker:
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
     "timeout": 60,
     "orm": "default",
@@ -392,7 +395,7 @@ python manage.py migrate
 **Check database configuration:**
 ```python
 # settings.py
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "orm": "default",  # Must match a key in DATABASES
 }
 ```
@@ -401,7 +404,7 @@ QRAFT_CLUSTER = {
 
 **Check timeout configuration:**
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "timeout": 60,  # Increase if tasks legitimately take longer
 }
 ```

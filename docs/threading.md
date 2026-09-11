@@ -99,11 +99,14 @@ Enable threading by setting `threads > 1` in your cluster configuration:
 
 ```python
 # settings.py
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,           # 4 worker processes
+    "timeout": 60,
+}
+
+QRAFT_CLUSTER = {
     "threads": 8,           # 8 threads per worker = 32 concurrent tasks
     "max_inflight": 16,     # Limit concurrent tasks per worker (backpressure)
-    "timeout": 60,
 }
 ```
 
@@ -120,45 +123,57 @@ QRAFT_CLUSTER = {
 **Light threading (2-4 threads):**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
+}
+
+QRAFT_CLUSTER = {
     "threads": 2,  # Conservative, good starting point
     "max_inflight": 4,
 }
-# Total concurrency: 4 workers * 2 threads = 8 tasks
+# Total concurrency: 4 workers (Q_CLUSTER) * 2 threads (QRAFT_CLUSTER) = 8 tasks
 ```
 
 **Medium threading (4-8 threads):**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
+}
+
+QRAFT_CLUSTER = {
     "threads": 8,  # Good balance for I/O tasks
     "max_inflight": 16,
 }
-# Total concurrency: 4 workers * 8 threads = 32 tasks
+# Total concurrency: 4 workers (Q_CLUSTER) * 8 threads (QRAFT_CLUSTER) = 32 tasks
 ```
 
 **Heavy threading (16+ threads):**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 2,
+}
+
+QRAFT_CLUSTER = {
     "threads": 16,  # Maximum concurrency for very I/O-heavy workloads
     "max_inflight": 32,
     "grace_period": 60.0,  # Longer grace period for cleanup
 }
-# Total concurrency: 2 workers * 16 threads = 32 tasks
+# Total concurrency: 2 workers (Q_CLUSTER) * 16 threads (QRAFT_CLUSTER) = 32 tasks
 ```
 
 **No threading (standard workers):**
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 8,
+}
+
+QRAFT_CLUSTER = {
     "threads": 1,  # Default: standard Django-Q2 behavior
 }
-# Total concurrency: 8 workers * 1 = 8 tasks
+# Total concurrency: 8 workers (Q_CLUSTER) * 1 thread (QRAFT_CLUSTER) = 8 tasks
 ```
 
 ## How It Works
@@ -214,8 +229,11 @@ Worker Process
 
 ```python
 # Configuration
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 2,
+}
+
+QRAFT_CLUSTER = {
     "threads": 4,
     "max_inflight": 8,
 }
@@ -461,10 +479,13 @@ Sentinel
 ### Example Scenario
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 2,
-    "threads": 8,
     "timeout": 60,  # 60 second process timeout
+}
+
+QRAFT_CLUSTER = {
+    "threads": 8,
 }
 
 # Worker 1 has 8 threads running:
@@ -488,10 +509,13 @@ Python threads cannot be safely terminated individually. The timeout applies to 
 Use standard workers (`threads=1`):
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 8,
-    "threads": 1,  # Process-level timeout = task-level timeout
     "timeout": 60,
+}
+
+QRAFT_CLUSTER = {
+    "threads": 1,  # Process-level timeout = task-level timeout
 }
 ```
 
@@ -502,6 +526,9 @@ Set timeout to the longest expected task:
 ```python
 QRAFT_CLUSTER = {
     "threads": 8,
+}
+
+Q_CLUSTER = {
     "timeout": 300,  # Set to longest task duration
 }
 ```
@@ -523,28 +550,42 @@ Run both standard (process-based) and threaded workers together using ALT_CLUSTE
 
 ### Configuration
 
+A named cluster that needs settings from both systems needs an entry under `ALT_CLUSTERS`
+in both `Q_CLUSTER` and `QRAFT_CLUSTER`, keyed by the same cluster name:
+
 ```python
-QRAFT_CLUSTER = {
-    # Default: Standard workers for CPU-bound tasks
+# Default: Standard workers for CPU-bound tasks
+Q_CLUSTER = {
     "name": "default",
     "workers": 8,
-    "threads": 1,
     "timeout": 300,
 
     "ALT_CLUSTERS": {
         # Threaded workers for I/O-bound tasks
         "io-workers": {
             "workers": 4,
-            "threads": 8,
-            "max_inflight": 16,
             "timeout": 60,
         },
 
         # Many processes for heavy CPU tasks
         "cpu-intensive": {
             "workers": 16,
-            "threads": 1,
             "timeout": 600,
+        },
+    },
+}
+
+QRAFT_CLUSTER = {
+    "threads": 1,
+
+    "ALT_CLUSTERS": {
+        "io-workers": {
+            "threads": 8,
+            "max_inflight": 16,
+        },
+
+        "cpu-intensive": {
+            "threads": 1,
         },
     },
 }
@@ -636,13 +677,16 @@ Begin with low thread counts and measure:
 
 ```python
 # Phase 1: Baseline
-QRAFT_CLUSTER = {"workers": 4, "threads": 1}
+Q_CLUSTER = {"workers": 4}
+QRAFT_CLUSTER = {"threads": 1}
 
 # Phase 2: Light threading
-QRAFT_CLUSTER = {"workers": 4, "threads": 2}
+Q_CLUSTER = {"workers": 4}
+QRAFT_CLUSTER = {"threads": 2}
 
 # Phase 3: Medium threading (monitor metrics)
-QRAFT_CLUSTER = {"workers": 4, "threads": 8}
+Q_CLUSTER = {"workers": 4}
+QRAFT_CLUSTER = {"threads": 8}
 ```
 
 ### 2. Monitor Key Metrics
@@ -700,6 +744,9 @@ For threaded workers, set timeout to longest task:
 ```python
 QRAFT_CLUSTER = {
     "threads": 8,
+}
+
+Q_CLUSTER = {
     "timeout": 120,  # Longest task takes 90s
 }
 ```
@@ -710,6 +757,9 @@ Not the average:
 # Wrong: average task takes 30s, but some take 90s
 QRAFT_CLUSTER = {
     "threads": 8,
+}
+
+Q_CLUSTER = {
     "timeout": 30,  # Will kill long tasks!
 }
 ```
@@ -805,8 +855,11 @@ DATABASES = {
 Or reduce concurrency:
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "workers": 4,
+}
+
+QRAFT_CLUSTER = {
     "threads": 4,  # Down from 8
 }
 ```
@@ -852,7 +905,7 @@ python manage.py qraftcluster  # Watch for errors
 Enable worker recycling:
 
 ```python
-QRAFT_CLUSTER = {
+Q_CLUSTER = {
     "recycle": 500,  # Recycle after 500 tasks
 }
 ```
