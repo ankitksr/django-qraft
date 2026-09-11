@@ -16,6 +16,7 @@ jobs:
           - {python-version: "3.11", django: "5.1.*", q2: ">=1.8,<2"}
           - {python-version: "3.12", django: "5.2.*", q2: ">=1.8,<2"}
           - {python-version: "3.13", django: "6.0.*", q2: ">=1.8,<2"}
+          - {python-version: "3.13", django: "6.1.*", q2: ">=1.8,<2"}
 
     steps:
     - uses: actions/checkout@v4

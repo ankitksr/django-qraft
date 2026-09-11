@@ -403,17 +403,17 @@ Worker count, task timeout, and broker selection are Django-Q2 settings and belo
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md)
-- [Configuration Reference](docs/configuration.md)
-- [Retry Policies](docs/retry.md)
-- [Dual-Phase Hooks](docs/hooks.md)
-- [Workflows and Graphs](docs/workflows.md)
-- [AI Workloads & Metering](docs/ai-workloads.md)
-- [Multithreading Guide](docs/threading.md)
-- [Dead Letter Queue](docs/dlq.md)
-- [Monitoring Dashboard](docs/dashboard.md)
-- [django.tasks Backend](docs/django-tasks-backend.md)
-- [Architecture & Internal Design](docs/architecture.md)
+- [Getting Started](https://github.com/ankitksr/django-qraft/blob/main/docs/getting-started.md)
+- [Configuration Reference](https://github.com/ankitksr/django-qraft/blob/main/docs/configuration.md)
+- [Retry Policies](https://github.com/ankitksr/django-qraft/blob/main/docs/retry.md)
+- [Dual-Phase Hooks](https://github.com/ankitksr/django-qraft/blob/main/docs/hooks.md)
+- [Workflows and Graphs](https://github.com/ankitksr/django-qraft/blob/main/docs/workflows.md)
+- [AI Workloads & Metering](https://github.com/ankitksr/django-qraft/blob/main/docs/ai-workloads.md)
+- [Multithreading Guide](https://github.com/ankitksr/django-qraft/blob/main/docs/threading.md)
+- [Dead Letter Queue](https://github.com/ankitksr/django-qraft/blob/main/docs/dlq.md)
+- [Monitoring Dashboard](https://github.com/ankitksr/django-qraft/blob/main/docs/dashboard.md)
+- [django.tasks Backend](https://github.com/ankitksr/django-qraft/blob/main/docs/django-tasks-backend.md)
+- [Architecture & Internal Design](https://github.com/ankitksr/django-qraft/blob/main/docs/architecture.md)
 
 ---
 
@@ -425,4 +425,4 @@ nothing stubbed; CI gates line coverage at 72%. Nested workflows are not impleme
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](https://github.com/ankitksr/django-qraft/blob/main/LICENSE) for details.
