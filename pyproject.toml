@@ -1,6 +1,6 @@
 [project]
 name = "django-qraft"
-version = "1.4.0"
+version = "1.4.1"
 description = "Durable background jobs and workflows for Django, on PostgreSQL, built on Django-Q2"
 authors = [
     {name = "Ankit Singh", email = "ankitksrdev@gmail.com"}

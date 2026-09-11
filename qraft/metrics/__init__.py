@@ -72,14 +72,16 @@ class _Health:
         self._lock = threading.Lock()
         self.failures = 0
         self.last_error: str | None = None
-        self._last_logged = 0.0
+        self._last_logged: float | None = None
 
     def record(self, exc: Exception) -> None:
         with self._lock:
             self.failures += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
             now = time.monotonic()
-            should_log = now - self._last_logged >= LOG_INTERVAL
+            should_log = (
+                self._last_logged is None or now - self._last_logged >= LOG_INTERVAL
+            )
             if should_log:
                 self._last_logged = now
         if should_log:
@@ -93,7 +95,7 @@ class _Health:
         with self._lock:
             self.failures = 0
             self.last_error = None
-            self._last_logged = 0.0
+            self._last_logged = None
 
 
 _health = _Health()

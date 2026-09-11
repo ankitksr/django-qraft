@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-09-11
+
+### Fixed
+- The first metrics-sink failure is logged on a host that booted less than the log
+  interval ago. The throttle compared `time.monotonic()` against a zero sentinel, and
+  monotonic time counts from boot, so the first failure on a fresh host went unlogged.
+- Project metadata: the package summary describes the library, and the README's
+  documentation links are absolute so they resolve on the PyPI project page.
+
 ## [1.4.0] - 2026-09-11
 
 ### Added
@@ -719,6 +728,7 @@ extra infra, built for AI workloads.
 - **Fixed**: Bug fixes
 - **Security**: Security fixes
 
+[1.4.1]: https://github.com/ankitksr/django-qraft/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/ankitksr/django-qraft/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ankitksr/django-qraft/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/ankitksr/django-qraft/compare/v1.2.0...v1.2.1
